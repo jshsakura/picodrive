@@ -7,13 +7,16 @@
  */
 
 #include "pico_int.h"
+#ifndef GNW_32X_CORE
+// GNW: no zlib (plain-FILE path only), no SMS FM (ym2413), no Sega CD (megasd)
 #include <zlib.h>
+#include "sound/ym2413.h"
+#include "cd/megasd.h"
+#endif
 
 #include <cpu/sh2/sh2.h>
 #include "sound/ym2612.h"
-#include "sound/ym2413.h"
 #include "sound/sn76496.h"
-#include "cd/megasd.h"
 #include "state.h"
 
 static arearw    *areaRead;
@@ -28,6 +31,7 @@ void (*PicoLoadStateHook)(void);
 
 
 /* I/O functions */
+#ifndef GNW_32X_CORE
 static size_t gzRead2(void *p, size_t _size, size_t _n, void *file)
 {
   return gzread(file, p, _size * _n);
@@ -37,16 +41,22 @@ static size_t gzWrite2(void *p, size_t _size, size_t _n, void *file)
 {
   return gzwrite(file, p, _size * _n);
 }
+#endif
 
 static void set_cbs(int gz)
 {
+#ifndef GNW_32X_CORE
   if (gz) {
     areaRead  = gzRead2;
     areaWrite = gzWrite2;
     areaEof   = (areaeof *) gzeof;
     areaSeek  = (areaseek *) gzseek;
     areaClose = (areaclose *) gzclose;
-  } else {
+  } else
+#else
+  (void)gz;   // GNW: plain-FILE path only, no zlib in the build
+#endif
+  {
     areaRead  = (arearw *) fread;
     areaWrite = (arearw *) fwrite;
     areaEof   = (areaeof *) feof;
@@ -60,6 +70,7 @@ static void *open_save_file(const char *fname, int is_save)
   int len = strlen(fname);
   void *afile = NULL;
 
+#ifndef GNW_32X_CORE
   if (len > 3 && strcasecmp(fname + len - 3, ".gz") == 0)
   {
     if ( (afile = gzopen(fname, is_save ? "wb" : "rb")) ) {
@@ -69,6 +80,9 @@ static void *open_save_file(const char *fname, int is_save)
     }
   }
   else
+#else
+  (void)len;   // GNW: .gz falls through to fopen and simply fails to parse
+#endif
   {
     if ( (afile = fopen(fname, is_save ? "wb" : "rb")) ) {
       set_cbs(0);
@@ -201,7 +215,15 @@ static int write_chunk(unsigned char name, int len, void *data, void *file)
   return (bwritten == len + 4 + 1);
 }
 
+#ifdef GNW_32X_CORE
+// No CD, no SMS: the only variable-size chunks routed through the temp buffer
+// are IOPORTSv2 / FMv3 / FM_TIMERS, all well under 4K (sound.c's own FMv3
+// re-init buffer uses the same 4096 bound). The CD-sized ceilings below would
+// need 18K/66K mallocs from the device's tight DTCM heap for nothing.
+#define CHUNK_LIMIT_W 4096
+#else
 #define CHUNK_LIMIT_W 18772 // sizeof(cdc)
+#endif
 
 #define CHECKED_WRITE(name,len,data) { \
   if (PicoStateProgressCB && name < CHUNK_DEFAULT_COUNT && chunk_names[name]) { \
@@ -253,11 +275,14 @@ static int state_save(void *file)
     CHECKED_WRITE_BUFF(CHUNK_IOPORTS, PicoMem.ioports);
     len = io_ports_pack(buf2, CHUNK_LIMIT_W);
     CHECKED_WRITE(CHUNK_IOPORTSv2, len, buf2);
+#ifndef GNW_32X_CORE   // GNW: no Pico (kids console) hardware in the build
     if (PicoIn.AHW & PAHW_PICO) {
       len = PicoPicoPCMSave(buf2, CHUNK_LIMIT_W);
       CHECKED_WRITE(CHUNK_PICO_PCM, len, buf2);
       CHECKED_WRITE(CHUNK_PICO, sizeof(PicoPicohw), &PicoPicohw);
-    } else {
+    } else
+#endif
+    {
 #ifdef __GP2X__
       void *ym_regs = YM2612GetRegs();
       ym2612_pack_state_old();
@@ -275,12 +300,14 @@ static int state_save(void *file)
       SekInitIdleDet();
   }
   else {
+#ifndef GNW_32X_CORE   // GNW: PAHW_SMS is never set (no SMS/ym2413 in the build)
     CHECKED_WRITE_BUFF(CHUNK_SMS, Pico.ms);
     // only store the FM unit state if it was really used
     if (Pico.m.hardware & PMS_HW_FMUSED) {
       len = ym2413_pack_state(buf2, CHUNK_LIMIT_W);
       CHECKED_WRITE(CHUNK_YM2413, len, buf2);
     }
+#endif
   }
   CHECKED_WRITE(CHUNK_PSG, 28*4, sn76496_regs);
 
@@ -298,6 +325,7 @@ static int state_save(void *file)
   CHECKED_WRITE(CHUNK_VDP, len, buf2);
   CHECKED_WRITE_BUFF(CHUNK_VIDEO, Pico.video);
 
+#ifndef GNW_32X_CORE   // GNW: no Sega CD in the build (Pico_mcd/megasd absent)
   if (PicoIn.AHW & PAHW_MCD)
   {
     memset(buff, 0, sizeof(buff));
@@ -331,6 +359,7 @@ static int state_save(void *file)
     if (Pico_mcd->s68k_regs[3] & 4) // convert back
       wram_2M_to_1M(Pico_mcd->word_ram2M);
   }
+#endif // !GNW_32X_CORE
 
 #ifndef NO_32X
   if (PicoIn.AHW & PAHW_32X)
@@ -409,13 +438,26 @@ static int g_read_offs = 0;
 
 #define CHECKED_READ_BUFF(buff) CHECKED_READ2(sizeof(buff), &buff);
 
+#ifdef GNW_32X_CORE
+#define CHUNK_LIMIT_R CHUNK_LIMIT_W // temp buffer shrunk with the CD chunks gone
+#else
 #define CHUNK_LIMIT_R 0x10960 // sizeof(old_cdc)
+#endif
 
 #define CHECKED_READ_LIM(data) { \
   if (len > CHUNK_LIMIT_R) \
     R_ERROR_RETURN("chunk size over limit."); \
   CHECKED_READ(len, data); \
 }
+
+// variable-size chunk into the temp buffer: GNW bounds it (the buffer is only
+// CHUNK_LIMIT sized and NDEBUG strips the packers' asserts), upstream keeps
+// its historical unbounded read for compatibility with old oversized states.
+#ifdef GNW_32X_CORE
+#define CHECKED_READ_VAR(data) CHECKED_READ_LIM(data)
+#else
+#define CHECKED_READ_VAR(data) CHECKED_READ(len, data)
+#endif
 
 static int state_load(void *file)
 {
@@ -446,7 +488,9 @@ static int state_load(void *file)
     R_ERROR_RETURN("bad header");
   CHECKED_READ(4, &ver);
 
+#ifndef GNW_32X_CORE
   memset(pcd_event_times, 0, sizeof(pcd_event_times));
+#endif
   memset(p32x_event_times, 0, sizeof(p32x_event_times));
 
   while (!areaEof(file))
@@ -484,20 +528,23 @@ static int state_load(void *file)
 
       case CHUNK_IOPORTS: CHECKED_READ_BUFF(PicoMem.ioports); break;
       case CHUNK_PSG:     CHECKED_READ2(28*4, sn76496_regs); break;
+#ifndef GNW_32X_CORE   // GNW: no ym2413 in the build; an unknown chunk is skipped
       case CHUNK_YM2413:
         CHECKED_READ(len, buf);
         ym2413_unpack_state(buf, len);
         Pico.m.hardware |= PMS_HW_FMUSED;
         break;
+#endif
       case CHUNK_FM:
         ym_regs = YM2612GetRegs();
         CHECKED_READ2(0x200+4, ym_regs);
         ym2612_unpack_state_old();
         break;
-      case CHUNK_FM_TIMERS: CHECKED_READ(len, buf); ym2612_unpack_timers(buf, len); break;
-      case CHUNK_FMv3:      CHECKED_READ(len, buf); YM2612PicoStateLoad3(buf, len); break;
-      case CHUNK_IOPORTSv2: CHECKED_READ(len, buf); io_ports_unpack(buf, len); break;
+      case CHUNK_FM_TIMERS: CHECKED_READ_VAR(buf); ym2612_unpack_timers(buf, len); break;
+      case CHUNK_FMv3:      CHECKED_READ_VAR(buf); YM2612PicoStateLoad3(buf, len); break;
+      case CHUNK_IOPORTSv2: CHECKED_READ_VAR(buf); io_ports_unpack(buf, len); break;
 
+#ifndef GNW_32X_CORE   // GNW: no Pico (kids console) hardware in the build
       case CHUNK_PICO_PCM:
         CHECKED_READ(len, buf);
         PicoPicoPCMLoad(buf, len);
@@ -505,11 +552,14 @@ static int state_load(void *file)
       case CHUNK_PICO:
         CHECKED_READ_BUFF(PicoPicohw);
         break;
+#endif
 
       case CHUNK_SMS:
         CHECKED_READ_BUFF(Pico.ms);
         break;
 
+#ifndef GNW_32X_CORE   // GNW: no Sega CD in the build; the guard at loop top
+                       // already rejects CD chunks when PAHW_MCD is unset
       // cd stuff
       case CHUNK_S68K:
         CHECKED_READ_BUFF(buff_s68k);
@@ -554,6 +604,7 @@ static int state_load(void *file)
         CHECKED_READ_LIM(buf);
         cdd_context_load_old(buf);
         break;
+#endif // !GNW_32X_CORE
 
       // 32x stuff
 #ifndef NO_32X
@@ -614,8 +665,10 @@ readend:
     if (!has_32x)
       Pico32xShutdown(); // in case of loading a state with 32X disabled
 
+#ifndef GNW_32X_CORE   // GNW: no SMS in the build
   if (PicoIn.AHW & PAHW_SMS)
     PicoStateLoadedMS();
+#endif
 
   if (PicoIn.AHW & PAHW_32X)
     Pico32xStateLoaded(1);
@@ -626,15 +679,19 @@ readend:
   // must unpack 68k and z80 after banks are set up
   if (!(PicoIn.AHW & PAHW_SMS))
     SekUnpackCpu(buff_m68k, 0);
+#ifndef GNW_32X_CORE   // GNW: no Sega CD sub-68k in the build
   if (PicoIn.AHW & PAHW_MCD)
     SekUnpackCpu(buff_s68k, 1);
+#endif
 
   z80_unpack(buff_z80);
 
   if (PicoIn.AHW & PAHW_32X)
     Pico32xStateLoaded(0);
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD)
     pcd_state_loaded();
+#endif
   if (!(PicoIn.AHW & PAHW_SMS)) {
     Pico.video.status &= ~(SR_VB | SR_F);
     Pico.video.status |= ((Pico.video.reg[1] >> 3) ^ SR_VB) & SR_VB;

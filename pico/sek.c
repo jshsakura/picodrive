@@ -274,8 +274,13 @@ PICO_INTERNAL void SekPackCpu(unsigned char *cpu, int is_sub)
 #endif
 
   if (is_sub) {
+#ifndef GNW_32X_CORE
+    // SekCycleCnt/AimS68k live in cd/sek.c, which the 32X core does not
+    // compile — and this reference only becomes live once state.c pulls
+    // SekPackCpu in (gc-sections hid it before). No sub-68k without CD.
     *(u32 *)(cpu+0x50) = SekCycleCntS68k;
     *(s16 *)(cpu+0x4e) = SekCycleCntS68k - SekCycleAimS68k;
+#endif
   } else {
     *(u32 *)(cpu+0x50) = Pico.t.m68c_cnt;
     *(s16 *)(cpu+0x4e) = Pico.t.m68c_cnt - Pico.t.m68c_aim;
@@ -328,8 +333,10 @@ PICO_INTERNAL void SekUnpackCpu(const unsigned char *cpu, int is_sub)
   }
 #endif
   if (is_sub) {
+#ifndef GNW_32X_CORE   // no sub-68k without CD (see SekPackCpu)
     SekCycleCntS68k = *(u32 *)(cpu+0x50);
     SekCycleAimS68k = SekCycleCntS68k - *(s16 *)(cpu+0x4e);
+#endif
   } else {
     Pico.t.m68c_cnt = *(u32 *)(cpu+0x50);
     Pico.t.m68c_aim = Pico.t.m68c_cnt - *(s16 *)(cpu+0x4e);

@@ -872,12 +872,10 @@ int PicoCartInsert(unsigned char *rom, unsigned int romsize, const char *carthw_
   PicoDmaHook = NULL;
   PicoResetHook = NULL;
   PicoLineHook = NULL;
-#ifndef GNW_32X_CORE
-  // PicoLoadStateHook lives in state.c, which the 32X core does not compile
-  // (savestate deferred). Nothing in the trimmed set reads the hook.
+  // state.c is part of the GNW 32X build again (savestates wired in M2), so
+  // these clear unconditionally, as upstream.
   PicoLoadStateHook = NULL;
   carthw_chunks = NULL;
-#endif
 
   if (!(PicoIn.AHW & (PAHW_SMS|PAHW_PICO)))
     PicoCartDetect(carthw_cfg);
