@@ -1980,9 +1980,13 @@ void PicoDrawUpdateHighPal(void)
     if ((*est->PicoOpt & POPT_ALT_RENDERER) | (est->rendstatus & PDRAW_SONIC_MODE))
       sh = 0; // no s/h support
 
+#ifndef GNW_32X_CORE
     if (PicoIn.AHW & PAHW_SMS)
       PicoDoHighPal555SMS();
     else if (FinalizeLine == FinalizeLine8bit)
+#else
+    if (FinalizeLine == FinalizeLine8bit)
+#endif
       PicoDoHighPal555_8bit(sh, 0, est);
     else
       PicoDoHighPal555(sh, 0, est);

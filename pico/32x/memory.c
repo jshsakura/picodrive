@@ -50,6 +50,15 @@ static const char str_mars[] = "MARS";
 void *p32x_bios_g, *p32x_bios_m, *p32x_bios_s;
 struct Pico32xMem *Pico32xMem;
 
+#ifdef GNW_32X_CORE
+// The SSF2 cart mapper lives in pico/carthw/carthw.c, which the 32X core does not
+// compile. The 32X bank-switch code reads carthw_ssf2_active (always 0 here, so it
+// takes the plain-ROM path) and references carthw_ssf2_banks in its dead is-active
+// branches. Provide the storage so these resolve; SSF2 is effectively disabled.
+int carthw_ssf2_active;
+unsigned char carthw_ssf2_banks[8];
+#endif
+
 static void bank_switch_rom_68k(int b);
 
 static void (*m68k_write8_io)(u32 a, u32 d);
@@ -1002,9 +1011,11 @@ static u32 PicoRead8_32x_on(u32 a)
   }
 
   if ((a & 0xfc00) != 0x5000) {
+#ifndef GNW_32X_CORE
     if (PicoIn.AHW & PAHW_MCD)
       return PicoRead8_mcd_io(a);
     else
+#endif
       return PicoRead8_io(a);
   }
 
@@ -1046,9 +1057,11 @@ static u32 PicoRead16_32x_on(u32 a)
   }
 
   if ((a & 0xfc00) != 0x5000) {
+#ifndef GNW_32X_CORE
     if (PicoIn.AHW & PAHW_MCD)
       return PicoRead16_mcd_io(a);
     else
+#endif
       return PicoRead16_io(a);
   }
 
@@ -1117,6 +1130,7 @@ static void PicoWrite8_32x_on_io(u32 a, u32 d)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
 
+#ifndef GNW_32X_CORE
 static void PicoWrite8_32x_on_io_cd(u32 a, u32 d)
 {
   PicoWrite8_mcd_io(a, d);
@@ -1130,6 +1144,7 @@ static void PicoWrite8_32x_on_io_ssf2(u32 a, u32 d)
   if ((a & ~0x0e) == 0xa130f1)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
+#endif
 
 static void PicoWrite16_32x_on(u32 a, u32 d)
 {
@@ -1171,6 +1186,7 @@ static void PicoWrite16_32x_on_io(u32 a, u32 d)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
 
+#ifndef GNW_32X_CORE
 static void PicoWrite16_32x_on_io_cd(u32 a, u32 d)
 {
   PicoWrite16_mcd_io(a, d);
@@ -1184,6 +1200,7 @@ static void PicoWrite16_32x_on_io_ssf2(u32 a, u32 d)
   if (a == 0x130f0)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
+#endif // !GNW_32X_CORE
 
 // before ADEN
 u32 PicoRead8_32x(u32 a)
@@ -2386,6 +2403,7 @@ void PicoMemSetup32x(void)
   cpu68k_map_set(m68k_write16_map, 0xa10000, 0xa1ffff, PicoWrite16_32x_on, 1);
 
   // TODO: cd + carthw
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD) {
     m68k_write8_io  = PicoWrite8_32x_on_io_cd;
     m68k_write16_io = PicoWrite16_32x_on_io_cd;
@@ -2394,7 +2412,9 @@ void PicoMemSetup32x(void)
     m68k_write8_io  = PicoWrite8_32x_on_io_ssf2;
     m68k_write16_io = PicoWrite16_32x_on_io_ssf2;
   }
-  else {
+  else
+#endif
+  {
     m68k_write8_io  = PicoWrite8_32x_on_io;
     m68k_write16_io = PicoWrite16_32x_on_io;
   }

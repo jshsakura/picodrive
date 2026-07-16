@@ -181,6 +181,12 @@ looks_like_pico:
 /* checks if fname points to valid MegaCD image */
 int PicoCdCheck(const char *fname_in, int *pregion)
 {
+#ifdef GNW_32X_CORE
+  // Game & Watch 32X core: the Sega CD subsystem (and its cue/chd parsers) is
+  // not compiled in. No CD images are ever detected here.
+  (void)fname_in; (void)pregion;
+  return -1;
+#else
   const char *fname = fname_in;
   unsigned char buf[32];
   pm_file *cd_f;
@@ -251,6 +257,7 @@ int PicoCdCheck(const char *fname_in, int *pregion)
     *pregion = region;
 
   return type;
+#endif // GNW_32X_CORE
 }
 
 enum media_type_e PicoLoadMedia(const char *filename,
@@ -273,12 +280,22 @@ enum media_type_e PicoLoadMedia(const char *filename,
   if (media_type == PM_BAD_DETECT)
     goto out;
 
+#ifndef GNW_32X_CORE
   if ((PicoIn.AHW & PAHW_MCD) && Pico_mcd != NULL)
     cdd_unload();
+#endif
   PicoCartUnload();
   PicoIn.AHW = 0;
   PicoIn.quirks = 0;
 
+#ifdef GNW_32X_CORE
+  if (media_type == PM_CD)
+  {
+    // Sega CD subsystem not compiled in for the 32X core.
+    media_type = PM_BAD_CD;
+    goto out;
+  }
+#else
   if (media_type == PM_CD)
   {
     // check for MegaCD image
@@ -328,6 +345,7 @@ enum media_type_e PicoLoadMedia(const char *filename,
       goto out;
     }
   }
+#endif // GNW_32X_CORE
   else if (media_type == PM_MARK3) {
     PicoIn.AHW = PAHW_SMS;
   }
@@ -370,6 +388,7 @@ enum media_type_e PicoLoadMedia(const char *filename,
       }
     }
 
+#ifndef GNW_32X_CORE
     // maybe we are loading MegaCD BIOS?
     if (!(PicoIn.AHW & PAHW_MCD) && rom_size <= 0x20000 && (!rom_strcmp(rom_data, rom_size, 0x124, "BOOT") ||
          !rom_strcmp(rom_data, rom_size, 0x128, "BOOT"))) {
@@ -379,6 +398,7 @@ enum media_type_e PicoLoadMedia(const char *filename,
       PicoCartUnload();
       rom_size = 0;
     }
+#endif
   }
 
   if (!(PicoIn.AHW & PAHW_MCD)) {
@@ -420,6 +440,7 @@ enum media_type_e PicoLoadMedia(const char *filename,
 
   // insert CD if it was detected
   Pico.m.ncart_in = 0;
+#ifndef GNW_32X_CORE
   if (cd_img_type != CT_UNKNOWN) {
     ret = cdd_load(filename, cd_img_type);
     if (ret != 0) {
@@ -430,6 +451,7 @@ enum media_type_e PicoLoadMedia(const char *filename,
     if (Pico.romsize == 0)
       Pico.m.ncart_in = 1;
   }
+#endif
 
   if (PicoIn.quirks & PQUIRK_FORCE_6BTN)
     PicoSetInputDevice(0, PICO_INPUT_PAD_6BTN);

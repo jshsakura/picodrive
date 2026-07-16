@@ -108,12 +108,21 @@ void Pico32xStartup(void)
   PicoIn.AHW |= PAHW_32X;
   // TODO: OOM handling
   if (Pico32xMem == NULL) {
+#ifdef GNW_32X_CORE
+    // Game & Watch: back the 32X memory (sdram 256K + dram 256K + banks/pal/pwm,
+    // ~524KB) with a static buffer so it lands in .bss the linker can account for,
+    // instead of the heap. calloc-equivalent: memset to zero below.
+    static struct Pico32xMem gnw_32xmem __attribute__((aligned(4)));
+    Pico32xMem = &gnw_32xmem;
+    memset(Pico32xMem, 0, sizeof(struct Pico32xMem));
+#else
     Pico32xMem = plat_mmap(0x06000000, sizeof(*Pico32xMem), 0, 0);
     if (Pico32xMem == NULL) {
       elprintf(EL_STATUS, "OOM");
       return;
     }
     memset(Pico32xMem, 0, sizeof(struct Pico32xMem));
+#endif
 
     sh2_init(&msh2, 0, &ssh2);
     msh2.irq_callback = sh2_irq_cb;
@@ -151,9 +160,11 @@ void Pico32xShutdown(void)
   rendstatus_old = -1;
 
   PicoIn.AHW &= ~PAHW_32X;
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD)
     PicoMemSetupCD();
   else
+#endif
     PicoMemSetup();
   emu_32x_startup();
 }
@@ -232,8 +243,10 @@ void PicoUnload32x(void)
   sh2_finish(&msh2);
   sh2_finish(&ssh2);
 
+#ifndef GNW_32X_CORE
   if (Pico32xMem != NULL)
     plat_munmap(Pico32xMem, sizeof(*Pico32xMem));
+#endif
   Pico32xMem = NULL;
 }
 
@@ -635,6 +648,18 @@ void sync_sh2s_lockstep(unsigned int m68k_target)
   }
 }
 
+#ifdef GNW_32X_CORE
+// No Sega CD in the 32X core: the 68k always runs directly (never pcd_run_cpus).
+#define CPUS_RUN(m68k_cycles) do { \
+  SekRunM68k(m68k_cycles); \
+  \
+  if ((Pico32x.emu_flags & P32XF_Z80_32X_IO) && Pico.m.z80Run \
+      && !Pico.m.z80_reset && (PicoIn.opt & POPT_EN_Z80)) \
+    PicoSyncZ80(SekCyclesDone()); \
+  if (Pico32x.emu_flags & (P32XF_68KCPOLL|P32XF_68KVPOLL)) \
+    p32x_sync_sh2s(SekCyclesDone()); \
+} while (0)
+#else
 #define CPUS_RUN(m68k_cycles) do { \
   if (PicoIn.AHW & PAHW_MCD) \
     pcd_run_cpus(m68k_cycles); \
@@ -647,6 +672,7 @@ void sync_sh2s_lockstep(unsigned int m68k_target)
   if (Pico32x.emu_flags & (P32XF_68KCPOLL|P32XF_68KVPOLL)) \
     p32x_sync_sh2s(SekCyclesDone()); \
 } while (0)
+#endif // GNW_32X_CORE
 
 #define PICO_32X
 #define PICO_CD
@@ -654,8 +680,10 @@ void sync_sh2s_lockstep(unsigned int m68k_target)
 
 void PicoFrame32x(void)
 {
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD)
     pcd_prepare_frame();
+#endif
 
   PicoFrameStart();
   Pico32x.sync_line = 0;

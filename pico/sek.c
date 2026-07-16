@@ -22,6 +22,13 @@ m68ki_cpu_core PicoCpuMM68k;
 // FAME 68000
 #ifdef EMU_F68K
 M68K_CONTEXT PicoCpuFM68k;
+#ifdef GNW_32X_CORE
+// The sub-68k (Sega CD) FAME context normally lives in pico/cd/sek.c, which the
+// 32X core does not compile. Its address is referenced from generic code and from
+// the generated FAME opcode table (famec_opcodes.h: `if (ctx == &PicoCpuFS68k)`),
+// so it must exist even though it is never used as an active CPU without CD.
+M68K_CONTEXT PicoCpuFS68k;
+#endif
 #endif
 
 
@@ -41,7 +48,11 @@ static int do_ack(int level)
   else if (pv->pending_ints & pv->reg[0] & 0x10)
     pv->pending_ints &= ~0x10;
 
+#ifndef GNW_32X_CORE
   return (PicoIn.AHW & PAHW_PICO ? PicoPicoIrqAck(level) : 0);
+#else
+  return 0;
+#endif
 }
 
 /* callbacks */

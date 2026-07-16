@@ -550,6 +550,7 @@ static void DmaSlow(int len, u32 source)
     base = (u16 *)PicoMem.ram;
     mask = 0xffff;
   }
+#ifndef GNW_32X_CORE
   else if (PicoIn.AHW & PAHW_MCD)
   {
     u8 r3 = Pico_mcd->s68k_regs[3];
@@ -575,6 +576,7 @@ static void DmaSlow(int len, u32 source)
     } else // Rom
       base = m68k_dma_source(source);
   }
+#endif
   else
   {
     // if we have DmaHook, let it handle ROM because of possible DMA delay
@@ -1034,7 +1036,11 @@ update_irq:
             SekEndRun(21); // make it delayed
           } else if (SekIrqLevel >= pvid->hint_irq) {
             // no VDP irq, query lower irqs
+#ifndef GNW_32X_CORE
             SekInterrupt(PicoIn.AHW & PAHW_PICO ? PicoPicoIrqAck(0) : 0);
+#else
+            SekInterrupt(0);
+#endif
           }
         }
 #endif

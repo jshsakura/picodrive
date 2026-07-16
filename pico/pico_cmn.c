@@ -94,7 +94,7 @@ static void SyncCPUs(unsigned int cycles)
   if (Pico.m.z80Run && !Pico.m.z80_reset && (PicoIn.opt&POPT_EN_Z80))
     PicoSyncZ80(cycles);
 
-#ifdef PICO_CD
+#if defined(PICO_CD) && !defined(GNW_32X_CORE)
   if (PicoIn.AHW & PAHW_MCD)
     pcd_sync_s68k(cycles, 0);
 #endif
@@ -175,7 +175,11 @@ static int PicoFrameHints(void)
       // find the right moment for frame renderer, when display is no longer blanked
       if ((pv->reg[1]&0x40) || y > 100) {
         if (Pico.est.rendstatus & PDRAW_SYNC_NEEDED)
+#ifndef GNW_32X_CORE
           PicoFrameFull();
+#else
+          {} // draw2 (alt full-frame renderer) is not compiled for the 32X core
+#endif
 #ifdef DRAW_FINISH_FUNC
         DRAW_FINISH_FUNC();
 #endif

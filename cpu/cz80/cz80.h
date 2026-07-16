@@ -2,7 +2,7 @@
  *
  * CZ80 (Z80 CPU emulator) version 0.9
  * Compiled with Dev-C++
- * Copyright 2004-2005 Stéphane Dallongeville
+ * Copyright 2004-2005 Stï¿½phane Dallongeville
  *
  * (Modified by NJ)
  *
@@ -68,7 +68,14 @@ extern "C" {
 #define PICODRIVE_HACKS			1
 #define CZ80_LITTLE_ENDIAN		CPU_IS_LE
 #define CZ80_USE_JUMPTABLE		1
+#ifdef GNW_32X_CORE
+// Game & Watch 32X core: RAM is the binding constraint (724KB overlay).
+// The big flags array (SZHVC_add/SZHVC_sub) costs 256KB of .bss; computing the
+// flags inline instead is spike-verified byte-identical for this core.
+#define CZ80_BIG_FLAGS_ARRAY		0
+#else
 #define CZ80_BIG_FLAGS_ARRAY		1
+#endif
 //#ifdef BUILD_CPS1PSP
 //#define CZ80_ENCRYPTED_ROM		1
 //#else

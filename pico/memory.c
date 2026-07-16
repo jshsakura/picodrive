@@ -23,6 +23,18 @@ uptr m68k_read16_map [0x1000000 >> M68K_MEM_SHIFT];
 uptr m68k_write8_map [0x1000000 >> M68K_MEM_SHIFT];
 uptr m68k_write16_map[0x1000000 >> M68K_MEM_SHIFT];
 
+#ifdef GNW_32X_CORE
+// The sub-68k (Sega CD) memory maps normally live in pico/cd/memory.c, which the
+// 32X core does not compile. The generic cpu68k_map_* helpers reference these in
+// their is_sub branches (dead code here: no CD => is_sub is always 0). Provide the
+// storage so the references resolve. 4x1KB of dead BSS, reclaimable later by
+// guarding the is_sub branches if RAM gets tight.
+uptr s68k_read8_map  [0x1000000 >> M68K_MEM_SHIFT];
+uptr s68k_read16_map [0x1000000 >> M68K_MEM_SHIFT];
+uptr s68k_write8_map [0x1000000 >> M68K_MEM_SHIFT];
+uptr s68k_write16_map[0x1000000 >> M68K_MEM_SHIFT];
+#endif
+
 static void xmap_set(uptr *map, int shift, u32 start_addr, u32 end_addr,
     const void *func_or_mh, int is_func)
 {

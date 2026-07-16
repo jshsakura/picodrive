@@ -827,8 +827,14 @@ int PicoCartInsert(unsigned char *rom, unsigned int romsize, const char *carthw_
   // notaz: add a 68k "jump one op back" opcode to the end of ROM.
   // This will hang the emu, but will prevent nasty crashes.
   // note: 4 bytes are padded to every ROM
+#ifndef GNW_32X_CORE
   if (rom != NULL)
     *(u32 *)(rom+romsize) = CPU_BE2(0x6000FFFE);
+#endif
+  // Game & Watch: zero-copy ROM. The caller passes a flash-mapped, read-only,
+  // already-byteswapped image that stays mapped for the life of the core, so we
+  // bind Pico.rom to it directly (no plat_mmap RAM buffer, no memcpy) and MUST
+  // NOT write the trailing hang opcode into read-only flash.
 
   Pico.rom=rom;
   Pico.romsize=romsize;
@@ -850,17 +856,23 @@ int PicoCartInsert(unsigned char *rom, unsigned int romsize, const char *carthw_
   PicoDmaHook = NULL;
   PicoResetHook = NULL;
   PicoLineHook = NULL;
+#ifndef GNW_32X_CORE
+  // PicoLoadStateHook lives in state.c, which the 32X core does not compile
+  // (savestate deferred). Nothing in the trimmed set reads the hook.
   PicoLoadStateHook = NULL;
   carthw_chunks = NULL;
+#endif
 
   if (!(PicoIn.AHW & (PAHW_SMS|PAHW_PICO)))
     PicoCartDetect(carthw_cfg);
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_SMS)
     PicoCartDetectMS();
   if (PicoIn.AHW & PAHW_SVP)
     PicoSVPStartup();
   if (PicoIn.AHW & PAHW_PICO)
     PicoInitPico();
+#endif
 
   // setup correct memory map for loaded ROM
   switch (PicoIn.AHW & ~(PAHW_GG|PAHW_SG|PAHW_SC)) {
@@ -868,17 +880,21 @@ int PicoCartInsert(unsigned char *rom, unsigned int romsize, const char *carthw_
       elprintf(EL_STATUS|EL_ANOMALY, "starting in unknown hw configuration: %x", PicoIn.AHW);
     case 0:
     case PAHW_SVP:  PicoMemSetup(); break;
+#ifndef GNW_32X_CORE
     case PAHW_MCD:  PicoMemSetupCD(); break;
     case PAHW_PICO: PicoMemSetupPico(); break;
     case PAHW_SMS:  PicoMemSetupMS(); break;
+#endif
   }
 
   if (PicoCartMemSetup != NULL)
     PicoCartMemSetup();
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_SMS)
     PicoPowerMS();
   else
+#endif
     PicoPower();
 
   PicoGameLoaded = 1;
@@ -1136,6 +1152,7 @@ static void parse_carthw(const char *carthw_cfg, int *fill_sram,
         PicoIn.AHW = PAHW_SVP;
       else if (strcmp(p, "pico") == 0)
         PicoIn.AHW = PAHW_PICO;
+#ifndef GNW_32X_CORE
       else if (strcmp(p, "j_cart") == 0)
         carthw_jcart_startup();
       else if (strcmp(p, "prot") == 0)
@@ -1162,6 +1179,7 @@ static void parse_carthw(const char *carthw_cfg, int *fill_sram,
         carthw_lk3_startup();
       else if (strcmp(p, "smw64_mapper") == 0)
         carthw_smw64_startup();
+#endif // !GNW_32X_CORE
       else {
         elprintf(EL_STATUS, "carthw:%d: unsupported mapper: %s", line, p);
         skip_sect = 1;
@@ -1261,7 +1279,9 @@ static void parse_carthw(const char *carthw_cfg, int *fill_sram,
       if (!parse_3_vals(p, &addr, &mask, &val))
         goto bad;
 
+#ifndef GNW_32X_CORE
       carthw_sprot_new_location(addr, mask, val, tmp ? 1 : 0);
+#endif
       continue;
     }
 
@@ -1320,8 +1340,10 @@ static void PicoCartDetect(const char *carthw_cfg)
     parse_carthw(carthw_cfg, &fill_sram, &carthw_detected);
 
   // assume the standard mapper for large roms
+#ifndef GNW_32X_CORE
   if (!carthw_detected && Pico.romsize > 0x400000)
     carthw_ssf2_startup();
+#endif
 
   if (Pico.sv.flags & SRF_ENABLED)
   {

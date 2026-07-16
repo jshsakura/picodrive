@@ -36,25 +36,34 @@ void PicoInit(void)
   SekInit();
   z80_init(); // init even if we aren't going to use it
 
+#ifndef GNW_32X_CORE
   PicoInitMCD();
   PicoSVPInit();
+#endif
   Pico32xInit();
   PsndInit();
 
   PicoVideoInit();
   PicoDrawInit();
+#ifndef GNW_32X_CORE
+  // draw2 (the fast 8-bit tile renderer) is never used by the 32X core.
   PicoDraw2Init();
+#endif
 }
 
 // to be called once on emu exit
 void PicoExit(void)
 {
   PicoCartUnload();
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD)
     PicoExitMCD();
+#endif
   z80_exit();
   PsndExit();
+#ifndef GNW_32X_CORE
   PicoCloseTape();
+#endif
 
   free(Pico.sv.data);
   Pico.sv.data = NULL;
@@ -79,8 +88,10 @@ void PicoPower(void)
 
   Pico.video.hint_irq = (PicoIn.AHW & PAHW_PICO ? 5 : 4);
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD)
     PicoPowerMCD();
+#endif
 
   if (PicoIn.opt & POPT_EN_32X)
     PicoPower32x();
@@ -173,10 +184,12 @@ int PicoReset(void)
   memset(&PicoIn.padInt, 0, sizeof(PicoIn.padInt));
 
   z80_reset();
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_SMS) {
     PicoResetMS();
     return 0;
   }
+#endif
 
   SekReset();
   // ..but do not reset SekCycle* to not desync with addons
@@ -202,10 +215,12 @@ int PicoReset(void)
   if (PicoIn.opt & POPT_EN_32X)
     PicoReset32x();
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD) {
     PicoResetMCD();
     return 0;
   }
+#endif
 
   // reinit, so that checksum checks pass
   if (!(PicoIn.opt & POPT_DIS_IDLE_DET))
@@ -245,8 +260,10 @@ void PicoLoopPrepare(void)
   Pico.m.dirtyPal = 1;
   rendstatus_old = -1;
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD)
     PicoMCDPrepare();
+#endif
   if (PicoIn.AHW & PAHW_32X)
     Pico32xPrepare();
 }
@@ -282,20 +299,24 @@ void PicoFrame(void)
 
   Pico.m.frame_count++;
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_SMS) {
     PicoFrameMS();
     goto end;
   }
+#endif
 
   if (PicoIn.AHW & PAHW_32X) {
     PicoFrame32x(); // also does MCD+32X
     goto end;
   }
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD) {
     PicoFrameMCD();
     goto end;
   }
+#endif
 
   PicoFrameStart();
   PicoFrameHints();
@@ -306,12 +327,17 @@ end:
 
 void PicoFrameDrawOnly(void)
 {
+#ifndef GNW_32X_CORE
   if (!(PicoIn.AHW & PAHW_SMS)) {
     PicoFrameStart();
     PicoDrawSync(Pico.m.pal?239:223, 0, 0);
   } else {
     PicoFrameDrawOnlyMS();
   }
+#else
+  PicoFrameStart();
+  PicoDrawSync(Pico.m.pal?239:223, 0, 0);
+#endif
 }
 
 void PicoGetInternal(pint_t which, pint_ret_t *r)

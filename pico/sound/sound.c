@@ -11,9 +11,13 @@
 #include <string.h>
 #include "../pico_int.h"
 #include "ym2612.h"
+#ifndef GNW_32X_CORE
 #include "ym2413.h"
+#endif
 #include "sn76496.h"
+#ifndef GNW_32X_CORE
 #include "../cd/megasd.h"
+#endif
 #include "resampler.h"
 #include "mix.h"
 
@@ -25,8 +29,10 @@ void (*PsndMix_32_to_16)(s16 *dest, s32 *src, int count) = mix_32_to_16_stereo;
 // +1 for a fill triggered by an instruction overhanging into the next scanline
 static s32 PsndBuffer[2*(54000+100)/50+2];
 
+#ifndef GNW_32X_CORE
 // cdda output buffer
 s16 cdda_out_buffer[2*1152];
+#endif
 
 // FM resampling polyphase FIR
 static resampler_t *fmresampler;
@@ -34,15 +40,19 @@ static int (*PsndFMUpdate)(s32 *buffer, int length, int stereo, int is_buf_empty
 
 PICO_INTERNAL void PsndInit(void)
 {
+#ifndef GNW_32X_CORE
   opll = OPLL_new(OSC_NTSC/15, OSC_NTSC/15/72);
   OPLL_setChipType(opll,0);
   OPLL_reset(opll);
+#endif
 }
 
 PICO_INTERNAL void PsndExit(void)
 {
+#ifndef GNW_32X_CORE
   OPLL_delete(opll);
   opll = NULL;
+#endif
 
   resampler_free(fmresampler); fmresampler = NULL;
 }
@@ -70,6 +80,7 @@ static int YM2612UpdateFIR(s32 *buffer, int length, int stereo, int is_buf_empty
   return ymchans;
 }
 
+#ifndef GNW_32X_CORE
 // resample SMS FM from its native 49716Hz/49262Hz with polyphase FIR filter
 static void YM2413Update(s32 *buffer, int length, int stereo)
 {
@@ -86,6 +97,7 @@ static int YM2413UpdateFIR(s32 *buffer, int length, int stereo, int is_buf_empty
   resampler_update(fmresampler, buffer, length, YM2413Update);
   return 0;
 }
+#endif
 
 // FIR setup, looks for a close enough rational number matching the ratio
 static void YMFM_setup_FIR(int inrate, int outrate, int stereo)
@@ -129,8 +141,10 @@ void PsndRerate(int preserve_state)
   void *state = NULL;
   int target_fps = Pico.m.pal ? 50 : 60;
   int target_lines = Pico.m.pal ? 313 : 262;
+#ifndef GNW_32X_CORE
   int sms_clock = Pico.m.pal ? OSC_PAL/15 : OSC_NTSC/15;
   int ym2413_rate = (sms_clock + 36) / 72;
+#endif
   int ym2612_clock = Pico.m.pal ? OSC_PAL/7 : OSC_NTSC/7;
   int ym2612_rate = YM2612_NATIVE_RATE();
   int ym2612_init = !preserve_state;
@@ -149,6 +163,7 @@ void PsndRerate(int preserve_state)
       state_size = YM2612PicoStateSave3(state, state_size);
   }
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_SMS) {
     OPLL_setRate(opll, ym2413_rate);
     if (!preserve_state)
@@ -156,6 +171,9 @@ void PsndRerate(int preserve_state)
     YMFM_setup_FIR(ym2413_rate, PicoIn.sndRate, 0);
     PsndFMUpdate = YM2413UpdateFIR;
   } else if ((PicoIn.opt & POPT_EN_FM_FILTER) && ym2612_rate != PicoIn.sndRate) {
+#else
+  if ((PicoIn.opt & POPT_EN_FM_FILTER) && ym2612_rate != PicoIn.sndRate) {
+#endif
     // polyphase FIR resampler, resampling directly from native to output rate
     if (ym2612_init)
       YM2612Init(ym2612_clock, ym2612_rate,
@@ -196,7 +214,9 @@ void PsndRerate(int preserve_state)
 
   // clear all buffers
   memset32(PsndBuffer, 0, sizeof(PsndBuffer)/4);
+#ifndef GNW_32X_CORE
   memset(cdda_out_buffer, 0, sizeof(cdda_out_buffer));
+#endif
   if (PicoIn.sndOut)
     PsndClear();
 
@@ -204,8 +224,10 @@ void PsndRerate(int preserve_state)
   PsndMix_32_to_16 = (PicoIn.opt & POPT_EN_STEREO) ? mix_32_to_16_stereo : mix_32_to_16_mono;
   mix_reset(PicoIn.opt & POPT_EN_SNDFILTER ? PicoIn.sndFilterAlpha : 0);
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_PICO)
     PicoReratePico();
+#endif
 }
 
 
@@ -360,6 +382,7 @@ PICO_INTERNAL void PsndDoFM(int cyc_to)
     PsndFMUpdate(PsndBuffer + pos, len, stereo, 1);
 }
 
+#ifndef GNW_32X_CORE
 PICO_INTERNAL void PsndDoPCM(int cyc_to)
 {
   int pos, len;
@@ -385,7 +408,9 @@ PICO_INTERNAL void PsndDoPCM(int cyc_to)
   }
   PicoPicoPCMUpdate(PicoIn.sndOut + pos, len, stereo);
 }
+#endif
 
+#ifndef GNW_32X_CORE
 // cdda
 static void cdda_raw_update(s32 *buffer, int length, int stereo)
 {
@@ -442,6 +467,7 @@ void cdda_start_play(int lba_base, int lba_offset, int lb_len)
     pm_seek(Pico_mcd->cdda_stream, 44, SEEK_CUR);
   }
 }
+#endif // !GNW_32X_CORE
 
 
 PICO_INTERNAL void PsndClear(void)
@@ -487,12 +513,14 @@ static int PsndRender(int offset, int length)
       SN76496Update(psgbuf, length-psglen, stereo);
   }
 
+#ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_PICO) {
     // always need to render sound for interrupts
     s16 *buf16 = PicoIn.sndOut ? PicoIn.sndOut + (pcmlen<<stereo) : NULL;
     PicoPicoPCMUpdate(buf16, length-pcmlen, stereo);
     return length;
   }
+#endif
 
   // Fill up DAC output in case of missing samples (Q rounding errors)
   if (length-daclen > 0 && PicoIn.sndOut) {
@@ -523,6 +551,7 @@ static int PsndRender(int offset, int length)
       PsndFMUpdate(fmbuf, length-fmlen, stereo, 1);
   }
 
+#ifndef GNW_32X_CORE
   // CD: PCM sound
   if (PicoIn.AHW & PAHW_MCD) {
     pcd_pcm_update(buf32, length-offset, stereo);
@@ -539,6 +568,7 @@ static int PsndRender(int offset, int length)
     else
       cdda_raw_update(buf32, length-offset, stereo);
   }
+#endif
 
   if ((PicoIn.AHW & PAHW_32X) && (PicoIn.opt & POPT_EN_PWM))
     p32x_pwm_update(buf32, length-offset, stereo);
