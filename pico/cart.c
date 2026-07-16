@@ -758,6 +758,22 @@ int PicoCartLoad(pm_file *f, const unsigned char *rom, unsigned int romsize,
   if (size <= 0) return 1;
   size = (size+3)&~3; // Round up to a multiple of 4
 
+#ifdef GNW_32X_CORE
+  if (rom != NULL) {
+    /* GNW zero-copy: the caller hands a flash-mapped, read-only, ALREADY
+     * byteswapped image (the porting layer caches it with byte_swap=true).
+     * The PicoCartAlloc+memcpy below was the first device boot's fatal
+     * _sbrk OOM (need=4 MB, device heap 81 KB — a host rig never sees it),
+     * and the Byteswap further down would both double-swap and write to
+     * flash. .32x images are raw (no SMD interleave), so bind directly. */
+    rom_data = (unsigned char *)rom;
+    rom_alloc_size = size;
+    if (prom)  *prom = rom_data;
+    if (psize) *psize = size;
+    return 0;
+  }
+#endif
+
   // Allocate space for the rom plus padding
   rom_data = PicoCartAlloc(size, is_sms);
   if (rom_data == NULL) {
