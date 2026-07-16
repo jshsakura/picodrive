@@ -30,6 +30,8 @@ M68K_CONTEXT PicoCpuFM68k;
 M68K_CONTEXT PicoCpuFS68k;
 #endif
 #endif
+// gwenesis 68000 (EMU_G68K): the context is the core's own global `m68k`
+// (cpu/gwenesis68k/m68kcpu.c) - single-context core, no sub-68k.
 
 
 static int do_ack(int level)
@@ -116,6 +118,17 @@ static void SekIntAckF68K(unsigned level)
 }
 #endif
 
+#ifdef EMU_G68K
+// same contract as SekIntAckM68K: fold the ack result back into the pending
+// irq level; the core always takes the autovector (the return is ignored,
+// which is correct for the MD where all interrupts are autovectored)
+static int SekIntAckG68K(int level)
+{
+  m68k.int_level = do_ack(level) << 8;
+  return M68K_INT_ACK_AUTOVECTOR;
+}
+#endif
+
 
 PICO_INTERNAL void SekInit(void)
 {
@@ -145,6 +158,12 @@ PICO_INTERNAL void SekInit(void)
   PicoCpuFM68k.iack_handler = SekIntAckF68K;
   PicoCpuFM68k.sr = 0x2704; // Z flag
 #endif
+#ifdef EMU_G68K
+  memset(&m68k, 0, sizeof(m68k));
+  g68k_bus_init();          // safe memory_map defaults until pico maps arrive
+  m68k_init();
+  m68k_set_int_ack_callback(SekIntAckG68K);
+#endif
 }
 
 
@@ -164,6 +183,14 @@ PICO_INTERNAL int SekReset(void)
 #ifdef EMU_F68K
   fm68k_reset(&PicoCpuFM68k);
 #endif
+#ifdef EMU_G68K
+  g68k_map_sync_all();      // pulse_reset fetches SP/PC vectors through the map
+  m68k.sp[0] = 0;
+  m68k_set_irq(0);
+  m68k.cycles = 0;
+  m68k_pulse_reset();
+  m68k.cycle_end = m68k.cycles; // idle: cycles-left = 0
+#endif
 
   return 0;
 }
@@ -181,6 +208,13 @@ void SekStepM68k(void)
   Pico.t.m68c_cnt += m68k_execute(1);
 #elif defined(EMU_F68K)
   Pico.t.m68c_cnt += fm68k_emulate(&PicoCpuFM68k, 1, 0);
+#elif defined(EMU_G68K)
+  // rebase and run one instruction's worth; done = 1 - cycles-left-at-end
+  m68k.cycles = 0;
+  m68k.cycle_end = 1 * 7;
+  m68k_run(m68k.cycle_end);
+  Pico.t.m68c_cnt += 1 - (int)(m68k.cycle_end - m68k.cycles) / 7;
+  m68k.cycle_end = m68k.cycles;
 #endif
 }
 
@@ -224,6 +258,19 @@ PICO_INTERNAL void SekPackCpu(unsigned char *cpu, int is_sub)
   *(u32  *)(cpu+0x48)=context->asp;
   cpu[0x4c] = context->interrupts[0];
   cpu[0x4d] = (context->execinfo & FM68K_HALTED) ? 1 : 0;
+#elif defined(EMU_G68K)
+  // same 0x58-byte blob layout as the other cores:
+  // dar[16]@0x00, pc@0x40, sr@0x44, asp@0x48, int_level@0x4c, stopped@0x4d
+  if (!is_sub) {
+    memcpy(cpu, m68k.dar, 0x40);
+    *(u32 *)(cpu+0x40) = m68k.pc;
+    *(u32 *)(cpu+0x44) = m68k_get_reg(M68K_REG_SR);
+    *(u32 *)(cpu+0x48) = m68k.sp[m68k.s_flag ^ 4 /* SFLAG_SET */];
+    cpu[0x4c] = m68k.int_level >> 8;
+    cpu[0x4d] = m68k.stopped;
+  }
+  else
+    memset(cpu, 0, 0x4e); // no sub-68k in this backend
 #endif
 
   if (is_sub) {
@@ -270,6 +317,15 @@ PICO_INTERNAL void SekUnpackCpu(const unsigned char *cpu, int is_sub)
   context->interrupts[0] = cpu[0x4c];
   context->execinfo &= ~FM68K_HALTED;
   if (cpu[0x4d]&1) context->execinfo |= FM68K_HALTED;
+#elif defined(EMU_G68K)
+  if (!is_sub) {
+    m68k_set_reg(M68K_REG_SR, *(u32 *)(cpu+0x44));
+    memcpy(m68k.dar, cpu, 0x40);
+    m68k.pc = *(u32 *)(cpu+0x40);
+    m68k.sp[m68k.s_flag ^ 4 /* SFLAG_SET */] = *(u32 *)(cpu+0x48);
+    m68k.int_level = cpu[0x4c] << 8;
+    m68k.stopped = cpu[0x4d];
+  }
 #endif
   if (is_sub) {
     SekCycleCntS68k = *(u32 *)(cpu+0x50);

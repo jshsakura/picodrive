@@ -126,11 +126,63 @@ extern m68ki_cpu_core PicoCpuMM68k, PicoCpuMS68k;
 #endif
 #endif // EMU_M68K
 
+#ifdef EMU_G68K
+// gwenesis const-table Musashi fork (Genesis Plus GX lineage). Single global
+// context `m68k`; runs to an ABSOLUTE master-cycle (7 x 68k cycle) target,
+// m68k.cycles is a uint32 up-counter rebased to 0 every timeslice by
+// SekExecM68k (pico_cmn.c), so it never overflows and never compares
+// "already ahead". All cycle table entries are multiples of 7, so the /7
+// conversions below are exact.
+#include <cpu/gwenesis68k/g68k.h>
+#define SekCyclesLeft ((int)(m68k.cycle_end - m68k.cycles) / 7)
+#define SekPc  (m68k.pc & 0x00ffffff)
+#define SekDar(x) (m68k.dar[x])
+#define SekSr  m68k_get_reg(M68K_REG_SR)
+#define SekSetStop(x) { \
+	if (x) { m68k.stopped = G68K_STOP_LEVEL_STOP; SekEndRun(0); } \
+	else m68k.stopped = 0; \
+}
+#define SekIsStoppedM68k() (m68k.stopped == G68K_STOP_LEVEL_STOP)
+#define SekShouldInterrupt() (m68k.int_level > m68k.int_mask)
+
+#define SekNotPolling g68k_not_polling
+
+// avoid m68k_set_irq() for delaying to work (same as EMU_M68K)
+#define SekInterrupt(irq) m68k.int_level = (irq) << 8
+#define SekIrqLevel       (m68k.int_level >> 8)
+
+// Sega CD sub-68k is NOT supported by this backend (the core has a single
+// global context). These stubs only keep pico/cd compiling in full builds;
+// PAHW_MCD must not be used at runtime with EMU_G68K.
+#define SekCyclesLeftS68k g68k_s68k_stub[0]
+#define SekPcS68k 0
+#define SekDarS68k(x) 0
+#define SekSrS68k 0x2704
+#define SekSetStopS68k(x) do { (void)(x); } while (0)
+#define SekIsStoppedS68k() 1
+#define SekNotPollingS68k g68k_s68k_stub[1]
+
+#endif // EMU_G68K
+
 // number of cycles done (can be checked anywhere)
 #define SekCyclesDone()  (Pico.t.m68c_cnt - SekCyclesLeft)
 
 // burn cycles while not in SekRun() and while in
 #define SekCyclesBurn(c)    Pico.t.m68c_cnt += c
+#ifdef EMU_G68K
+// consume timeslice cycles by advancing the up-counter (7x master cycles);
+// they count as done, same as decrementing FAME's io_cycle_counter
+#define SekCyclesBurnRun(c) m68k.cycles += (c) * 7
+
+// note: sometimes may extend timeslice to delay an irq
+#define SekEndRun(after) do { \
+  int g68k_left_ = (int)(m68k.cycle_end - m68k.cycles) / 7; \
+  if (g68k_left_ > (after)) { \
+    Pico.t.m68c_cnt -= g68k_left_ - (after); \
+    m68k.cycle_end = m68k.cycles + (after) * 7; \
+  } \
+} while (0)
+#else
 #define SekCyclesBurnRun(c) SekCyclesLeft -= c
 
 // note: sometimes may extend timeslice to delay an irq
@@ -138,6 +190,7 @@ extern m68ki_cpu_core PicoCpuMM68k, PicoCpuMS68k;
   Pico.t.m68c_cnt -= SekCyclesLeft - (after); \
   SekCyclesLeft = after; \
 }
+#endif
 
 extern unsigned int SekCycleCntS68k;
 extern unsigned int SekCycleAimS68k;

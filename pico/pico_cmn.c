@@ -35,8 +35,26 @@ static void SekExecM68k(int cyc_do)
   Pico.t.m68c_cnt += m68k_execute(cyc_do) - cyc_do;
 #elif defined(EMU_F68K)
   Pico.t.m68c_cnt += fm68k_emulate(&PicoCpuFM68k, cyc_do, 0) - cyc_do;
+#elif defined(EMU_G68K)
+  {
+    // gwenesis m68k_run() runs to an ABSOLUTE master-cycle target (7x 68k
+    // cycles) on a uint32 up-counter. Rebase to 0 every timeslice so the
+    // counter never overflows and never starts "already ahead".
+    // Accounting mirrors the FAME line exactly: done = cyc_do - left_at_end
+    // (left is negative on overshoot; memhandlers ending the run early via
+    // SekEndRun have already accounted the unspent cycles themselves).
+    int g68k_done;
+    m68k.cycles = 0;
+    m68k.cycle_end = (unsigned int)cyc_do * 7;
+    m68k_run(m68k.cycle_end);
+    g68k_done = cyc_do - (int)(m68k.cycle_end - m68k.cycles) / 7;
+    Pico.t.m68c_cnt += g68k_done - cyc_do;
+    m68k.cycle_end = m68k.cycles; // idle: cycles-left = 0
+  }
 #endif
+#ifndef EMU_G68K
   SekCyclesLeft = 0;
+#endif
 }
 
 static int SekSyncM68k(int once)

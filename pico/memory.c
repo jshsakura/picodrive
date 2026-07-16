@@ -94,6 +94,12 @@ void cpu68k_map_set(uptr *map, u32 start_addr, u32 end_addr,
       ctx->Fetch[i] = base;
   }
 #endif
+#ifdef EMU_G68K
+  // keep the gwenesis 68k memory_map in sync (runtime remaps included)
+  if (map == m68k_read8_map || map == m68k_read16_map ||
+      map == m68k_write8_map || map == m68k_write16_map)
+    g68k_map_sync_range(start_addr, end_addr);
+#endif
 }
 
 // more specialized/optimized function (does same as above)
@@ -126,6 +132,10 @@ void cpu68k_map_read_mem(u32 start_addr, u32 end_addr, void *ptr, int is_sub)
     for (; i <= (end_addr >> shiftout); i++)
       ctx->Fetch[i] = addr;
   }
+#endif
+#ifdef EMU_G68K
+  if (!is_sub)
+    g68k_map_sync_range(start_addr, end_addr);
 #endif
 }
 
@@ -163,6 +173,10 @@ void cpu68k_map_all_ram(u32 start_addr, u32 end_addr, void *ptr, int is_sub)
       ctx->Fetch[i] = addr;
   }
 #endif
+#ifdef EMU_G68K
+  if (!is_sub)
+    g68k_map_sync_range(start_addr, end_addr);
+#endif
 }
 
 void cpu68k_map_read_funcs(u32 start_addr, u32 end_addr, u32 (*r8)(u32), u32 (*r16)(u32), int is_sub)
@@ -184,6 +198,10 @@ void cpu68k_map_read_funcs(u32 start_addr, u32 end_addr, u32 (*r8)(u32), u32 (*r
   ar16 = (ar16 >> 1 ) | MAP_FLAG;
   for (i = start_addr >> shift; i <= end_addr >> shift; i++)
     r8map[i] = ar8, r16map[i] = ar16;
+#ifdef EMU_G68K
+  if (!is_sub)
+    g68k_map_sync_range(start_addr, end_addr);
+#endif
 }
 
 void cpu68k_map_all_funcs(u32 start_addr, u32 end_addr, u32 (*r8)(u32), u32 (*r16)(u32), void (*w8)(u32, u32), void (*w16)(u32, u32), int is_sub)
@@ -212,6 +230,10 @@ void cpu68k_map_all_funcs(u32 start_addr, u32 end_addr, u32 (*r8)(u32), u32 (*r1
   aw16 = (aw16 >> 1 ) | MAP_FLAG;
   for (i = start_addr >> shift; i <= end_addr >> shift; i++)
     r8map[i] = ar8, r16map[i] = ar16, w8map[i] = aw8, w16map[i] = aw16;
+#ifdef EMU_G68K
+  if (!is_sub)
+    g68k_map_sync_range(start_addr, end_addr);
+#endif
 }
 
 u32 PicoRead16_floating(u32 a)
@@ -271,6 +293,9 @@ void m68k_map_unmap(u32 start_addr, u32 end_addr)
   addr = (uptr)m68k_unmapped_write16;
   for (i = start_addr >> shift; i <= end_addr >> shift; i++)
     m68k_write16_map[i] = (addr >> 1) | MAP_FLAG;
+#ifdef EMU_G68K
+  g68k_map_sync_range(start_addr, end_addr);
+#endif
 }
 
 #ifndef _ASM_MEMORY_C
