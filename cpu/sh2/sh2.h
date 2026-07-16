@@ -110,6 +110,14 @@ void sh2_unpack(SH2 *sh2, const unsigned char *buff);
 int  sh2_execute_drc(SH2 *sh2c, int cycles);
 int  sh2_execute_interpreter(SH2 *sh2c, int cycles);
 
+#ifdef GNW_32X_CORE
+/* runtime kill-switch for the GNW cycle-exact SH-2 fast-loop levers
+ * (DT/BF countdown fast-forward + BRA-self idle park, cpu/sh2/mame/sh2pico.c).
+ * 1 = on (default). Flip to 0 for an on-device A/B — bit-identical output
+ * either way, only host CPU time changes. */
+extern int gnw_sh2_fastloops;
+#endif
+
 static __inline void sh2_execute_prepare(SH2 *sh2, int use_drc)
 {
 #ifdef DRC_SH2

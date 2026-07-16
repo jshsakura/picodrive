@@ -118,9 +118,132 @@ unsigned long long g_sh2_insns;
 
 #ifndef DRC_CMP
 
+/* GNW_SH2_FASTLOOPS: cycle-exact fast-forward of the two loop shapes that
+ * dominate 32X SH-2 time (sweep: DOOM 56% / Kolibri 62% idle in BRA-self
+ * spins; VR 50% / Metal Head 11% in DT/BF countdown delays).
+ *
+ * Both levers reproduce the interpreter's EXACT cycle flow (the WS idle-skip
+ * lesson: state-exact != cycle-exact).  Per-instruction costs in THIS
+ * interpreter (dispatch charges 1, handlers add extra):
+ *     NOP = 1,  DT = 1,  BF taken = 3,  BF not-taken = 1,  BRA = 2.
+ * Note the BUSY_LOOP_HACKS blocks in mame/sh2.c are inert here: they compare
+ * against the opcode at sh2->ppc, which in this dispatch loop is the
+ * executing instruction's OWN address, so the pattern never matches.
+ *
+ * The skip is capped so sh2->icount stays >= 1 (never crosses the current
+ * timeslice) and the last iteration is always interpreted for real.  Within
+ * a slice the skipped instructions perform no data access, so no poll
+ * detection, no sh2_end_run, no test_irq source exists mid-skip (irqs are
+ * posted from memhandlers or between slices only; we bail if test_irq is
+ * already pending).  At every slice boundary the architectural state and
+ * icount are therefore bit-identical to plain interpretation.
+ *
+ * Off (#undef) compiles byte-identical to upstream; gnw_sh2_fastloops is a
+ * runtime kill-switch for on-device A/B. */
+#if defined(GNW_32X_CORE) && !defined(DRC_SH2)
+#define GNW_SH2_FASTLOOPS 1
+#endif
+
+#ifdef GNW_SH2_FASTLOOPS
+
+#ifndef GNW_SH2_FASTLOOPS_DEFAULT
+#define GNW_SH2_FASTLOOPS_DEFAULT 1
+#endif
+int gnw_sh2_fastloops = GNW_SH2_FASTLOOPS_DEFAULT;
+
+/* per-core negative cache, direct-mapped by PC: insn addresses where
+ * detection already failed (backward BF whose body is not NOPs+DT — e.g.
+ * comm/VDP poll loops — or BRA-self whose delay slot is not a NOP).  The
+ * probe is inlined at the dispatch site so a hot REAL loop (a taken
+ * backward BF every iteration) rejects in a few instructions with no call
+ * and no re-scan; without that, Kolibri's polls paid +4-5% host for zero
+ * skips.  Stale or evicted entries only cost missed skips, never
+ * correctness. */
+#define GNW_DL_REJ_SLOTS 8	/* 32 bytes per core */
+static unsigned int gnw_dl_reject[2][GNW_DL_REJ_SLOTS];
+#define GNW_DL_REJ_SLOT(sh2) \
+	(&gnw_dl_reject[(sh2)->is_slave & 1][((sh2)->ppc >> 1) & (GNW_DL_REJ_SLOTS - 1)])
+
+/* Fast-forward hook, entered only for a directly-fetched (non-delay-slot)
+ * BF with negative displacement or BRA-to-self, with no irq test pending.
+ * At entry: ppc = insn address, pc = ppc + 2, delay = 0, icount >= 1. */
+static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
+{
+	if (opcode == 0xaffe)	/* BRA $ */
+	{
+		/* idle spin `BRA $; NOP` — burns 3 cycles/iteration (BRA 2 +
+		 * delay-slot NOP 1) forever; park by consuming every complete
+		 * iteration that fits in the slice, then interpret the last
+		 * one for real (exact exit state: pc/ppc/ea/delay/icount). */
+		int m;
+		if ((UINT32)(UINT16)RW(sh2, sh2->pc) != 0x0009) {
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+		m = (sh2->icount - 1) / 3;
+		if (m > 0)
+			sh2->icount -= 3 * m;
+		return;
+	}
+
+	/* countdown delay loop: backward BF whose body is NOPs + exactly one
+	 * DT Rn.  One iteration = body (len * 1 cycle) + BF taken (3). */
+	{
+		int disp = (int)(opcode & 0xff) - 0x100;	/* [-128,-1] */
+		unsigned int target = sh2->ppc + disp * 2 + 4;	/* = BF's taken pc */
+		unsigned int len = (unsigned int)(-disp) - 2;	/* body insns */
+		int dt_reg = -1;
+		unsigned int a, k, v;
+		int iter_cost, kmax;
+
+		if (sh2->sr & T)	/* final pass: BF won't be taken */
+			return;
+		if (len - 1 > 3)	/* body of 1..4 insns only */
+			return;
+
+		for (a = target, k = 0; k < len; a += 2, k++) {
+			UINT32 bop = (UINT32)(UINT16)RW(sh2, a);
+			if (bop == 0x0009)			/* NOP */
+				continue;
+			if ((bop & 0xf0ff) == 0x4010 && dt_reg < 0) {
+				dt_reg = (bop >> 8) & 0xf;	/* DT Rn */
+				continue;
+			}
+			dt_reg = -1;
+			break;
+		}
+		if (dt_reg < 0) {
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+
+		/* T==0 after the body's DT means r[dt_reg] != 0 here */
+		v = sh2->r[dt_reg];
+		if (v < 2)
+			return;
+		iter_cost = (int)len + 3;
+		kmax = (sh2->icount - 1) / iter_cost;	/* keep icount >= 1 */
+		if (kmax > (int)(v - 1))		/* leave the final */
+			kmax = (int)(v - 1);		/* iteration real   */
+		if (kmax < 1)
+			return;
+		sh2->r[dt_reg] = v - (unsigned int)kmax;
+		sh2->icount -= kmax * iter_cost;
+		/* fall through: the pending BF executes for real (still
+		 * taken: r[dt_reg] >= 1, T still 0), then the interpreter
+		 * finishes the loop or the slice exactly as the unskipped
+		 * flow would. */
+	}
+}
+
+#endif /* GNW_SH2_FASTLOOPS */
+
 int sh2_execute_interpreter(SH2 *sh2, int cycles)
 {
 	UINT32 opcode;
+#ifdef GNW_SH2_FASTLOOPS
+	UINT32 gnw_direct;
+#endif
 
 	sh2->icount = cycles;
 
@@ -146,16 +269,32 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 			}
 
 			sh2->pc -= 2;
+#ifdef GNW_SH2_FASTLOOPS
+			gnw_direct = 0;
+#endif
 		}
 		else
 		{
 			sh2->ppc = sh2->pc;
 			opcode = (UINT32)(UINT16)RW(sh2, sh2->pc);
+#ifdef GNW_SH2_FASTLOOPS
+			gnw_direct = 1;
+#endif
 		}
 
 		sh2->delay = 0;
 		sh2->pc += 2;
 		RIG_SH2_TICK();
+
+#ifdef GNW_SH2_FASTLOOPS
+		/* cheap opcode pre-filter first, then the negative-cache probe
+		 * inline (see gnw_dl_reject above), so ordinary hot loops
+		 * reject in a few instructions without calling the helper */
+		if (((opcode & 0xff80) == 0x8b80 || opcode == 0xaffe)
+		    && gnw_direct && *GNW_DL_REJ_SLOT(sh2) != sh2->ppc
+		    && !sh2->test_irq && gnw_sh2_fastloops)
+			gnw_sh2_fastloop(sh2, opcode);
+#endif
 
 		switch (opcode & ( 15 << 12))
 		{
