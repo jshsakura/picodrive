@@ -79,6 +79,14 @@ void g68k_map_sync_range(unsigned int start_addr, unsigned int end_addr)
 
     if (base)
       mm->base = base; /* else: keep previous base (FAME stale-fetch rule) */
+#ifdef GNW_32X_CORE
+    else if (map_flag_set(r16))
+      /* Handler-mapped page with no memory base (the 32X page-0 stub split):
+       * a stale base FETCHES the wrong program — Chaotix/VRDx jsr into the
+       * stub helpers. NULL routes fetches through the generic dispatchers
+       * (see m68k_read_immediate_16's GNW fallback). */
+      mm->base = NULL;
+#endif
 
     if (map_flag_set(r16))
       mm->read16 = (unsigned int (*)(unsigned int))MAP_FUNC(r16);

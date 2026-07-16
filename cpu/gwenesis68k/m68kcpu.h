@@ -531,11 +531,32 @@ void gwenesis_m68k_load_state(FILE *file, int ss_version);
 /* ----------------------------- Read / Write ----------------------------- */
 
 /* Read data immediately following the PC */
+#ifdef GNW_32X_CORE
+/* GNW: a handler-mapped page can have NO memory base (the 32X page-0 stub:
+ * 256B RAM shadow + flash ROM cannot be one base; g68k_bus sets base=NULL).
+ * Opcode/PC-relative fetches from such a page fall back to the generic
+ * dispatchers — QEMU-rig-proven: Chaotix/VR Deluxe jsr INTO the synthesized
+ * stub helpers at 0xC0 and executed stale-base garbage otherwise. */
+extern unsigned int m68k_read16(unsigned int a);   /* picodrive generic dispatch; */
+extern unsigned int m68k_read8(unsigned int a);    /* objcopy renames refs too    */
+#define m68k_read_immediate_16(address) \
+  (m68ki_cpu.memory_map[((address)>>16)&0xff].base \
+    ? *(uint16 *)(m68ki_cpu.memory_map[((address)>>16)&0xff].base + ((address) & 0xffff)) \
+    : (uint16)m68k_read16(address))
+#else
 #define m68k_read_immediate_16(address) *(uint16 *)(m68ki_cpu.memory_map[((address)>>16)&0xff].base + ((address) & 0xffff))
+#endif
 #define m68k_read_immediate_32(address) (m68k_read_immediate_16(address) << 16) | (m68k_read_immediate_16(address+2))
 
 /* Read data relative to the PC */
+#ifdef GNW_32X_CORE
+#define m68k_read_pcrelative_8(address) \
+  (m68ki_cpu.memory_map[((address)>>16)&0xff].base \
+    ? READ_BYTE(m68ki_cpu.memory_map[((address)>>16)&0xff].base, (address) & 0xffff) \
+    : (uint8)m68k_read8(address))
+#else
 #define m68k_read_pcrelative_8(address)  READ_BYTE(m68ki_cpu.memory_map[((address)>>16)&0xff].base, (address) & 0xffff)
+#endif
 
 #define m68k_read_pcrelative_16(address) m68k_read_immediate_16(address)
 #define m68k_read_pcrelative_32(address) m68k_read_immediate_32(address)
