@@ -727,10 +727,22 @@ struct Pico32xMem
   unsigned char drclit_ram[1 << (18 - SH2_DRCBLK_RAM_SHIFT)];
 #endif
   unsigned short dram[2][0x20000/2];    // AKA fb
+#ifdef GNW_32X_CORE
+  /* GNW: the 64K composed bank image (0x100 stub + ROM copy) lives OUTSIDE the
+   * struct, in AHB SRAM allocated at get_bios() time by the porting layer —
+   * RAM_EMU cannot afford it. Union of POINTERS mirrors the upstream union of
+   * arrays, so every Pico32xMem->m68k_rom[...] use compiles unchanged; only
+   * the sizeof() sites differ (see M68K_ROM_SZ in 32x/memory.c). */
+  union {
+    unsigned char *m68k_rom;
+    unsigned char *m68k_rom_bank;
+  };
+#else
   union {
     unsigned char  m68k_rom[0x100];
     unsigned char  m68k_rom_bank[0x10000]; // M68K_BANK_SIZE
   };
+#endif
 #ifdef DRC_SH2
   unsigned char drcblk_da[2][1 << (12 - SH2_DRCBLK_DA_SHIFT)];
   unsigned char drclit_da[2][1 << (12 - SH2_DRCBLK_DA_SHIFT)];

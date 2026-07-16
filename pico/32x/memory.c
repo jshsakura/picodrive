@@ -2209,16 +2209,34 @@ static const u16 ssh2_code[] = {
   0x2400, 0x0018, // 23c _start_cd
 };
 
+#ifdef GNW_32X_CORE
+/* GNW: m68k_rom_bank is a pointer (see pico_int.h) — the 64K image is provided
+ * by the porting layer from AHB SRAM. sizeof() on the union members would give
+ * pointer sizes, so the byte counts are spelled out here; the #else forms are
+ * the upstream sizeof()s, so a non-GNW build is unchanged. */
+extern unsigned char *gnw_m68k_bank_alloc(void);
+#define M68K_ROM_SZ       0x100
+#define M68K_ROM_BANK_SZ  0x10000
+#else
+#define M68K_ROM_SZ       sizeof(Pico32xMem->m68k_rom)
+#define M68K_ROM_BANK_SZ  sizeof(Pico32xMem->m68k_rom_bank)
+#endif
+
 static void get_bios(void)
 {
   u16 *ps;
   u32 *pl;
   int i;
 
+#ifdef GNW_32X_CORE
+  if (Pico32xMem->m68k_rom_bank == NULL)
+    Pico32xMem->m68k_rom_bank = gnw_m68k_bank_alloc();
+#endif
+
   // M68K ROM
   if (p32x_bios_g != NULL) {
     elprintf(EL_STATUS|EL_32X, "32x: using supplied 68k BIOS");
-    Byteswap(Pico32xMem->m68k_rom, p32x_bios_g, sizeof(Pico32xMem->m68k_rom));
+    Byteswap(Pico32xMem->m68k_rom, p32x_bios_g, M68K_ROM_SZ);
   }
   else {
     static const u16 andb[] = { 0x0239, 0x00fe, 0x00a1, 0x5107 };
@@ -2254,9 +2272,9 @@ static void get_bios(void)
     ps[0xfe/2] = 0x4e75; // rts
   }
   // fill remaining m68k_rom page with game ROM
-  memcpy(Pico32xMem->m68k_rom_bank + sizeof(Pico32xMem->m68k_rom),
-    Pico.rom + sizeof(Pico32xMem->m68k_rom),
-    sizeof(Pico32xMem->m68k_rom_bank) - sizeof(Pico32xMem->m68k_rom));
+  memcpy(Pico32xMem->m68k_rom_bank + M68K_ROM_SZ,
+    Pico.rom + M68K_ROM_SZ,
+    M68K_ROM_BANK_SZ - M68K_ROM_SZ);
 
   // MSH2
   if (p32x_bios_m != NULL) {
@@ -2375,7 +2393,7 @@ void PicoMemSetup32x(void)
 
   if (!Pico.m.ncart_in) {
     // MD ROM area
-    rs = sizeof(Pico32xMem->m68k_rom_bank);
+    rs = M68K_ROM_BANK_SZ;
     cpu68k_map_set(m68k_read8_map,   0x000000, rs - 1, Pico32xMem->m68k_rom_bank, 0);
     cpu68k_map_set(m68k_read16_map,  0x000000, rs - 1, Pico32xMem->m68k_rom_bank, 0);
     cpu68k_map_set(m68k_write8_map,  0x000000, rs - 1, PicoWrite8_hint, 1); // TODO verify
