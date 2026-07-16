@@ -378,8 +378,17 @@ PICO_INTERNAL void PsndDoFM(int cyc_to)
     stereo = 1;
     pos <<= 1;
   }
-  if (PicoIn.opt & POPT_EN_FM)
+  if (PicoIn.opt & POPT_EN_FM) {
+#ifdef RIG_PHASE_PROF
+    /* mid-frame FM render fires from 68K/Z80 FM-port writes and timer sync —
+     * book it to pp_fm and pause the live CPU accumulator */
+    pprof_start(fm); pprof_start(m68k); pprof_start(z80);
+#endif
     PsndFMUpdate(PsndBuffer + pos, len, stereo, 1);
+#ifdef RIG_PHASE_PROF
+    pprof_end_sub(z80); pprof_end_sub(m68k); pprof_end(fm);
+#endif
+  }
 }
 
 #ifndef GNW_32X_CORE
@@ -547,8 +556,16 @@ static int PsndRender(int offset, int length)
   if (length-fmlen > 0 && PicoIn.sndOut) {
     s32 *fmbuf = buf32 + ((fmlen-offset) << stereo);
     Pico.snd.fm_pos += (length-fmlen) << 20;
-    if (PicoIn.opt & POPT_EN_FM)
+    if (PicoIn.opt & POPT_EN_FM) {
+#ifdef RIG_PHASE_PROF
+      /* frame-end FM residual: book to pp_fm, pause the enclosing pp_sound */
+      pprof_start(fm); pprof_start(sound);
+#endif
       PsndFMUpdate(fmbuf, length-fmlen, stereo, 1);
+#ifdef RIG_PHASE_PROF
+      pprof_end_sub(sound); pprof_end(fm);
+#endif
+    }
   }
 
 #ifndef GNW_32X_CORE
@@ -570,8 +587,15 @@ static int PsndRender(int offset, int length)
   }
 #endif
 
-  if ((PicoIn.AHW & PAHW_32X) && (PicoIn.opt & POPT_EN_PWM))
+  if ((PicoIn.AHW & PAHW_32X) && (PicoIn.opt & POPT_EN_PWM)) {
+#ifdef RIG_PHASE_PROF
+    pprof_start(pwm); pprof_start(sound);
+#endif
     p32x_pwm_update(buf32, length-offset, stereo);
+#ifdef RIG_PHASE_PROF
+    pprof_end_sub(sound); pprof_end(pwm);
+#endif
+  }
 
   // convert + limit to normal 16bit output
   if (PicoIn.sndOut)

@@ -1270,6 +1270,9 @@ do { \
 #endif
 
 // profiling
+#if defined(RIG_PHASE_PROF) && !defined(PPROF)
+#define PPROF 1 /* the GNW QEMU rig's phase profiler rides the pprof probes */
+#endif
 #ifdef PPROF
 #include <platform/linux/pprof.h>
 #else

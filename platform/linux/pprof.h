@@ -13,6 +13,11 @@ enum pprof_points {
   pp_msh2,
   pp_ssh2,
   pp_memsh,
+#ifdef RIG_PHASE_PROF
+  pp_fm,      /* rig: YM2612 render, all call sites (paused out of cpu/sound) */
+  pp_pwm,     /* rig: 32X PWM chip render (paused out of sound) */
+  pp_draw32x, /* rig: 32X compositor (pico/32x/draw.c layer merge) */
+#endif
   pp_dummy,
   pp_total_points
 };
@@ -46,6 +51,16 @@ extern unsigned int (*gp2x_get_ticks_us)(void);
 #define unglitch_timer(di) \
   if ((signed int)(di) < 0) di = 0
 #endif
+
+#elif defined(RIG_PHASE_PROF)
+/* GNW QEMU M7 rig (tools/m7_qemu_rig): CMSDK timer on icount virtual time —
+ * a tick delta IS an executed-instruction count (rig_runtime.c calibrates
+ * the insn/tick factor). Counter storage lives in rig_32x.c. */
+typedef unsigned long long pp_type;
+#include <stdint.h>
+extern uint32_t rig_timer_now(void);
+#define pprof_get_one() ((unsigned int)rig_timer_now())
+#define unglitch_timer(x)
 
 #else
 #error no timer

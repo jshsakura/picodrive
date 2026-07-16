@@ -10,6 +10,13 @@
 #include "../sound/ym2612.h"
 #include <cpu/sh2/compiler.h>
 
+#ifdef RIG_PHASE_PROF
+/* This file's pprof "draw" windows are the 32X compositor (layer merge over
+ * the MD line buffer) — attribute them to their own bucket so the rig's
+ * phase table can separate MD VDP line render (pico/draw.c) from it. */
+#define pp_draw pp_draw32x
+#endif
+
 struct Pico32x Pico32x;
 SH2 sh2s[2];
 
@@ -289,6 +296,12 @@ static void Pico32xRenderSync(int lines)
 
 void Pico32xDrawSync(SH2 *sh2)
 {
+#ifdef RIG_PHASE_PROF
+  /* mid-frame draw sync fires from CPU memory handlers — pause whichever CPU
+   * accumulator is live so its bucket holds pure interpreter+bus time (the
+   * draw work below books itself into pp_draw/pp_draw32x) */
+  pprof_start(m68k); pprof_start(msh2); pprof_start(ssh2);
+#endif
   // the fast renderer isn't operating on a line-by-line base
   if (sh2 && !(PicoIn.opt & POPT_ALT_RENDERER)) {
     unsigned int cycle = (sh2 ? sh2_cycles_done_m68k(sh2) : SekCyclesDone());
@@ -309,6 +322,9 @@ void Pico32xDrawSync(SH2 *sh2)
     // remember line we sync'ed to
     Pico32x.sync_line = line;
   }
+#ifdef RIG_PHASE_PROF
+  pprof_end_sub(ssh2); pprof_end_sub(msh2); pprof_end_sub(m68k);
+#endif
 }
 
 static void p32x_render_frame(void)
@@ -323,6 +339,8 @@ static void p32x_render_frame(void)
       lines = 240;
 
     Pico32xRenderSync(lines);
+
+    pprof_end(draw); // was missing: PPROF builds leaked scope + refcount here
   }
 }
 
