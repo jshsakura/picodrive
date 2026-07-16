@@ -116,6 +116,48 @@ unsigned long long g_sh2_insns;
 #define RIG_SH2_TICK() ((void)0)
 #endif
 
+/* RIG_SH2_PC_HIST: SH-2 guest-PC histogram for the QEMU M7 feasibility rig.
+ * Two sparse open-addressed tables (master/slave), keyed by ppc, counting
+ * direct vs delay-slot executions. Reveals which guest loops eat the msh2/
+ * ssh2 phase — fastloop-off shows loops fastloop already kills, fastloop-on
+ * shows the residual hot set. Never compiled in device/libretro builds.
+ * rig_32x.c reads the table (non-static) and prints the top-N report. */
+#ifdef RIG_SH2_PC_HIST
+#define RIG_PC_HIST_SLOTS 8192
+struct rig_pc_slot {
+	unsigned int pc;
+	unsigned int occupied;
+	unsigned short opcode;
+	unsigned long long dir;
+	unsigned long long dly;
+};
+struct rig_pc_slot rig_pchist[2][RIG_PC_HIST_SLOTS];
+
+static void rig_pchist_tick(SH2 *sh2, int is_delay, unsigned short opcode)
+{
+	unsigned core = sh2->is_slave & 1;
+	unsigned int pc = sh2->ppc;
+	unsigned start = (pc >> 1) & (RIG_PC_HIST_SLOTS - 1);
+	for (unsigned i = 0; i < RIG_PC_HIST_SLOTS; i++) {
+		unsigned s = (start + i) & (RIG_PC_HIST_SLOTS - 1);
+		struct rig_pc_slot *e = &rig_pchist[core][s];
+		if (!e->occupied) {
+			e->occupied = 1; e->pc = pc; e->opcode = opcode;
+			e->dir = is_delay ? 0 : 1; e->dly = is_delay ? 1 : 0;
+			return;
+		}
+		if (e->pc == pc) {
+			if (is_delay) e->dly++; else e->dir++;
+			return;
+		}
+	}
+	/* table full — extremely unlikely with 8192 slots; sample silently */
+}
+#define RIG_PC_HIST_TICK(sh2, is_delay, op) rig_pchist_tick(sh2, is_delay, op)
+#else
+#define RIG_PC_HIST_TICK(sh2, is_delay, op) ((void)0)
+#endif
+
 #ifndef DRC_CMP
 
 /* GNW_SH2_FASTLOOPS: cycle-exact fast-forward of the two loop shapes that
@@ -186,6 +228,63 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 		return;
 	}
 
+	/* BFS countdown loop: backward BFS (delay-slot branch) whose body is
+	 * a single TST Rn,Rn (sets T = (Rn==0)) and whose delay slot is
+	 * ADD #-1,Rn.  Loop: do { Rn--; } while (Rn != 0); on loop exit
+	 * Rn = 0xFFFFFFFF (the final delay-slot decrement runs after T sets).
+	 * Dominant msh2 hot path on DOOM 32X (~62% of guest master insns),
+	 * invisible to the DT-only BF case below because BFS (0x8Fxx) and a
+	 * TST+ADD#-1 body are both outside its filters. */
+	if ((opcode & 0xff00) == 0x8f00)
+	{
+		int disp8 = (int)(signed char)(opcode & 0xff);	/* [-128,127] */
+		unsigned int target, bfs_at, dslot_at;
+		UINT32 bop, dop;
+		int rn;
+		unsigned int v;
+		int iter_cost, kmax;
+
+		if (disp8 >= 0) {			/* forward: not a loop */
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+		target = sh2->ppc + disp8 * 2 + 4;	/* BFS taken pc */
+		bfs_at = sh2->ppc;
+		if (target + 2 != bfs_at) {		/* exactly 1 body insn */
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+		bop = (UINT32)(UINT16)RW(sh2, target);	/* TST Rn,Rn */
+		if ((bop & 0xf00f) != 0x2008
+		    || ((bop >> 8) & 0xf) != ((bop >> 4) & 0xf)) {
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+		rn = (bop >> 8) & 0xf;
+		dslot_at = bfs_at + 2;
+		dop = (UINT32)(UINT16)RW(sh2, dslot_at);	/* ADD #-1,Rn */
+		if ((dop & 0xf0ff) != 0x70ff || ((dop >> 8) & 0xf) != rn) {
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+		if (sh2->sr & T)			/* T==1: BFS not taken */
+			return;
+		v = sh2->r[rn];
+		if (v < 2)				/* last iteration real */
+			return;
+		/* iter = TST(1) + BFS taken(3) + ADD delay(1) = 5 host-icount;
+		 * tuned against fb checksum, keep bit-exact to plain interp. */
+		iter_cost = 5;
+		kmax = (sh2->icount - 1) / iter_cost;
+		if (kmax > (int)(v - 1))
+			kmax = (int)(v - 1);
+		if (kmax < 1)
+			return;
+		sh2->r[rn] = v - (unsigned int)kmax;
+		sh2->icount -= kmax * iter_cost;
+		return;
+	}
+
 	/* countdown delay loop: backward BF whose body is NOPs + exactly one
 	 * DT Rn.  One iteration = body (len * 1 cycle) + BF taken (3). */
 	{
@@ -244,6 +343,9 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 #ifdef GNW_SH2_FASTLOOPS
 	UINT32 gnw_direct;
 #endif
+#ifdef RIG_SH2_PC_HIST
+	int rig_is_delay = 0;
+#endif
 
 	sh2->icount = cycles;
 
@@ -272,6 +374,9 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 #ifdef GNW_SH2_FASTLOOPS
 			gnw_direct = 0;
 #endif
+#ifdef RIG_SH2_PC_HIST
+			rig_is_delay = 1;
+#endif
 		}
 		else
 		{
@@ -280,17 +385,22 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 #ifdef GNW_SH2_FASTLOOPS
 			gnw_direct = 1;
 #endif
+#ifdef RIG_SH2_PC_HIST
+			rig_is_delay = 0;
+#endif
 		}
 
 		sh2->delay = 0;
 		sh2->pc += 2;
 		RIG_SH2_TICK();
+		RIG_PC_HIST_TICK(sh2, rig_is_delay, (unsigned short)opcode);
 
 #ifdef GNW_SH2_FASTLOOPS
 		/* cheap opcode pre-filter first, then the negative-cache probe
 		 * inline (see gnw_dl_reject above), so ordinary hot loops
 		 * reject in a few instructions without calling the helper */
-		if (((opcode & 0xff80) == 0x8b80 || opcode == 0xaffe)
+		if ((((opcode & 0xff80) == 0x8b80) || ((opcode & 0xff80) == 0x8f80)
+		     || opcode == 0xaffe)
 		    && gnw_direct && *GNW_DL_REJ_SLOT(sh2) != sh2->ppc
 		    && !sh2->test_irq && gnw_sh2_fastloops)
 			gnw_sh2_fastloop(sh2, opcode);
