@@ -183,15 +183,19 @@ void memset32(void *dest, int c, int count);
 */
 //#define TL_TAB_LEN (13*2*TL_RES_LEN)
 #define TL_TAB_LEN (13*TL_RES_LEN*256/8) // 106496*2
+#ifndef GNW_32X_CORE
 UINT16 ym_tl_tab[TL_TAB_LEN];
 
 /* ~3K wasted but oh well */
 UINT16 ym_tl_tab2[13*TL_RES_LEN];
+#endif
 
 #define ENV_QUIET		(2*13*TL_RES_LEN/8)
 
 /* sin waveform table in 'decibel' scale (use only period/4 values) */
+#ifndef GNW_32X_CORE
 static UINT16 ym_sin_tab[256];
+#endif
 
 static int ym_init_tab;
 
@@ -433,6 +437,7 @@ static const UINT8 lfo_ams_depth_shift[4] = {8, 3, 1, 0};
    samples (32*432=13824; 32 because we store only a quarter of whole
             waveform in the table below)
 */
+#ifndef GNW_32X_CORE /* only used to build lfo_pm_table at runtime; precomputed under GNW_32X_CORE */
 static const UINT8 lfo_pm_output[7*8][8]={ /* 7 bits meaningful (of F-NUMBER), 8 LFO output levels per one depth (out of 32), 8 LFO depths */
 /* FNUM BIT 4: 000 0001xxxx */
 /* DEPTH 0 */ {0,   0,   0,   0,   0,   0,   0,   0},
@@ -505,9 +510,19 @@ static const UINT8 lfo_pm_output[7*8][8]={ /* 7 bits meaningful (of F-NUMBER), 8
 /* DEPTH 7 */ {0,   0,0x20,0x30,0x40,0x40,0x50,0x60},
 
 };
+#endif /* !GNW_32X_CORE */
 
 /* all 128 LFO PM waveforms */
+#ifndef GNW_32X_CORE
 static INT32 lfo_pm_table[128*8*32]; /* 128 combinations of 7 bits meaningful (of F-NUMBER), 8 LFO depths, 32 LFO output levels per one depth */
+#else
+/* GNW_32X_CORE: the four purely-constant synthesis tables are precomputed
+ * into .rodata (XIP-able from flash) instead of being generated into ~351 KB
+ * of writable RAM at init.  Byte-identical to the runtime fill; proven by
+ * tools/verify_ym2612_const.c.  (fn_table below stays runtime-filled: it
+ * depends on clock/rate/prescaler.) */
+#include "ym2612_const_tables.h"
+#endif
 
 /* there are 2048 FNUMs that can be generated using FNUM/BLK registers
 	but LFO works with one more bit of a precision so we really need 4096 elements */
@@ -1463,13 +1478,16 @@ static void reset_channels(FM_CH *CH)
 /* initialize generic tables */
 static void init_tables(void)
 {
+#ifndef GNW_32X_CORE
 	signed int i,x,y,p;
 	signed int n;
 	double o,m;
+#endif
 
 	if (ym_init_tab) return;
 	ym_init_tab = 1;
 
+#ifndef GNW_32X_CORE
 	for (i=0; i < 256; i++)
 	{
 		/* non-standard sinus */
@@ -1565,6 +1583,7 @@ static void init_tables(void)
 			}
 		}
 	}
+#endif /* !GNW_32X_CORE */
 }
 
 
