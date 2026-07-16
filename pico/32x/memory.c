@@ -1385,6 +1385,31 @@ static void m68k_write16_dram1_ow(u32 a, u32 d)
 
 // -----------------------------------------------------------------
 
+#ifdef GNW_32X_CORE
+/* GNW: the 64K bank image is not materialized at all. Bytes 0x100.. are
+ * IDENTICAL to the (byteswapped, flash-mapped) cart image, and the only
+ * runtime-writable bytes are the H-int vector (0x70-0x73, see the hint
+ * handlers below) inside the synthesized 0x100 stub. So page 0 reads go
+ * through these handlers: stub bytes from a 256-byte RAM shadow, the rest
+ * straight from Pico.rom in flash. Costs a dispatch per page-0 access
+ * (vector fetches, stub thunks — low traffic); saves 64K of RAM. */
+static u32 PicoRead8_gnwbank(u32 a)
+{
+  a &= 0xffff;
+  if (a < 0x100)
+    return Pico32xMem->m68k_rom[MEM_BE2(a)];
+  return Pico.rom[MEM_BE2(a)];
+}
+
+static u32 PicoRead16_gnwbank(u32 a)
+{
+  a &= 0xfffe;
+  if (a < 0x100)
+    return ((u16 *)Pico32xMem->m68k_rom)[a / 2];
+  return ((u16 *)Pico.rom)[a / 2];
+}
+#endif
+
 // hint vector is writeable
 static void PicoWrite8_hint(u32 a, u32 d)
 {
@@ -2229,6 +2254,8 @@ static void get_bios(void)
   int i;
 
 #ifdef GNW_32X_CORE
+  /* Only the 0x100 stub shadow (incl. the writable H-int vector) is RAM;
+   * reads >= 0x100 come from Pico.rom via PicoRead8/16_gnwbank. */
   if (Pico32xMem->m68k_rom_bank == NULL)
     Pico32xMem->m68k_rom_bank = gnw_m68k_bank_alloc();
 #endif
@@ -2271,10 +2298,13 @@ static void get_bios(void)
     memcpy(ps + 0xd4/2, p_d4, sizeof(p_d4));
     ps[0xfe/2] = 0x4e75; // rts
   }
+#ifndef GNW_32X_CORE
   // fill remaining m68k_rom page with game ROM
   memcpy(Pico32xMem->m68k_rom_bank + M68K_ROM_SZ,
     Pico.rom + M68K_ROM_SZ,
     M68K_ROM_BANK_SZ - M68K_ROM_SZ);
+#endif
+  /* GNW: no 64K copy — PicoRead8/16_gnwbank serve >= 0x100 from Pico.rom. */
 
   // MSH2
   if (p32x_bios_m != NULL) {
@@ -2394,8 +2424,14 @@ void PicoMemSetup32x(void)
   if (!Pico.m.ncart_in) {
     // MD ROM area
     rs = M68K_ROM_BANK_SZ;
+#ifdef GNW_32X_CORE
+    /* Function-mapped: 256B RAM stub + flash ROM (no 64K bank copy). */
+    cpu68k_map_set(m68k_read8_map,   0x000000, rs - 1, PicoRead8_gnwbank, 1);
+    cpu68k_map_set(m68k_read16_map,  0x000000, rs - 1, PicoRead16_gnwbank, 1);
+#else
     cpu68k_map_set(m68k_read8_map,   0x000000, rs - 1, Pico32xMem->m68k_rom_bank, 0);
     cpu68k_map_set(m68k_read16_map,  0x000000, rs - 1, Pico32xMem->m68k_rom_bank, 0);
+#endif
     cpu68k_map_set(m68k_write8_map,  0x000000, rs - 1, PicoWrite8_hint, 1); // TODO verify
     cpu68k_map_set(m68k_write16_map, 0x000000, rs - 1, PicoWrite16_hint, 1);
 
