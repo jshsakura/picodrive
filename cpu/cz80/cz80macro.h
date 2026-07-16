@@ -67,7 +67,7 @@
 	unsigned char d = D; \
 	uptr v = z80_write_map[a >> Z80_MEM_SHIFT]; \
 	if (map_flag_set(v)) \
-		((z80_write_f *)(v << 1))(a, d); \
+		((z80_write_f *)MAP_FUNC(v))(a, d); \
 	else \
 		*(unsigned char *)((v << 1) + a) = d; \
 }

@@ -53,6 +53,15 @@ static void xmap_set(uptr *map, int shift, u32 start_addr, u32 end_addr,
     return;
   }
 
+#ifdef GNW_32X_CORE
+  // Thumb function pointers carry bit0 set; strip it before the alignment
+  // check or EVERY function mapping is rejected here (and the map keeps its
+  // stale entry). Call sites re-OR the Thumb bit via MAP_FUNC. No-op on
+  // targets whose function addresses are even (x86 etc).
+  if (is_func)
+    addr &= ~(uptr)1;
+#endif
+
   if (addr & 1) {
     elprintf(EL_STATUS|EL_ANOMALY, "xmap_set: ptr is not aligned: %08lx", addr);
     return;

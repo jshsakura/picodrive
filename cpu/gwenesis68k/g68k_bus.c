@@ -60,37 +60,49 @@ void g68k_map_sync_range(unsigned int start_addr, unsigned int end_addr)
     uptr w16 = m68k_write16_map[page];
     unsigned char *base = NULL;
 
+    /* entry 0 = a never-registered page (the maps are BSS): NOT a real
+     * mapping (that would mean host_ptr == guest page start). Installing it
+     * as a base makes opcode fetch dereference the raw guest address — a
+     * wild read on the host, a Hardfault on the device (VF's MD-mode probe
+     * of 0x880000 found this). Treat it as unmapped: keep the previous
+     * fetch base and go through the generic dispatchers, which reproduce
+     * upstream's behaviour for unregistered pages. */
+    int r16_mem = !map_flag_set(r16) && r16 != 0;
+    int r8_mem  = !map_flag_set(r8)  && r8 != 0;
+
     /* choose the fetch/base pointer: 16-bit read base has priority (opcode
      * fetches go through it), then 8-bit read base */
-    if (!map_flag_set(r16))
+    if (r16_mem)
       base = g68k_page_base(r16, page);
-    else if (!map_flag_set(r8))
+    else if (r8_mem)
       base = g68k_page_base(r8, page);
 
     if (base)
       mm->base = base; /* else: keep previous base (FAME stale-fetch rule) */
 
     if (map_flag_set(r16))
-      mm->read16 = (unsigned int (*)(unsigned int))(r16 << 1);
-    else
+      mm->read16 = (unsigned int (*)(unsigned int))MAP_FUNC(r16);
+    else if (r16_mem)
       mm->read16 = NULL; /* direct: r16 base IS mm->base by construction */
+    else
+      mm->read16 = m68k_read16; /* unregistered page: generic dispatch */
 
     if (map_flag_set(r8))
-      mm->read8 = (unsigned int (*)(unsigned int))(r8 << 1);
-    else if (base && g68k_page_base(r8, page) == base)
+      mm->read8 = (unsigned int (*)(unsigned int))MAP_FUNC(r8);
+    else if (r8_mem && base && g68k_page_base(r8, page) == base)
       mm->read8 = NULL;
     else
-      mm->read8 = m68k_read8; /* mem-mapped but different base: dispatch */
+      mm->read8 = m68k_read8; /* different base or unregistered: dispatch */
 
     if (map_flag_set(w16))
-      mm->write16 = (void (*)(unsigned int, unsigned int))(w16 << 1);
+      mm->write16 = (void (*)(unsigned int, unsigned int))MAP_FUNC(w16);
     else if (base && g68k_page_base(w16, page) == base)
       mm->write16 = NULL;
     else
       mm->write16 = g68k_disp_write16;
 
     if (map_flag_set(w8))
-      mm->write8 = (void (*)(unsigned int, unsigned int))(w8 << 1);
+      mm->write8 = (void (*)(unsigned int, unsigned int))MAP_FUNC(w8);
     else if (base && g68k_page_base(w8, page) == base)
       mm->write8 = NULL;
     else

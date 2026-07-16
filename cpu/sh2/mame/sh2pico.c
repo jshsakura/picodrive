@@ -107,6 +107,15 @@ static unsigned int op_refs[0x10000];
 
 #include "sh2.c"
 
+/* RIG_SH2_COUNT: executed-instruction counter for the QEMU M7 feasibility rig
+ * (tools/m7_qemu_rig). Never defined in device or libretro builds. */
+#ifdef RIG_SH2_COUNT
+unsigned long long g_sh2_insns;
+#define RIG_SH2_TICK() (g_sh2_insns++)
+#else
+#define RIG_SH2_TICK() ((void)0)
+#endif
+
 #ifndef DRC_CMP
 
 int sh2_execute_interpreter(SH2 *sh2, int cycles)
@@ -146,6 +155,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 
 		sh2->delay = 0;
 		sh2->pc += 2;
+		RIG_SH2_TICK();
 
 		switch (opcode & ( 15 << 12))
 		{
@@ -247,6 +257,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 
 		sh2->delay = 0;
 		sh2->pc += 2;
+		RIG_SH2_TICK();
 
 		switch (opcode & ( 15 << 12))
 		{

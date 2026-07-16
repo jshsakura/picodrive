@@ -1940,7 +1940,7 @@ u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
   if (!map_flag_set(p))
     return *(s8 *)((p << 1) + MEM_BE2(a & sh2_map->mask));
   else
-    return ((sh2_read_handler *)(p << 1))(a, sh2);
+    return ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
 }
 
 u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
@@ -1953,7 +1953,7 @@ u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
   if (!map_flag_set(p))
     return *(s16 *)((p << 1) + (a & sh2_map->mask));
   else
-    return ((sh2_read_handler *)(p << 1))(a, sh2);
+    return ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
 }
 
 u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
@@ -1967,7 +1967,7 @@ u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
     u32 *pd = (u32 *)((p << 1) + (a & sh2_map->mask));
     return CPU_BE2(*pd);
   } else
-    return ((sh2_read_handler *)(p << 1))(a, sh2);
+    return ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
 }
 
 void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
