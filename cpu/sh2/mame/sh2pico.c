@@ -58,6 +58,13 @@ MAKE_WRITEFUNC(WL, p32x_sh2_write32)
 #define WW(sh2, a, d) p32x_sh2_write16(a, d, sh2)
 #define WL(sh2, a, d) p32x_sh2_write32(a, d, sh2)
 
+/* GNW: inline SDRAM fast path for opcode fetch.  32X code lives in SDRAM, so
+ * this avoids the cross-TU p32x_sh2_read16 call (LTO is disabled) on every
+ * fetched instruction.  Identical addressing to the read16_map SDRAM entry
+ * (p_sdram + (a & 0x3fffe)); the 0xdf mask ignores the cache-through bit
+ * 0x20000000, matching read16_map indices 0x06/0x26. */
+#define GNW_FETCH_SD(sh2, addr) ((UINT32)(UINT16)RW(sh2, addr))
+
 #endif
 
 // some stuff from sh2comn.h
@@ -158,6 +165,73 @@ static void rig_pchist_tick(SH2 *sh2, int is_delay, unsigned short opcode)
 #define RIG_PC_HIST_TICK(sh2, is_delay, op) ((void)0)
 #endif
 
+/* RIG_POLL_PEEK: diagnostic for the QEMU M7 rig. On the first visit to each
+ * backward-branch site (BF/BFS/BT/BTS with negative disp8), snapshot the full
+ * register file + gbr so the rig can resolve each spin loop's poll address
+ * and classify its memory region. Never compiled in device/libretro builds. */
+#ifdef RIG_POLL_PEEK
+struct rig_peek_entry {
+	unsigned int pc;
+	unsigned short op;
+	int core;
+	unsigned int r[16];
+	unsigned int gbr, vbr, sr;
+};
+struct rig_peek_entry rig_peek_log[128];
+unsigned int rig_peek_seen[256];
+int rig_peek_n = 0;
+
+void rig_poll_peek(SH2 *sh2, UINT32 opcode)
+{
+	unsigned int pc = sh2->ppc;
+	unsigned slot = (pc >> 1) & 255;
+	if (rig_peek_seen[slot] == pc) return;
+	if (rig_peek_n >= 128) return;
+	rig_peek_seen[slot] = pc;
+	struct rig_peek_entry *e = &rig_peek_log[rig_peek_n++];
+	e->pc = pc; e->op = (unsigned short)opcode; e->core = sh2->is_slave & 1;
+	for (int i = 0; i < 16; i++) e->r[i] = sh2->r[i];
+	e->gbr = sh2->gbr; e->vbr = sh2->vbr; e->sr = sh2->sr;
+}
+
+static inline void rig_poll_peek_check(SH2 *sh2, UINT32 opcode)
+{
+	unsigned btop = opcode & 0xff00;
+	if (btop != 0x8b00 && btop != 0x8f00
+	    && btop != 0x8900 && btop != 0x8d00) return;
+	int disp8 = (int)(signed char)(opcode & 0xff);
+	if (disp8 >= 0) return;
+	rig_poll_peek(sh2, opcode);
+}
+#define RIG_POLL_PEEK_HOOK(sh2, op) rig_poll_peek_check(sh2, op)
+#else
+#define RIG_POLL_PEEK_HOOK(sh2, op) ((void)0)
+#endif
+
+/* RIG_SDRAM_POLL_DIAG: counters + samples for the SDRAM poll case of
+ * gnw_sh2_fastloop. Off => byte-identical (no code emitted). */
+#ifdef RIG_SDRAM_POLL_DIAG
+struct rig_spd_sample { unsigned int pc, bop1, bop2, pa; };
+#define RIG_SPD_LOG_N 64
+struct rig_spd_sample rig_spd_log[RIG_SPD_LOG_N];
+volatile unsigned int rig_spd_tries, rig_spd_hits;
+volatile unsigned int rig_spd_bad_bop, rig_spd_bad_addr;
+volatile unsigned int rig_spd_addr_06, rig_spd_addr_00, rig_spd_addr_02;
+volatile unsigned int rig_spd_addr_22, rig_spd_addr_40, rig_spd_addr_other;
+volatile unsigned int rig_spd_log_n = 0;
+static inline void rig_spd_sample(unsigned int pc, unsigned int bop1,
+		unsigned int bop2, unsigned int pa) {
+	unsigned int i = rig_spd_log_n;
+	if (i < RIG_SPD_LOG_N) {
+		rig_spd_log[i].pc = pc;
+		rig_spd_log[i].bop1 = bop1;
+		rig_spd_log[i].bop2 = bop2;
+		rig_spd_log[i].pa = pa;
+		rig_spd_log_n = i + 1;
+	}
+}
+#endif
+
 #ifndef DRC_CMP
 
 /* GNW_SH2_FASTLOOPS: cycle-exact fast-forward of the two loop shapes that
@@ -228,6 +302,110 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 		return;
 	}
 
+	/* SDRAM poll loop: backward BT/BF whose body is exactly
+	 *   MOV.W @Rm,Rn      (0x6nm1)   or
+	 *   MOV.W @(disp4,Rm),R0 (0x85dm)
+	 * followed by TST Rn,Rm (0x2nm8) with TST dest == MOV.W dest.
+	 * The SH-2 spins on a shared SDRAM slot (cache-through bit 0x20000000
+	 * stripped) waiting for the other core to write it.  Dominant
+	 * ssh2/msh2 hot path on Kolibri 32X (~86% / 12% of guest insns) and
+	 * the same shape recurs on Metal Head / Tempo.
+	 *
+	 * Each iteration re-reads the slot (real side effect — the other
+	 * core's write must be visible) and recomputes T.  iter_cost = 5
+	 * (MOV.W 1 + TST 1 + BT/BF taken 3).  On exit (polled bit changed)
+	 * T is set so the real BT/BF falls through; R[dest] holds the last
+	 * read.  If the slice ends still looping, T is left at the loop
+	 * value so the real BT/BF branches back and the scheduler runs the
+	 * producer on the next slice.  No RPOLL/SLEEP state — deadlock-free. */
+	if ((opcode & 0xff00) == 0x8900 || (opcode & 0xff00) == 0x8b00)	/* BT / BF */
+	{
+		int disp8 = (int)(signed char)(opcode & 0xff);
+		int is_bt = (opcode & 0xff00) == 0x8900;
+#ifdef RIG_SDRAM_POLL_DIAG
+		rig_spd_tries++;
+#endif
+		if (disp8 < 0)
+		{
+			unsigned int target = sh2->ppc + disp8 * 2 + 4;
+			if (target + 4 == sh2->ppc
+			    && (target & 0xc6000000) == 0x06000000)	/* body 2 insns, in SDRAM (RW() on a sysreg/comm target would fire poll_detect and corrupt the guest's poll state) */
+			{
+				UINT32 bop1 = (UINT32)(UINT16)RW(sh2, target);
+				UINT32 bop2 = (UINT32)(UINT16)RW(sh2, target + 2);
+				int dest_reg = -1, base_reg = -1, mask_reg;
+				unsigned int pa;
+				int self_test;
+				UINT32 mask;
+
+				if ((bop1 & 0xf00f) == 0x6001) {		/* MOV.W @Rm,Rn */
+					dest_reg = (bop1 >> 8) & 0xf;
+					base_reg = (bop1 >> 4) & 0xf;
+					pa = sh2->r[base_reg];
+				} else if ((bop1 & 0xff00) == 0x8500) {	/* MOV.W @(disp4,Rm),R0 */
+					dest_reg = 0;
+					base_reg = (bop1 >> 4) & 0xf;
+					pa = sh2->r[base_reg] + (unsigned int)(bop1 & 0xf) * 2;
+				}
+#ifdef RIG_SDRAM_POLL_DIAG
+				if (dest_reg < 0
+				    || (bop2 & 0xf00f) != 0x2008
+				    || ((bop2 >> 8) & 0xf) != (unsigned)dest_reg) {
+					rig_spd_bad_bop++;
+					rig_spd_sample(sh2->ppc, bop1, bop2, 0);
+				}
+#endif
+				if (dest_reg >= 0
+				    && (bop2 & 0xf00f) == 0x2008		/* TST Rm,Rn */
+				    && ((bop2 >> 8) & 0xf) == (unsigned)dest_reg) {
+					mask_reg = (bop2 >> 4) & 0xf;
+					self_test = (mask_reg == dest_reg);
+					pa &= ~0x20000000;			/* strip cache-through */
+#ifdef RIG_SDRAM_POLL_DIAG
+					if ((pa & 0xff000000) != 0x06000000) {
+						rig_spd_bad_addr++;
+						rig_spd_sample(sh2->ppc, bop1, bop2, pa);
+						if ((pa & 0xff000000) == 0x06000000) rig_spd_addr_06++;
+						else if ((pa & 0xff000000) == 0x00000000 || (pa & 0xff000000) == 0x20000000) rig_spd_addr_00++;
+						else if ((pa & 0xff000000) == 0x02000000 || (pa & 0xff000000) == 0x22000000) rig_spd_addr_02++;
+						else if ((pa & 0xff000000) == 0x22000000) rig_spd_addr_22++;
+						else if ((pa & 0xff000000) == 0x40000000) rig_spd_addr_40++;
+						else rig_spd_addr_other++;
+					}
+#endif
+					if ((pa & 0xff000000) == 0x06000000) {	/* SDRAM */
+						mask = self_test ? 0xffff : sh2->r[mask_reg];
+#ifdef RIG_SDRAM_POLL_DIAG
+						rig_spd_hits++;
+						rig_spd_sample(sh2->ppc, bop1, bop2, pa);
+#endif
+						/* BT taken (T==1) loops; BF taken (T==0) loops.
+						 * TST: T = ((val & mask) == 0). */
+						int want_t_loop = is_bt ? 1 : 0;
+						while (sh2->icount >= 5) {
+							unsigned int val = (UINT32)(UINT16)RW(sh2, pa);
+							int t = ((val & mask) == 0) ? 1 : 0;
+							sh2->r[dest_reg] = val;	/* MOV.W dest */
+							if (t != want_t_loop) {		/* exit cond met */
+								if (t) sh2->sr |= T;
+								else   sh2->sr &= ~T;
+								return;			/* BT/BF falls through */
+							}
+							sh2->icount -= 5;
+						}
+						/* slice exhausted still in loop: leave T at the
+						 * loop value so the real BT/BF branches back */
+						if (want_t_loop) sh2->sr |= T;
+						else            sh2->sr &= ~T;
+						return;
+					}
+				}
+			}
+		}
+		/* not an SDRAM poll we recognise: fall through to the
+		 * countdown cases below (no reject caching here) */
+	}
+
 	/* BFS countdown loop: backward BFS (delay-slot branch) whose body is
 	 * a single TST Rn,Rn (sets T = (Rn==0)) and whose delay slot is
 	 * ADD #-1,Rn.  Loop: do { Rn--; } while (Rn != 0); on loop exit
@@ -262,26 +440,60 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 		}
 		rn = (bop >> 8) & 0xf;
 		dslot_at = bfs_at + 2;
-		dop = (UINT32)(UINT16)RW(sh2, dslot_at);	/* ADD #-1,Rn */
-		if ((dop & 0xf0ff) != 0x70ff || ((dop >> 8) & 0xf) != rn) {
-			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+		dop = (UINT32)(UINT16)RW(sh2, dslot_at);
+#ifdef RIG_SDRAM_POLL_DIAG
+		rig_spd_sample(sh2->ppc, bop, dop, sh2->gbr);
+		rig_spd_tries++;
+#endif
+		if ((dop & 0xf0ff) == 0x70ff && ((dop >> 8) & 0xf) == rn) {
+			/* ADD #-1,Rn: countdown (Doom).  iter = TST(1) + BFS
+			 * taken(3) + ADD delay(1) = 5 host-icount; tuned against
+			 * fb checksum, keep bit-exact to plain interp. */
+			if (sh2->sr & T)			/* T==1: BFS not taken */
+				return;
+			v = sh2->r[rn];
+			if (v < 2)				/* last iteration real */
+				return;
+			iter_cost = 5;
+			kmax = (sh2->icount - 1) / iter_cost;
+			if (kmax > (int)(v - 1))
+				kmax = (int)(v - 1);
+			if (kmax < 1)
+				return;
+			sh2->r[rn] = v - (unsigned int)kmax;
+			sh2->icount -= kmax * iter_cost;
 			return;
 		}
-		if (sh2->sr & T)			/* T==1: BFS not taken */
-			return;
-		v = sh2->r[rn];
-		if (v < 2)				/* last iteration real */
-			return;
-		/* iter = TST(1) + BFS taken(3) + ADD delay(1) = 5 host-icount;
-		 * tuned against fb checksum, keep bit-exact to plain interp. */
-		iter_cost = 5;
-		kmax = (sh2->icount - 1) / iter_cost;
-		if (kmax > (int)(v - 1))
-			kmax = (int)(v - 1);
-		if (kmax < 1)
-			return;
-		sh2->r[rn] = v - (unsigned int)kmax;
-		sh2->icount -= kmax * iter_cost;
+		/* MOV.W @(disp8,GBR),R0 (0xC5xx) in the delay slot: SDRAM poll loop
+		 * (Metal Head ~59% msh2).  Loop shape: TST R0,R0 (body, 1 insn) +
+		 * BFS back + MOV.W @(disp8,GBR),R0 (delay slot poll read).  Each
+		 * iteration: R0 = MEM[GBR + disp8*2]; TST sets T=(R0==0); BFS
+		 * taken while T==0.  Exit when the slot reads 0.  body TST
+		 * self-test forces rn==0, matching the MOV.W dest R0.  Every
+		 * iteration performs the real SDRAM read (side-effect safe,
+		 * deadlock-free: icount exhaustion => BFS taken => next timeslice
+		 * runs the producer).  iter_cost = TST1 + BFS3 + MOV.W1 = 5. */
+		if ((dop & 0xff00) == 0xc500 && rn == 0) {
+			unsigned int disp_gbr = dop & 0xff;
+			unsigned int poll_addr = (sh2->gbr + disp_gbr * 2) & ~0x20000000u;
+			if ((poll_addr & 0xc6000000) == 0x06000000) {
+				if (sh2->sr & T)		/* T==1: BFS not taken */
+					return;
+				while (sh2->icount >= 5) {
+					unsigned int val = (unsigned int)(UINT16)RW(sh2, poll_addr);
+					sh2->r[0] = val;
+					sh2->icount -= 5;
+					if (val == 0) {
+						sh2->sr |= T;	/* T=1: BFS exits */
+						return;		/* BFS not taken */
+					}
+					/* T stays 0: BFS taken (loop) */
+				}
+				sh2->sr &= ~T;			/* slice done: BFS taken */
+				return;
+			}
+		}
+		*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
 		return;
 	}
 
@@ -357,7 +569,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		if (sh2->delay)
 		{
 			sh2->ppc = sh2->delay;
-			opcode = (UINT32)(UINT16)RW(sh2, sh2->delay);
+			opcode = GNW_FETCH_SD(sh2, sh2->delay);
 
 			// TODO: more branch types
 			if ((opcode >> 13) == 5) { // BRA/BSR
@@ -381,7 +593,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		else
 		{
 			sh2->ppc = sh2->pc;
-			opcode = (UINT32)(UINT16)RW(sh2, sh2->pc);
+			opcode = GNW_FETCH_SD(sh2, sh2->pc);
 #ifdef GNW_SH2_FASTLOOPS
 			gnw_direct = 1;
 #endif
@@ -394,12 +606,14 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		sh2->pc += 2;
 		RIG_SH2_TICK();
 		RIG_PC_HIST_TICK(sh2, rig_is_delay, (unsigned short)opcode);
+		RIG_POLL_PEEK_HOOK(sh2, opcode);
 
 #ifdef GNW_SH2_FASTLOOPS
 		/* cheap opcode pre-filter first, then the negative-cache probe
 		 * inline (see gnw_dl_reject above), so ordinary hot loops
 		 * reject in a few instructions without calling the helper */
 		if ((((opcode & 0xff80) == 0x8b80) || ((opcode & 0xff80) == 0x8f80)
+		     || ((opcode & 0xff80) == 0x8980) || ((opcode & 0xff80) == 0x8d80)
 		     || opcode == 0xaffe)
 		    && gnw_direct && *GNW_DL_REJ_SLOT(sh2) != sh2->ppc
 		    && !sh2->test_irq && gnw_sh2_fastloops)
@@ -495,19 +709,20 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		if (sh2->delay)
 		{
 			sh2->ppc = sh2->delay;
-			opcode = (UINT32)(UINT16)RW(sh2, sh2->delay);
+			opcode = GNW_FETCH_SD(sh2, sh2->delay);
 			sh2->pc -= 2;
 		}
 		else
 		{
 			sh2->ppc = sh2->pc;
-			opcode = (UINT32)(UINT16)RW(sh2, sh2->pc);
+			opcode = GNW_FETCH_SD(sh2, sh2->pc);
 		}
 
 		sh2->delay = 0;
 		sh2->pc += 2;
 		RIG_SH2_TICK();
 
+		RIG_POLL_PEEK_HOOK(sh2, opcode);
 		switch (opcode & ( 15 << 12))
 		{
 		case  0<<12: op0000(sh2, opcode); break;
