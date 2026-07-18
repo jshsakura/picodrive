@@ -13,6 +13,7 @@
 #include "compiler.h"
 
 #define I 0xf0
+#define T 0x00000001
 
 int sh2_init(SH2 *sh2, int is_slave, SH2 *other_sh2)
 {
@@ -45,6 +46,7 @@ void sh2_reset(SH2 *sh2)
 	sh2->pc = p32x_sh2_read32(0, sh2);
 	sh2->r[15] = p32x_sh2_read32(4, sh2);
 	sh2->sr = I;
+	sh2->t_flag = 0;
 	sh2->vbr = 0;
 	sh2->pending_int_irq = 0;
 }
@@ -52,6 +54,7 @@ void sh2_reset(SH2 *sh2)
 void sh2_do_irq(SH2 *sh2, int level, int vector)
 {
 	sh2->sr &= 0x3f3;
+	sh2->sr = (sh2->sr & ~T) | sh2->t_flag;	/* reconcile T before push */
 
 	sh2->r[15] -= 4;
 	p32x_sh2_write32(sh2->r[15], sh2->sr, sh2);	/* push SR onto stack */

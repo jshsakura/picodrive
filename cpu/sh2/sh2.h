@@ -22,7 +22,8 @@ typedef struct SH2_
 	uint32_t	ppc;
 	uint32_t	pr;
 	uint32_t	sr;
-	uint32_t	gbr, vbr;	// 50
+	uint32_t	t_flag;		// decomposed T bit (sr & 1), hot path
+	uint32_t	gbr, vbr;	// 54
 	uint32_t	mach, macl;	// 58
 
 	// common

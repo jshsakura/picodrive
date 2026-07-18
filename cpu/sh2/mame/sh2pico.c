@@ -387,16 +387,16 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 							int t = ((val & mask) == 0) ? 1 : 0;
 							sh2->r[dest_reg] = val;	/* MOV.W dest */
 							if (t != want_t_loop) {		/* exit cond met */
-								if (t) sh2->sr |= T;
-								else   sh2->sr &= ~T;
+								if (t) sh2->t_flag = T;
+								else   sh2->t_flag = 0;
 								return;			/* BT/BF falls through */
 							}
 							sh2->icount -= 5;
 						}
 						/* slice exhausted still in loop: leave T at the
 						 * loop value so the real BT/BF branches back */
-						if (want_t_loop) sh2->sr |= T;
-						else            sh2->sr &= ~T;
+						if (want_t_loop) sh2->t_flag = T;
+						else            sh2->t_flag = 0;
 						return;
 					}
 				}
@@ -449,7 +449,7 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 			/* ADD #-1,Rn: countdown (Doom).  iter = TST(1) + BFS
 			 * taken(3) + ADD delay(1) = 5 host-icount; tuned against
 			 * fb checksum, keep bit-exact to plain interp. */
-			if (sh2->sr & T)			/* T==1: BFS not taken */
+			if (sh2->t_flag)			/* T==1: BFS not taken */
 				return;
 			v = sh2->r[rn];
 			if (v < 2)				/* last iteration real */
@@ -477,19 +477,19 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 			unsigned int disp_gbr = dop & 0xff;
 			unsigned int poll_addr = (sh2->gbr + disp_gbr * 2) & ~0x20000000u;
 			if ((poll_addr & 0xc6000000) == 0x06000000) {
-				if (sh2->sr & T)		/* T==1: BFS not taken */
+				if (sh2->t_flag)		/* T==1: BFS not taken */
 					return;
 				while (sh2->icount >= 5) {
 					unsigned int val = (unsigned int)(UINT16)RW(sh2, poll_addr);
 					sh2->r[0] = val;
 					sh2->icount -= 5;
 					if (val == 0) {
-						sh2->sr |= T;	/* T=1: BFS exits */
+						sh2->t_flag = T;	/* T=1: BFS exits */
 						return;		/* BFS not taken */
 					}
 					/* T stays 0: BFS taken (loop) */
 				}
-				sh2->sr &= ~T;			/* slice done: BFS taken */
+				sh2->t_flag = 0;			/* slice done: BFS taken */
 				return;
 			}
 		}
@@ -507,7 +507,7 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 		unsigned int a, k, v;
 		int iter_cost, kmax;
 
-		if (sh2->sr & T)	/* final pass: BF won't be taken */
+		if (sh2->t_flag)	/* final pass: BF won't be taken */
 			return;
 		if (len - 1 > 3)	/* body of 1..4 insns only */
 			return;
@@ -564,6 +564,13 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 	if (sh2->icount <= 0)
 		goto out;
 
+	const void *gnw_dt[16] = {
+		&&gnw_op0,  &&gnw_op1,  &&gnw_op2,  &&gnw_op3,
+		&&gnw_op4,  &&gnw_op5,  &&gnw_op6,  &&gnw_op7,
+		&&gnw_op8,  &&gnw_op9,  &&gnw_opA,  &&gnw_opB,
+		&&gnw_opC,  &&gnw_opD,  &&gnw_opE,  &&gnw_opF
+	};
+
 	do
 	{
 		if (sh2->delay)
@@ -572,9 +579,10 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 			opcode = GNW_FETCH_SD(sh2, sh2->delay);
 
 			// TODO: more branch types
-			if ((opcode >> 13) == 5) { // BRA/BSR
-				sh2->r[15] -= 4;
-				WL(sh2, sh2->r[15], sh2->sr);
+		if ((opcode >> 13) == 5) { // BRA/BSR
+			sh2->sr = (sh2->sr & ~T) | sh2->t_flag;	/* reconcile lazy T */
+			sh2->r[15] -= 4;
+			WL(sh2, sh2->r[15], sh2->sr);
 				sh2->r[15] -= 4;
 				WL(sh2, sh2->r[15], sh2->pc);
 				sh2->pc = RL(sh2, sh2->vbr + 6 * 4);
@@ -620,25 +628,24 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 			gnw_sh2_fastloop(sh2, opcode);
 #endif
 
-		switch (opcode & ( 15 << 12))
-		{
-		case  0<<12: op0000(sh2, opcode); break;
-		case  1<<12: op0001(sh2, opcode); break;
-		case  2<<12: op0010(sh2, opcode); break;
-		case  3<<12: op0011(sh2, opcode); break;
-		case  4<<12: op0100(sh2, opcode); break;
-		case  5<<12: op0101(sh2, opcode); break;
-		case  6<<12: op0110(sh2, opcode); break;
-		case  7<<12: op0111(sh2, opcode); break;
-		case  8<<12: op1000(sh2, opcode); break;
-		case  9<<12: op1001(sh2, opcode); break;
-		case 10<<12: op1010(sh2, opcode); break;
-		case 11<<12: op1011(sh2, opcode); break;
-		case 12<<12: op1100(sh2, opcode); break;
-		case 13<<12: op1101(sh2, opcode); break;
-		case 14<<12: op1110(sh2, opcode); break;
-		default: op1111(sh2, opcode); break;
-		}
+		goto *gnw_dt[opcode >> 12];
+		gnw_op0:  op0000(sh2, opcode); goto gnw_next;
+		gnw_op1:  op0001(sh2, opcode); goto gnw_next;
+		gnw_op2:  op0010(sh2, opcode); goto gnw_next;
+		gnw_op3:  op0011(sh2, opcode); goto gnw_next;
+		gnw_op4:  op0100(sh2, opcode); goto gnw_next;
+		gnw_op5:  op0101(sh2, opcode); goto gnw_next;
+		gnw_op6:  op0110(sh2, opcode); goto gnw_next;
+		gnw_op7:  op0111(sh2, opcode); goto gnw_next;
+		gnw_op8:  op1000(sh2, opcode); goto gnw_next;
+		gnw_op9:  op1001(sh2, opcode); goto gnw_next;
+		gnw_opA:  op1010(sh2, opcode); goto gnw_next;
+		gnw_opB:  op1011(sh2, opcode); goto gnw_next;
+		gnw_opC:  op1100(sh2, opcode); goto gnw_next;
+		gnw_opD:  op1101(sh2, opcode); goto gnw_next;
+		gnw_opE:  op1110(sh2, opcode); goto gnw_next;
+		gnw_opF:  op1111(sh2, opcode); goto gnw_next;
+		gnw_next:
 
 		sh2->icount--;
 
