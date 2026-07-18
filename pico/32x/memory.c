@@ -1957,6 +1957,14 @@ typedef void REGPARM(3) (sh2_write_handler)(u32 a, u32 d, SH2 *sh2);
 
 u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
 {
+  /* SDRAM fastpath: 256KB at 0x06000000 (mirror 0x26000000 cache-through).
+   * The map lookup costs ~11 cycles on device (call + index + deref);
+   * direct p_sdram access costs ~2 cycles.  Write path already uses
+   * direct p_sdram (sh2_write8_sdram). */
+  u32 h = a & 0xff000000;
+  if (h == 0x06000000 || h == 0x26000000)
+    return ((u8 *)sh2->p_sdram)[MEM_BE2(a & 0x3ffff)];
+
   const sh2_memmap *sh2_map = sh2->read8_map;
   uptr p;
 
@@ -1970,6 +1978,11 @@ u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
 
 u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
 {
+  /* SDRAM fastpath — see read8 comment above. */
+  u32 h = a & 0xff000000;
+  if (h == 0x06000000 || h == 0x26000000)
+    return *(u16 *)((u8 *)sh2->p_sdram + (a & 0x3fffe));
+
   const sh2_memmap *sh2_map = sh2->read16_map;
   uptr p;
 
@@ -1983,6 +1996,13 @@ u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
 
 u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
 {
+  /* SDRAM fastpath — see read8 comment above. */
+  u32 h = a & 0xff000000;
+  if (h == 0x06000000 || h == 0x26000000) {
+    u32 *pd = (u32 *)((u8 *)sh2->p_sdram + (a & 0x3fffc));
+    return CPU_BE2(*pd);
+  }
+
   const sh2_memmap *sh2_map = sh2->read32_map;
   uptr p;
 
