@@ -13,10 +13,10 @@ enum pprof_points {
   pp_msh2,
   pp_ssh2,
   pp_memsh,
-#ifdef RIG_PHASE_PROF
-  pp_fm,      /* rig: YM2612 render, all call sites (paused out of cpu/sound) */
-  pp_pwm,     /* rig: 32X PWM chip render (paused out of sound) */
-  pp_draw32x, /* rig: 32X compositor (pico/32x/draw.c layer merge) */
+#if defined(RIG_PHASE_PROF) || defined(MD32X_DEVICE_PROFILE)
+  pp_fm,      /* YM2612 render, all call sites (paused out of cpu/sound) */
+  pp_pwm,     /* 32X PWM chip render (paused out of sound) */
+  pp_draw32x, /* 32X compositor (pico/32x/draw.c layer merge) */
 #endif
   pp_dummy,
   pp_total_points
@@ -60,6 +60,16 @@ typedef unsigned long long pp_type;
 #include <stdint.h>
 extern uint32_t rig_timer_now(void);
 #define pprof_get_one() ((unsigned int)rig_timer_now())
+#define unglitch_timer(x)
+
+#elif defined(MD32X_DEVICE_PROFILE)
+/* Real STM32H7: DWT->CYCCNT, armed once by common_emu_enable_dwt_cycles()
+ * before the main loop starts (Core/Src/porting/md32x/main_md32x.c). A tick
+ * delta IS a device cycle count directly — no calibration needed, unlike the
+ * QEMU rig's icount. Counter storage lives in main_md32x.c. */
+typedef unsigned long long pp_type;
+extern unsigned int md32x_dwt_now(void);
+#define pprof_get_one() md32x_dwt_now()
 #define unglitch_timer(x)
 
 #else

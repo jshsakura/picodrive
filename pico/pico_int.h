@@ -1270,8 +1270,10 @@ do { \
 #endif
 
 // profiling
-#if defined(RIG_PHASE_PROF) && !defined(PPROF)
-#define PPROF 1 /* the GNW QEMU rig's phase profiler rides the pprof probes */
+#if (defined(RIG_PHASE_PROF) || defined(MD32X_DEVICE_PROFILE)) && !defined(PPROF)
+#define PPROF 1 /* the GNW QEMU rig's phase profiler, and the on-device DWT
+                   ledger (Core/Src/porting/md32x/main_md32x.c), both ride
+                   the same pprof probes below. */
 #endif
 #ifdef PPROF
 #include <platform/linux/pprof.h>

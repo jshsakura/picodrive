@@ -10,10 +10,10 @@
 #include "../sound/ym2612.h"
 #include <cpu/sh2/compiler.h>
 
-#ifdef RIG_PHASE_PROF
+#if defined(RIG_PHASE_PROF) || defined(MD32X_DEVICE_PROFILE)
 /* This file's pprof "draw" windows are the 32X compositor (layer merge over
- * the MD line buffer) — attribute them to their own bucket so the rig's
- * phase table can separate MD VDP line render (pico/draw.c) from it. */
+ * the MD line buffer) — attribute them to their own bucket so the phase
+ * table can separate MD VDP line render (pico/draw.c) from it. */
 #define pp_draw pp_draw32x
 #endif
 
@@ -296,7 +296,7 @@ static void Pico32xRenderSync(int lines)
 
 void Pico32xDrawSync(SH2 *sh2)
 {
-#ifdef RIG_PHASE_PROF
+#if defined(RIG_PHASE_PROF) || defined(MD32X_DEVICE_PROFILE)
   /* mid-frame draw sync fires from CPU memory handlers — pause whichever CPU
    * accumulator is live so its bucket holds pure interpreter+bus time (the
    * draw work below books itself into pp_draw/pp_draw32x) */
@@ -322,7 +322,7 @@ void Pico32xDrawSync(SH2 *sh2)
     // remember line we sync'ed to
     Pico32x.sync_line = line;
   }
-#ifdef RIG_PHASE_PROF
+#if defined(RIG_PHASE_PROF) || defined(MD32X_DEVICE_PROFILE)
   pprof_end_sub(ssh2); pprof_end_sub(msh2); pprof_end_sub(m68k);
 #endif
 }

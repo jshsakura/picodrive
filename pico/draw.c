@@ -1876,7 +1876,7 @@ void PicoDrawSync(int to, int off, int on)
   int bgc = est->Pico->video.reg[7] & 0x3f;
 
   pprof_start(draw);
-#ifdef RIG_PHASE_PROF
+#if defined(RIG_PHASE_PROF) || defined(MD32X_DEVICE_PROFILE)
   /* line render fires mid-frame from VDP-access handlers of any CPU — pause
    * the live CPU accumulator so draw time books only into pp_draw */
   pprof_start(m68k); pprof_start(msh2); pprof_start(ssh2);
@@ -1895,7 +1895,7 @@ void PicoDrawSync(int to, int off, int on)
     est->HighCol += count*HighColIncrement;
     est->DrawLineDest = (char *)est->DrawLineDest + count*DrawLineDestIncrement;
     est->DrawScanline = to+1;
-#ifndef RIG_PHASE_PROF
+#if !defined(RIG_PHASE_PROF) && !defined(MD32X_DEVICE_PROFILE)
     // early return leaks the pprof scope/refcount; falling through is
     // identical (line == to+1 skips both the loop and the last-line branch,
     // and DrawScanline is re-assigned the same value)
@@ -1923,7 +1923,7 @@ void PicoDrawSync(int to, int off, int on)
   }
   est->DrawScanline = line;
 
-#ifdef RIG_PHASE_PROF
+#if defined(RIG_PHASE_PROF) || defined(MD32X_DEVICE_PROFILE)
   pprof_end_sub(ssh2); pprof_end_sub(msh2); pprof_end_sub(m68k);
 #endif
   pprof_end(draw);
