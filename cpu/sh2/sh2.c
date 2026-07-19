@@ -105,6 +105,7 @@ void sh2_internal_irq(SH2 *sh2, int level, int vector)
 		sh2->pending_level = level;
 
 	sh2->test_irq = 1;
+	sh2->state &= ~SH2_STATE_SLEEP;
 }
 
 #define SH2_REG_SIZE (offsetof(SH2, macl) + sizeof(sh2->macl))

@@ -267,6 +267,13 @@ static inline void rig_spd_sample(unsigned int pc, unsigned int bop1,
 #endif
 int gnw_sh2_fastloops = GNW_SH2_FASTLOOPS_DEFAULT;
 
+/* BRA-self idle-skip using scheduler SLEEP state. Default OFF — only
+ * safe for verified ROMs. Set to 1 by main_md32x.c via CRC whitelist. */
+#ifndef GNW_SH2_IDLE_SKIP_DEFAULT
+#define GNW_SH2_IDLE_SKIP_DEFAULT 0
+#endif
+int gnw_sh2_idle_skip = GNW_SH2_IDLE_SKIP_DEFAULT;
+
 /* per-core negative cache, direct-mapped by PC: insn addresses where
  * detection already failed (backward BF whose body is not NOPs+DT — e.g.
  * comm/VDP poll loops — or BRA-self whose delay slot is not a NOP).  The
@@ -294,6 +301,17 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 		int m;
 		if ((UINT32)(UINT16)RW(sh2, sh2->pc) != 0x0009) {
 			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+		if (gnw_sh2_idle_skip) {
+			/* Whitelisted ROM: set SLEEP instead of burning icount.
+			 * The scheduler skips sleeping SH-2s and advances their
+			 * m68krcycles_done to target — same cycle accounting as
+			 * burning the slice, but zero host cost.
+			 * Wake: sh2_internal_irq clears SLEEP on timer/VBlank/hint;
+			 * p32x_sh2_poll_event clears SLEEP at VBlank (IDLE_STATES). */
+			sh2->state |= SH2_STATE_SLEEP;
+			sh2->icount = 0;
 			return;
 		}
 		m = (sh2->icount - 1) / 3;

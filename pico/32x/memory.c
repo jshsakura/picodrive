@@ -165,6 +165,13 @@ void NOINLINE p32x_sh2_poll_detect(u32 a, SH2 *sh2, u32 flags, int maxcnt)
 void NOINLINE p32x_sh2_poll_event(u32 a, SH2 *sh2, u32 flags, u32 m68k_cycles)
 {
   a &= ~0x20000000;
+  /* SLEEP (BRA-self idle, whitelisted ROMs only) is not address-specific
+   * — wake on any event that carries the SLEEP flag (e.g. VBlank). */
+  if ((sh2->state & SH2_STATE_SLEEP) && (flags & SH2_STATE_SLEEP)) {
+    if (CYCLES_GT(m68k_cycles, sh2->m68krcycles_done) && !(sh2->state & SH2_STATE_RUN))
+      sh2->m68krcycles_done = m68k_cycles;
+    sh2->state &= ~SH2_STATE_SLEEP;
+  }
   if ((sh2->state & flags) && a - sh2->poll_addr <= 3) {
     elprintf_sh2(sh2, EL_32X, "state: %02x->%02x", sh2->state,
       sh2->state & ~flags);
