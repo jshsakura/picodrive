@@ -123,6 +123,20 @@ unsigned long long g_sh2_insns;
 #define RIG_SH2_TICK() ((void)0)
 #endif
 
+/* MD32X_DEVICE_PROFILE: per-core guest instruction counters, device-only.
+ * The msh2/ssh2 DWT buckets (main_md32x.c) already give real cycles spent
+ * per core; dividing by these gives cycles-per-guest-instruction, the number
+ * that tells whether a core's cost is dispatch overhead (ratio close to the
+ * other core's) or memory-stall-bound (ratio far higher — e.g. XIP/cache
+ * misses fetching game code straight out of external flash, see cart.c's
+ * GNW_32X_CORE zero-copy binding). Never defined in the release build. */
+#ifdef MD32X_DEVICE_PROFILE
+unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
+#define GNW_SH2_INSN_TICK(sh2) (gnw_sh2_insn_count[(sh2)->is_slave & 1]++)
+#else
+#define GNW_SH2_INSN_TICK(sh2) ((void)0)
+#endif
+
 /* RIG_SH2_PC_HIST: SH-2 guest-PC histogram for the QEMU M7 feasibility rig.
  * Two sparse open-addressed tables (master/slave), keyed by ppc, counting
  * direct vs delay-slot executions. Reveals which guest loops eat the msh2/
@@ -632,6 +646,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		sh2->delay = 0;
 		sh2->pc += 2;
 		RIG_SH2_TICK();
+		GNW_SH2_INSN_TICK(sh2);
 		RIG_PC_HIST_TICK(sh2, rig_is_delay, (unsigned short)opcode);
 		RIG_POLL_PEEK_HOOK(sh2, opcode);
 
