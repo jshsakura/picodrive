@@ -27,7 +27,17 @@ void (*PsndMix_32_to_16)(s16 *dest, s32 *src, int count) = mix_32_to_16_stereo;
 
 // master int buffer to mix to
 // +1 for a fill triggered by an instruction overhanging into the next scanline
-static s32 PsndBuffer[2*(54000+100)/50+2];
+#ifdef GNW_32X_CORE
+/* GNW's 32X core is hardcoded to MD32X_AUDIO_RATE (44100, main_md32x.c) —
+ * the generic 54kHz worst case (some picodrive platforms output higher)
+ * never applies here. Shrinking frees ~1.6K of RAM_EMU/ITCM budget the SH-2
+ * interpreter's move into ITCM needs (computed-goto dispatch must be one
+ * contiguous chunk — see 32X_SH2_ITCM_ANALYSIS.md). */
+#define PSND_BUFFER_SAMPLES (2*(44100+100)/50+2)
+#else
+#define PSND_BUFFER_SAMPLES (2*(54000+100)/50+2)
+#endif
+static s32 PsndBuffer[PSND_BUFFER_SAMPLES];
 
 #ifndef GNW_32X_CORE
 // cdda output buffer
@@ -213,7 +223,7 @@ void PsndRerate(int preserve_state)
   Pico.snd.cdda_div  = 65536LL * PicoIn.sndRate / 44100;
 
   // clear all buffers
-  memset32(PsndBuffer, 0, sizeof(PsndBuffer)/4);
+  memset32(PsndBuffer, 0, PSND_BUFFER_SAMPLES);
 #ifndef GNW_32X_CORE
   memset(cdda_out_buffer, 0, sizeof(cdda_out_buffer));
 #endif
