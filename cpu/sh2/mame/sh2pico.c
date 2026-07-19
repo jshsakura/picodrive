@@ -343,9 +343,10 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 					base_reg = (bop1 >> 4) & 0xf;
 					pa = sh2->r[base_reg];
 				} else if ((bop1 & 0xff00) == 0x8500) {	/* MOV.W @(disp4,Rm),R0 */
+					/* encoding 1000 0101 dddd mmmm: bits 7-4 = disp, bits 3-0 = Rm */
 					dest_reg = 0;
-					base_reg = (bop1 >> 4) & 0xf;
-					pa = sh2->r[base_reg] + (unsigned int)(bop1 & 0xf) * 2;
+					base_reg = bop1 & 0xf;
+					pa = sh2->r[base_reg] + ((unsigned int)((bop1 >> 4) & 0xf)) * 2;
 				}
 #ifdef RIG_SDRAM_POLL_DIAG
 				if (dest_reg < 0
