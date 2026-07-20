@@ -63,7 +63,25 @@ MAKE_WRITEFUNC(WL, p32x_sh2_write32)
  * fetched instruction.  Identical addressing to the read16_map SDRAM entry
  * (p_sdram + (a & 0x3fffe)); the 0xdf mask ignores the cache-through bit
  * 0x20000000, matching read16_map indices 0x06/0x26. */
-#define GNW_FETCH_SD(sh2, addr) ((UINT32)(UINT16)RW(sh2, addr))
+/* This used to expand to plain RW() -- i.e. exactly the cross-TU call the
+ * comment says it avoids -- so the described fast path was documented but
+ * never implemented. p32x_sh2_read16() does already short-circuit SDRAM
+ * internally, so what the call actually cost was the call itself: bl +
+ * prologue/epilogue across a TU boundary with LTO off, on EVERY fetched
+ * guest instruction. Device measurement puts the SH-2 interpreter at ~100
+ * cycles per guest instruction with msh2 at 59.5% of the frame, so this is
+ * a small, bounded win -- not a fix for the dominant cost, which is D-cache
+ * pressure from a 256 KB SDRAM working set against a 16 KB D-cache.
+ *
+ * The condition and the load below are copied verbatim from
+ * p32x_sh2_read16()'s own SDRAM branch (pico/32x/memory.c), so a fetch
+ * resolves to the identical byte either way; anything outside SDRAM still
+ * goes through the full call. */
+#define GNW_FETCH_SD(sh2, addr)                                              \
+  (((((addr) & 0xff000000) == 0x06000000) ||                                 \
+    (((addr) & 0xff000000) == 0x26000000))                                   \
+     ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_sdram + ((addr) & 0x3fffe))     \
+     : (UINT32)(UINT16)RW(sh2, addr))
 
 #endif
 
