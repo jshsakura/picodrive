@@ -543,8 +543,11 @@ void p32x_sync_other_sh2(SH2 *sh2, unsigned int m68k_target)
 }
 
 #define STEP_LS 24
-#define STEP_N 2112 // 4 lines: fewer msh2<->ssh2 swaps, less D-cache thrash
-                     // (was 528 = 1 line; 488 is the correctness floor, not a cap.
+#define STEP_N 976 // 2 lines: fewer msh2<->ssh2 swaps, less D-cache thrash
+                     // (was 528 = 1 line. 488 is the floor; the practical CAP is the
+                    //  H-Blank sync period, ~1000 cycles -- past that, titles
+                    //  that hand off between the SH-2s inside a line (VR,
+                    //  Kolibri) can crash. 2112 was tried first and is unsafe.
                      //  p32x_sh2_poll_detect still forces an early sync whenever
                      //  one SH-2 polls a location the other writes, so a longer
                      //  slice does not by itself break inter-CPU handshakes.)
