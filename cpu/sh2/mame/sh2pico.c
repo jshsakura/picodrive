@@ -1,4 +1,8 @@
 #include "../sh2.h"
+#ifdef GNW_SH2_ROM_FETCH
+#include "../../../pico/pico_int.h"
+#include "../../../pico/carthw/carthw.h"
+#endif
 
 #ifdef DRC_CMP
 #include "../compiler.h"
@@ -77,11 +81,38 @@ MAKE_WRITEFUNC(WL, p32x_sh2_write32)
  * p32x_sh2_read16()'s own SDRAM branch (pico/32x/memory.c), so a fetch
  * resolves to the identical byte either way; anything outside SDRAM still
  * goes through the full call. */
+#ifndef GNW_SH2_ROM_FETCH
 #define GNW_FETCH_SD(sh2, addr)                                              \
   (((((addr) & 0xff000000) == 0x06000000) ||                                 \
     (((addr) & 0xff000000) == 0x26000000))                                   \
      ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_sdram + ((addr) & 0x3fffe))     \
      : (UINT32)(UINT16)RW(sh2, addr))
+#else
+/* GNW_SH2_ROM_FETCH: extend the same idea to cartridge ROM, for code that runs
+ * from 0x02/0x22 rather than SDRAM. Unmeasured on hardware, hence a knob and
+ * not the default -- the SDRAM path above is shipping behaviour and does not
+ * change either way. The ROM test is second, so the SDRAM path pays nothing.
+ *
+ * The guard is not optional: bank_switch_rom_sh2() installs
+ * MAP_HANDLER(sh2_read16_rom) instead of MAP_MEMORY(Pico.rom) whenever
+ * carthw_ssf2_active is set, and that handler is what applies the banking.
+ * Reading Pico.rom directly there fetches instructions from the wrong bank,
+ * silently, and only on SSF2 carts -- which is exactly the kind of thing a
+ * single-ROM hash gate cannot see. */
+static inline UINT32 gnw_fetch_sd(SH2 *sh2, UINT32 addr)
+{
+  UINT32 h = addr & 0xff000000;
+  if (h == 0x06000000 || h == 0x26000000)
+    return (UINT32)*(UINT16 *)((UINT8 *)sh2->p_sdram + (addr & 0x3fffe));
+  if ((h == 0x02000000 || h == 0x22000000) && !carthw_ssf2_active) {
+    UINT32 off = addr & 0x01ffffff;
+    if (off < (UINT32)Pico.romsize)
+      return (UINT32)*(UINT16 *)((UINT8 *)Pico.rom + (off & ~1u));
+  }
+  return (UINT32)(UINT16)RW(sh2, addr);
+}
+#define GNW_FETCH_SD(sh2, addr) gnw_fetch_sd(sh2, addr)
+#endif
 
 #endif
 
