@@ -1,7 +1,11 @@
 #include "../sh2.h"
 #ifdef GNW_SH2_ROM_FETCH
+/* pico_int.h already pulls carthw/carthw.h (its line 17), and carthw.h pulls
+ * svp/ssp16.h, which has no include guard -- including carthw.h again here
+ * redeclares every SSP_* enumerator and the file does not compile at all with
+ * this knob on. carthw_ssf2_active, which the fetch guard needs, comes in
+ * through pico_int.h either way. */
 #include "../../../pico/pico_int.h"
-#include "../../../pico/carthw/carthw.h"
 #endif
 
 #ifdef DRC_CMP
