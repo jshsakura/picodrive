@@ -86,23 +86,99 @@ static void convert_pal555(int invert_prio)
 
 // packed pixel mode
 //
-// 2-pixel unroll with combined 32-bit stores. The output line buffer `pd`
-// (DrawLineDest) is the launcher's RGB565 framebuffer: AHB-allocated and
-// 4-byte aligned (320 px * 2 B), so two adjacent pixels may always be written
-// as one 32-bit store. 32X DRAM holds big-endian packed pixels; when the read
-// pointer is 2-byte aligned a single u16 load fetches both pixel bytes (high
-// byte = pixel N, low byte = pixel N+1), otherwise two byte loads are used.
-// 320 is even, so there is never an odd-pixel remainder. The run-length merge
-// semantics (MD-background check + 32X priority) are preserved exactly: the
+// 2-pixel unroll with combined 32-bit stores, plus solid-run detection
+// (mirrors draw_arm.S labels 5-9). The output line buffer `pd` (DrawLineDest)
+// is the launcher's RGB565 framebuffer: AHB-allocated and 4-byte aligned
+// (320 px * 2 B), so two adjacent pixels may always be written as one 32-bit
+// store. 32X DRAM holds big-endian packed pixels; when the read pointer is
+// 2-byte aligned a single u16 load fetches both pixel bytes (high byte = pixel
+// N, low byte = pixel N+1), otherwise two byte loads are used. 320 is even, so
+// there is never an odd-pixel remainder. The run-length merge semantics
+// (MD-background check + 32X priority) are preserved exactly: the
 // MD-background run always writes the 32X pixel, the non-background run writes
 // it only when PXPRIO is set (else the per-pixel pmd_draw_code fallback, which
 // handles all three md_code variants correctly).
+//
+// Solid-run detection: before the per-pixel loops, 4 leading 32X pixels are
+// probed (short-circuit &&, so non-run pixels cost ~2 byte reads).  When all
+// four match, the palette entry is converted ONCE and the run is counted with
+// u16 loads (2 pixels/iteration, like the arm ldrh loop) when p32x is aligned.
+// The run is blasted with paired 32-bit stores (4 pixels/iteration) when the
+// merge rule guarantees a 32X write for every pixel: 32X priority set (wins
+// regardless of MD) OR every pixel sits over MD-background.  Mixed-bg runs
+// are handled per-pixel with the pre-converted color (no pal[] lookup per
+// pixel).  The entire run is always consumed, so detection never re-fires
+// O(n^2) on the same identical pixels.
 #define do_line_pp(pd, p32x, pmd, pmd_draw_code)                  \
 {                                                                 \
   unsigned short t, t0, t1, v;                                    \
   int i = 320;                                                    \
   _Static_assert(320 % 2 == 0, "line must be an even pixel count"); \
   while (i > 0) {                                                 \
+    /* --- solid-run detection (draw_arm.S labels 5-9) --- */     \
+    if (i >= 4) {                                                 \
+      unsigned char b0 = *(unsigned char *)(MEM_BE2((uintptr_t)(p32x))); \
+      if (b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1))) && \
+          b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+2))) && \
+          b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+3)))) { \
+        unsigned short sv = pal[b0];                              \
+        int run = 4, n;                                           \
+        if (sv & PXPRIO) {                                        \
+          /* prio: 32X wins everywhere. Count pure 32X, blast. */ \
+          if (!((uintptr_t)(p32x) & 1)) {                        \
+            u16 exp = (u16)(b0 | (b0 << 8));                     \
+            while (run + 1 < i && *(u16 *)(p32x + run) == exp)   \
+              run += 2;                                           \
+            if (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
+          } else                                                  \
+            while (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
+          { u32 pair = (u32)sv | ((u32)sv << 16);                \
+            for (n = run; n >= 4; n -= 4) { *(u32 *)(pd) = pair; *(u32 *)(pd+2) = pair; pd += 4; } \
+            for (; n >= 2; n -= 2) { *(u32 *)(pd) = pair; pd += 2; } \
+            if (n) { *pd = sv; pd++; }                           \
+          }                                                       \
+          pmd += run; p32x += run; i -= run;                      \
+          continue;                                               \
+        }                                                         \
+        /* no prio: count bg+identical (u16 for aligned) */       \
+        if ((pmd[0] & 0x3f) == mdbg && (pmd[1] & 0x3f) == mdbg && \
+            (pmd[2] & 0x3f) == mdbg && (pmd[3] & 0x3f) == mdbg) { \
+          if (!((uintptr_t)(p32x) & 1)) {                        \
+            u16 exp = (u16)(b0 | (b0 << 8));                     \
+            while (run + 1 < i && *(u16 *)(p32x + run) == exp && \
+                   (pmd[run] & 0x3f) == mdbg && (pmd[run+1] & 0x3f) == mdbg) \
+              run += 2;                                           \
+            if (run < i && (pmd[run] & 0x3f) == mdbg &&          \
+                *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
+          } else                                                  \
+            while (run < i && (pmd[run] & 0x3f) == mdbg &&        \
+                   *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
+          /* blast bg+identical run */                            \
+          { u32 pair = (u32)sv | ((u32)sv << 16);                \
+            for (n = run; n >= 4; n -= 4) { *(u32 *)(pd) = pair; *(u32 *)(pd+2) = pair; pd += 4; } \
+            for (; n >= 2; n -= 2) { *(u32 *)(pd) = pair; pd += 2; } \
+            if (n) { *pd = sv; pd++; }                           \
+          }                                                       \
+          pmd += run; p32x += run; i -= run;                      \
+          /* consume remaining solid-run pixels (non-bg portion) */ \
+          while (i > 0 && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x))) == b0) { \
+            if ((*pmd & 0x3f) == mdbg) *pd = sv;                  \
+            else pmd_draw_code;                                   \
+            pd++; pmd++; p32x++; i--;                             \
+          }                                                       \
+          continue;                                               \
+        }                                                         \
+        /* mixed-bg (not all bg): per-pixel with constant sv */   \
+        while (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
+        for (n = 0; n < run; n++) {                               \
+          if ((*pmd & 0x3f) == mdbg) *pd = sv;                    \
+          else pmd_draw_code;                                     \
+          pd++; pmd++;                                            \
+        }                                                         \
+        p32x += run; i -= run;                                    \
+        continue;                                                 \
+      }                                                           \
+    }                                                             \
     /* MD-background run: 32X pixel shown unconditionally */      \
     for (; i > 0 && (*pmd & 0x3f) == mdbg; ) {                    \
       if (i >= 2 && (pmd[1] & 0x3f) == mdbg) {                    \
