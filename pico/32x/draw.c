@@ -85,21 +85,68 @@ static void convert_pal555(int invert_prio)
 }
 
 // packed pixel mode
+//
+// 2-pixel unroll with combined 32-bit stores. The output line buffer `pd`
+// (DrawLineDest) is the launcher's RGB565 framebuffer: AHB-allocated and
+// 4-byte aligned (320 px * 2 B), so two adjacent pixels may always be written
+// as one 32-bit store. 32X DRAM holds big-endian packed pixels; when the read
+// pointer is 2-byte aligned a single u16 load fetches both pixel bytes (high
+// byte = pixel N, low byte = pixel N+1), otherwise two byte loads are used.
+// 320 is even, so there is never an odd-pixel remainder. The run-length merge
+// semantics (MD-background check + 32X priority) are preserved exactly: the
+// MD-background run always writes the 32X pixel, the non-background run writes
+// it only when PXPRIO is set (else the per-pixel pmd_draw_code fallback, which
+// handles all three md_code variants correctly).
 #define do_line_pp(pd, p32x, pmd, pmd_draw_code)                  \
 {                                                                 \
-  unsigned short t;                                               \
+  unsigned short t, t0, t1, v;                                    \
   int i = 320;                                                    \
+  _Static_assert(320 % 2 == 0, "line must be an even pixel count"); \
   while (i > 0) {                                                 \
-    for (; i > 0 && (*pmd & 0x3f) == mdbg; pd++, pmd++, i--) {    \
-      t = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x++)))];  \
-      *pd = t;                                                    \
+    /* MD-background run: 32X pixel shown unconditionally */      \
+    for (; i > 0 && (*pmd & 0x3f) == mdbg; ) {                    \
+      if (i >= 2 && (pmd[1] & 0x3f) == mdbg) {                    \
+        if (!((uintptr_t)(p32x) & 1)) {                           \
+          v = *(u16 *)(p32x);                                     \
+          t0 = pal[(v >> 8) & 0xff];                              \
+          t1 = pal[v & 0xff];                                     \
+        } else {                                                  \
+          t0 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+0)))]; \
+          t1 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1)))]; \
+        }                                                         \
+        *(u32 *)(pd) = (u32)t0 | ((u32)t1 << 16);                 \
+        pd += 2; pmd += 2; p32x += 2; i -= 2;                     \
+      } else {                                                    \
+        t = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x++)))]; \
+        *pd++ = t; pmd++; i--;                                    \
+      }                                                           \
     }                                                             \
-    for (; i > 0 && (*pmd & 0x3f) != mdbg; pd++, pmd++, i--) {    \
-      t = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x++)))];  \
-      if (t & PXPRIO)                                             \
-        *pd = t;                                                  \
-      else                                                        \
-        pmd_draw_code;                                            \
+    /* non-background run: 32X pixel only if priority bit set */  \
+    for (; i > 0 && (*pmd & 0x3f) != mdbg; ) {                    \
+      if (i >= 2 && (pmd[1] & 0x3f) != mdbg) {                    \
+        if (!((uintptr_t)(p32x) & 1)) {                           \
+          v = *(u16 *)(p32x);                                     \
+          t0 = pal[(v >> 8) & 0xff];                              \
+          t1 = pal[v & 0xff];                                     \
+        } else {                                                  \
+          t0 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+0)))]; \
+          t1 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1)))]; \
+        }                                                         \
+        if ((t0 & PXPRIO) && (t1 & PXPRIO)) {                     \
+          *(u32 *)(pd) = (u32)t0 | ((u32)t1 << 16);               \
+          pd += 2; pmd += 2; p32x += 2; i -= 2;                   \
+        } else {                                                  \
+          /* per-pixel fallback: md_code needs sequential advance */ \
+          if (t0 & PXPRIO) *pd = t0; else pmd_draw_code;          \
+          pd++; pmd++; p32x++; i--;                               \
+          if (t1 & PXPRIO) *pd = t1; else pmd_draw_code;          \
+          pd++; pmd++; p32x++; i--;                               \
+        }                                                         \
+      } else {                                                    \
+        t = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x++)))]; \
+        if (t & PXPRIO) *pd = t; else pmd_draw_code;              \
+        pd++; pmd++; i--;                                         \
+      }                                                           \
     }                                                             \
   }                                                               \
 }
