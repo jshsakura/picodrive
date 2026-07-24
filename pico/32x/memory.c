@@ -816,6 +816,8 @@ static u32 p32x_sh2reg_read16(u32 a, SH2 *sh2)
     case 0x3a/2:
     case 0x3c/2:
     case 0x3e/2:
+      p32x_sh2_poll_detect(a, sh2, SH2_STATE_CPOLL, 7);
+      sh2s_sync_on_read(sh2, sh2_cycles_done_m68k(sh2));
       return p32x_pwm_read16(a, sh2, sh2_cycles_done_m68k(sh2));
   }
 
