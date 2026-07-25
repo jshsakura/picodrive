@@ -181,9 +181,16 @@ unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
  * stamp words stay here (~44 B). The tables are touched every 32 insns
  * from the cold sample path, where an AHB access is irrelevant. */
 #define GNW_PCWALL_PERIOD    32
+/* Two-pass aiming: pass 1 (SHIFT=16) covers the whole 4 MB ROM in 64 KB
+ * pages — the first device run showed 94.9% of msh2's wall in "ROM above
+ * the 64 KB fine window", i.e. the QEMU-flagged loops were cold and the
+ * real hot set was outside the window. Once pass 1 names the hot 64 KB
+ * page(s), set SHIFT back to 10 and WIN_BASE to that page for the 1 KB
+ * fine pass. */
+#define GNW_PCWALL_PAGE_SHIFT 16                  /* 16=64K pages, 10=1K   */
 #define GNW_PCWALL_WIN_BASE  0x00000000u          /* offset into ROM */
-#define GNW_PCWALL_WIN_SIZE  0x10000u             /* 64 KB fine window */
-#define GNW_PCWALL_NBUCK     (GNW_PCWALL_WIN_SIZE >> 10)
+#define GNW_PCWALL_NBUCK     64
+#define GNW_PCWALL_WIN_SIZE  ((unsigned int)GNW_PCWALL_NBUCK << GNW_PCWALL_PAGE_SHIFT)
 enum { GNW_PCWALL_ROM_HI = 0, GNW_PCWALL_SDRAM, GNW_PCWALL_OTHER,
        GNW_PCWALL_NREGION };
 /* Caller-provided block word count: [core0 hist][core1 hist][core0 regions]
@@ -192,6 +199,7 @@ enum { GNW_PCWALL_ROM_HI = 0, GNW_PCWALL_SDRAM, GNW_PCWALL_OTHER,
 int gnw_pcwall_armed;                             /* porting layer clears  */
 const unsigned int gnw_pcwall_win_base = GNW_PCWALL_WIN_BASE; /* for the dump */
 const unsigned int gnw_pcwall_nbuck = GNW_PCWALL_NBUCK;       /* for the dump */
+const unsigned int gnw_pcwall_page_shift = GNW_PCWALL_PAGE_SHIFT; /* for the dump */
 const unsigned int gnw_pcwall_block_words = GNW_PCWALL_BLOCK_WORDS; /* alloc size */
 unsigned int *gnw_pcwall_hist_p[2];               /* cycles, ROM window    */
 unsigned int *gnw_pcwall_region_p[2];             /* cycles, coarse        */
@@ -218,7 +226,7 @@ static void __attribute__((noinline)) gnw_pcwall_sample(SH2 *sh2)
 	if (a - 0x02000000u < 0x400000u) {        /* 32X ROM, 4 MB */
 		unsigned int off = a - 0x02000000u - GNW_PCWALL_WIN_BASE;
 		if (off < GNW_PCWALL_WIN_SIZE)
-			gnw_pcwall_hist_p[core][off >> 10] += d;
+			gnw_pcwall_hist_p[core][off >> GNW_PCWALL_PAGE_SHIFT] += d;
 		else
 			gnw_pcwall_region_p[core][GNW_PCWALL_ROM_HI] += d;
 	} else if (a - 0x06000000u < 0x40000u) {  /* SDRAM, 256 KB */
