@@ -151,8 +151,91 @@ unsigned long long g_sh2_insns;
 #ifdef MD32X_DEVICE_PROFILE
 unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
 #define GNW_SH2_INSN_TICK(sh2) (gnw_sh2_insn_count[(sh2)->is_slave & 1]++)
+
+/* Sampled guest-PC wall attribution (device DWT cycles, per core).
+ *
+ * Answers the question the QEMU histogram cannot (instructions != device
+ * cycles): which guest-PC REGION owns the msh2/ssh2 wall — the ROM render
+ * loops the histogram flagged, other ROM code, or SDRAM code. Every
+ * GNW_PCWALL_PERIOD dispatched instructions the probe reads DWT_CYCCNT and
+ * attributes the delta since the previous sample (of the same core, within
+ * the same interpreter slice — the stamp resets at slice entry, so time in
+ * the other core / 68K / VDP never leaks in) to a bucket chosen by the
+ * current ppc:
+ *   - a 1 KB-granular histogram over a 64 KB ROM window (both Doom hot
+ *     loops, 0x02005fa6 / 0x020023a8, sit in the first 32 KB; the window
+ *     base is a define so a second pass can slide it if mass lands in
+ *     rom_hi instead),
+ *   - whole-region sums for ROM-above-window, SDRAM, and everything else.
+ * The porting layer (md32x_profile.c) freezes gnw_pcwall_armed and prints
+ * shares in the one-shot /32x_dwt.txt dump; the disarmed per-insn cost
+ * collapses to a counter decrement that never reaches zero. uint32 bucket
+ * sums are safe: armed only from init to the ~64-frame dump (< 1 G cycles
+ * total, far below wrap). */
+#define GNW_PCWALL_PERIOD    32
+#define GNW_PCWALL_WIN_BASE  0x00000000u          /* offset into ROM */
+#define GNW_PCWALL_WIN_SIZE  0x10000u             /* 64 KB fine window */
+#define GNW_PCWALL_NBUCK     (GNW_PCWALL_WIN_SIZE >> 10)
+enum { GNW_PCWALL_ROM_HI = 0, GNW_PCWALL_SDRAM, GNW_PCWALL_OTHER,
+       GNW_PCWALL_NREGION };
+int gnw_pcwall_armed;                             /* porting layer clears  */
+const unsigned int gnw_pcwall_win_base = GNW_PCWALL_WIN_BASE; /* for the dump */
+unsigned int gnw_pcwall_hist[2][GNW_PCWALL_NBUCK];/* cycles, ROM window    */
+unsigned int gnw_pcwall_region[2][GNW_PCWALL_NREGION]; /* cycles, coarse   */
+unsigned int gnw_pcwall_samples[2];
+static int gnw_pcwall_cnt[2];
+static unsigned int gnw_pcwall_last[2];
+
+static void __attribute__((noinline)) gnw_pcwall_sample(SH2 *sh2)
+{
+	unsigned int now = *(volatile unsigned int *)0xE0001004; /* DWT_CYCCNT */
+	int core = sh2->is_slave & 1;
+
+	if (!gnw_pcwall_armed) {
+		gnw_pcwall_cnt[core] = 1 << 30;   /* disarmed: never resample */
+		return;
+	}
+	gnw_pcwall_cnt[core] = GNW_PCWALL_PERIOD;
+
+	unsigned int d = now - gnw_pcwall_last[core];
+	gnw_pcwall_last[core] = now;
+	gnw_pcwall_samples[core]++;
+
+	unsigned int a = sh2->ppc & 0x1fffffff;   /* fold cache-through mirror */
+	if (a - 0x02000000u < 0x400000u) {        /* 32X ROM, 4 MB */
+		unsigned int off = a - 0x02000000u - GNW_PCWALL_WIN_BASE;
+		if (off < GNW_PCWALL_WIN_SIZE)
+			gnw_pcwall_hist[core][off >> 10] += d;
+		else
+			gnw_pcwall_region[core][GNW_PCWALL_ROM_HI] += d;
+	} else if (a - 0x06000000u < 0x40000u) {  /* SDRAM, 256 KB */
+		gnw_pcwall_region[core][GNW_PCWALL_SDRAM] += d;
+	} else {
+		gnw_pcwall_region[core][GNW_PCWALL_OTHER] += d;
+	}
+}
+
+/* Porting-layer entry point: arm (or re-arm) the probe. Must reset the
+ * countdowns — a tick that fired while disarmed parks its counter at 1<<30,
+ * and flipping gnw_pcwall_armed alone would leave that core asleep. */
+void gnw_sh2_pcwall_arm(void)
+{
+	unsigned int now = *(volatile unsigned int *)0xE0001004;
+	gnw_pcwall_last[0] = gnw_pcwall_last[1] = now;
+	gnw_pcwall_cnt[0] = gnw_pcwall_cnt[1] = GNW_PCWALL_PERIOD;
+	gnw_pcwall_armed = 1;
+}
+
+/* Slice entry: re-stamp so the delta of the first in-slice sample cannot
+ * span the other core's slice / 68K / VDP time. */
+#define GNW_PCWALL_ENTER(sh2) \
+	(gnw_pcwall_last[(sh2)->is_slave & 1] = *(volatile unsigned int *)0xE0001004)
+#define GNW_PCWALL_TICK(sh2) \
+	((--gnw_pcwall_cnt[(sh2)->is_slave & 1] <= 0) ? gnw_pcwall_sample(sh2) : (void)0)
 #else
 #define GNW_SH2_INSN_TICK(sh2) ((void)0)
+#define GNW_PCWALL_ENTER(sh2) ((void)0)
+#define GNW_PCWALL_TICK(sh2) ((void)0)
 #endif
 
 /* RIG_SH2_PC_HIST: SH-2 guest-PC histogram for the QEMU M7 feasibility rig.
@@ -615,6 +698,8 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 	if (sh2->icount <= 0)
 		goto out;
 
+	GNW_PCWALL_ENTER(sh2);
+
 	const void *gnw_dt[16] = {
 		&&gnw_op0,  &&gnw_op1,  &&gnw_op2,  &&gnw_op3,
 		&&gnw_op4,  &&gnw_op5,  &&gnw_op6,  &&gnw_op7,
@@ -665,6 +750,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		sh2->pc += 2;
 		RIG_SH2_TICK();
 		GNW_SH2_INSN_TICK(sh2);
+		GNW_PCWALL_TICK(sh2);
 		RIG_PC_HIST_TICK(sh2, rig_is_delay, (unsigned short)opcode);
 		RIG_POLL_PEEK_HOOK(sh2, opcode);
 
