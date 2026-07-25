@@ -187,10 +187,20 @@ unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
  * pass 2 (SHIFT=16, BASE=0, whole 4 MB): msh2 = 77.6% page 0x030000 +
  *   17.3% page 0x040000; ssh2 = 84.6% page 0x040000 + 15.3% 0x030000.
  *   The hot set is two adjacent 64 KB pages, split by core.
- * pass 3 (current): 2 KB pages x 64 = exactly that 128 KB window —
- *   function-sized resolution over 0x02030000..0x0204ffff. */
-#define GNW_PCWALL_PAGE_SHIFT 11                  /* 16=64K, 11=2K, 10=1K  */
-#define GNW_PCWALL_WIN_BASE  0x00030000u          /* offset into ROM */
+ * pass 3 (2 KB x 64 over 0x030000..0x04ffff): title-scene only — the
+ *   boot-anchored window profiled the logo. Discarded once the porting
+ *   layer learned to open the window after 1200 warmup frames.
+ * pass 4 (same geometry, gameplay window): msh2 = 37.7% page 0x04d800 +
+ *   34.5% 0x049000; ssh2 = 70.5% page 0x04e800. Disassembly: 0x049000 is
+ *   real render math; 0x04d800 mixes crt0 (COMM "68UP"/"S_OK" boot
+ *   handshake polls + 256K ROM->SDRAM copy), the IRQ prologue, a SLEEP
+ *   idle and the VInt ISR; 0x04e800 holds a TAS spinlock. Page resolution
+ *   cannot split poll/memcpy/ISR/SLEEP costs.
+ * pass 5 (current): 128 B pages x 64 = 0x04d000..0x04efff — instruction-
+ *   run resolution over msh2's #1, msh2's #4 and ssh2's #1 pages.
+ *   (msh2's #2, the 0x049000 render code, is a later pass if needed.) */
+#define GNW_PCWALL_PAGE_SHIFT 7                   /* 16=64K, 11=2K, 7=128B */
+#define GNW_PCWALL_WIN_BASE  0x0004d000u          /* offset into ROM */
 #define GNW_PCWALL_NBUCK     64
 #define GNW_PCWALL_WIN_SIZE  ((unsigned int)GNW_PCWALL_NBUCK << GNW_PCWALL_PAGE_SHIFT)
 enum { GNW_PCWALL_ROM_HI = 0, GNW_PCWALL_SDRAM, GNW_PCWALL_OTHER,
