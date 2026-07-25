@@ -1964,6 +1964,37 @@ typedef void REGPARM(3) (sh2_write_handler)(u32 a, u32 d, SH2 *sh2);
 #define SH2MAP_ADDR2OFFS_W(a) \
   ((u32)(a) >> SH2_WRITE_SHIFT)
 
+#ifdef MD32X_DEVICE_PROFILE
+/* Generic memory-dispatch cost ledger (device DWT cycles, per core).
+ *
+ * The pass-4/5 device probes measured 101-134 cycles per dispatched guest
+ * instruction — 3-4x what a tuned M7 interpreter should cost — and that
+ * disease is game-independent.  Reads have an SDRAM fastpath; every WRITE
+ * is an indirect call through the write tab, and read handlers (VDP, sysreg,
+ * ROM bank...) are calls too.  This ledger splits the window's SH-2 cycles
+ * into handler-call cost vs everything else, per class, so the "make the
+ * 32X itself faster" lever can be sized before it is built.  Gated on the
+ * same window flag as the pcwall probe (armed at warmup expiry, frozen at
+ * dump); zeroed by md32x_profile.c.  Self-cost ~10 cycles per counted call
+ * (two DWT reads + adds) — the dump prints call counts so that bias can be
+ * subtracted.  Nested dispatch (a handler reading through the map again)
+ * double-books the inner call; rare, and fine for a diag ledger. */
+unsigned int gnw_memh_cyc[2][4];  /* [core][RH, W8, W16, W32] */
+unsigned int gnw_memh_cnt[2][4];
+extern int gnw_pcwall_armed;      /* sh2pico.c probe owns the window */
+#define GNW_MEMH(sh2i, idx, expr) do { \
+    if (gnw_pcwall_armed) { \
+      unsigned int _c = (sh2i)->is_slave & 1; \
+      unsigned int _t0 = *(volatile unsigned int *)0xE0001004; \
+      expr; \
+      gnw_memh_cyc[_c][idx] += *(volatile unsigned int *)0xE0001004 - _t0; \
+      gnw_memh_cnt[_c][idx]++; \
+    } else { expr; } \
+  } while (0)
+#else
+#define GNW_MEMH(sh2i, idx, expr) expr
+#endif
+
 u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
 {
   /* SDRAM fastpath: 256KB at 0x06000000 (mirror 0x26000000 cache-through).
@@ -1981,8 +2012,11 @@ u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
   p = sh2_map->addr;
   if (!map_flag_set(p))
     return *(s8 *)((p << 1) + MEM_BE2(a & sh2_map->mask));
-  else
-    return ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
+  else {
+    u32 r_;
+    GNW_MEMH(sh2, 0, r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2));
+    return r_;
+  }
 }
 
 u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
@@ -1999,8 +2033,11 @@ u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
   p = sh2_map->addr;
   if (!map_flag_set(p))
     return *(s16 *)((p << 1) + (a & sh2_map->mask));
-  else
-    return ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
+  else {
+    u32 r_;
+    GNW_MEMH(sh2, 0, r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2));
+    return r_;
+  }
 }
 
 u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
@@ -2020,8 +2057,11 @@ u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
   if (!map_flag_set(p)) {
     u32 *pd = (u32 *)((p << 1) + (a & sh2_map->mask));
     return CPU_BE2(*pd);
-  } else
-    return ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
+  } else {
+    u32 r_;
+    GNW_MEMH(sh2, 0, r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2));
+    return r_;
+  }
 }
 
 void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
@@ -2030,7 +2070,7 @@ void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
   sh2_write_handler *wh;
 
   wh = sh2_wmap[SH2MAP_ADDR2OFFS_W(a)];
-  wh(a, d, sh2);
+  GNW_MEMH(sh2, 1, wh(a, d, sh2));
 }
 
 void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
@@ -2039,7 +2079,7 @@ void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
   sh2_write_handler *wh;
 
   wh = sh2_wmap[SH2MAP_ADDR2OFFS_W(a)];
-  wh(a, d, sh2);
+  GNW_MEMH(sh2, 2, wh(a, d, sh2));
 }
 
 void REGPARM(3) p32x_sh2_write32(u32 a, u32 d, SH2 *sh2)
@@ -2048,7 +2088,7 @@ void REGPARM(3) p32x_sh2_write32(u32 a, u32 d, SH2 *sh2)
   sh2_write_handler *wh;
 
   wh = sh2_wmap[SH2MAP_ADDR2OFFS_W(a)];
-  wh(a, d, sh2);
+  GNW_MEMH(sh2, 3, wh(a, d, sh2));
 }
 
 void *p32x_sh2_get_mem_ptr(u32 a, u32 *mask, SH2 *sh2)

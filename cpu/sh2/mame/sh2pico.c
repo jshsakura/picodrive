@@ -582,6 +582,100 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 		 * countdown cases below (no reject caching here) */
 	}
 
+	/* BTS SDRAM poll loop (Doom 32X frame-wait): backward BT/S whose
+	 * 2-insn body is
+	 *     CMP/EQ Rm,Rn        (0x3nm0)   T = (masked == ref)
+	 *     MOV.L  @Rb,Rd       (0x6db2)   reload the polled slot
+	 * and whose delay slot is
+	 *     AND    Rk,Rd        (0x2dk9)   mask the reload
+	 * polling an SDRAM long the VInt ISR increments.  Doom's master parks
+	 * here after finishing each frame's work (0x0204df30, ROM+0x4df30:
+	 * `CMP/EQ R0,R2; MOV.L @R1,R0; BT/S -2; AND R3,R0` on 0x06001170) —
+	 * the device pcwall probe measured this ONE 128-byte page at 35% of
+	 * msh2 wall / ~27% of PicoFrame during gameplay (pass 5, 0726).
+	 *
+	 * Fold model (mirrors THIS interpreter, incl. mame's BT/S executing
+	 * the delay slot on BOTH paths): one continuing iteration =
+	 * BTS taken(2) + slot AND(1) + head CMP(1) + MOV.L reload(1) = 5.
+	 * Each folded iteration re-reads the slot via RL() (real side effect —
+	 * the ISR's/other core's write must be visible) and recomputes T.  On
+	 * exit T=0 is left so the real BT/S is dispatched untaken: mame then
+	 * runs the slot AND for real and falls through — final register state,
+	 * T, pc and icount are bit-identical to plain interpretation.  If the
+	 * slice ends still looping, T holds the loop value and the real BT/S
+	 * re-branches on the next slice after IRQs run.  No SLEEP/RPOLL state,
+	 * deadlock-free; base/mask/ref registers are required distinct from
+	 * the destination so the loop cannot mutate its own operands. */
+	if ((opcode & 0xff00) == 0x8d00)	/* BT/S */
+	{
+		int disp8 = (int)(signed char)(opcode & 0xff);
+		unsigned int target = sh2->ppc + disp8 * 2 + 4;
+
+		if (disp8 >= 0 || target + 4 != sh2->ppc) {	/* not a 2-insn backward loop */
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+		/* opcode fetches must stay off sysreg/comm space (poll_detect) */
+		if ((target & 0xdf000000) != 0x02000000
+		    && (target & 0xdf000000) != 0x06000000) {
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+		{
+			UINT32 head = (UINT32)(UINT16)RW(sh2, target);
+			UINT32 load = (UINT32)(UINT16)RW(sh2, target + 2);
+			UINT32 slot = (UINT32)(UINT16)RW(sh2, sh2->ppc + 2);
+			int dest, base, mask_reg, ref, cmp_n, cmp_m;
+			unsigned int pa;
+
+			if ((head & 0xf00f) != 0x3000		/* CMP/EQ Rm,Rn  */
+			    || (load & 0xf00f) != 0x6002	/* MOV.L @Rm,Rn  */
+			    || (slot & 0xf00f) != 0x2009) {	/* AND Rm,Rn     */
+				*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+				return;
+			}
+			dest = (load >> 8) & 0xf;
+			base = (load >> 4) & 0xf;
+			mask_reg = (slot >> 4) & 0xf;
+			cmp_n = (head >> 8) & 0xf;
+			cmp_m = (head >> 4) & 0xf;
+			if (((slot >> 8) & 0xf) != (unsigned)dest) {	/* AND dest != reload dest */
+				*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+				return;
+			}
+			if (cmp_n == dest)      ref = cmp_m;
+			else if (cmp_m == dest) ref = cmp_n;
+			else                    ref = -1;
+			if (ref < 0 || base == dest || mask_reg == dest || ref == dest) {
+				*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+				return;
+			}
+			pa = sh2->r[base] & ~0x20000000;	/* strip cache-through */
+			if ((pa & 0xff000000) != 0x06000000 || (pa & 3) != 0) {
+				/* polled slot must be an aligned SDRAM long; a comm/
+				 * sysreg target must keep its poll_detect behaviour */
+				*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+				return;
+			}
+			if (sh2->t_flag == 0)	/* this BT/S falls through: nothing to fold */
+				return;
+			{
+				UINT32 mask_v = sh2->r[mask_reg];
+				UINT32 ref_v  = sh2->r[ref];
+				while (sh2->icount >= 5) {
+					UINT32 masked = sh2->r[dest] & mask_v;	/* delay slot */
+					int t = (masked == ref_v);		/* head CMP/EQ */
+					sh2->r[dest] = (UINT32)RL(sh2, pa);	/* reload */
+					sh2->t_flag = t ? T : 0;
+					sh2->icount -= 5;
+					if (!t)
+						return;	/* real BT/S dispatches untaken */
+				}
+				return;	/* slice exhausted: real BT/S re-branches */
+			}
+		}
+	}
+
 	/* BFS countdown loop: backward BFS (delay-slot branch) whose body is
 	 * a single TST Rn,Rn (sets T = (Rn==0)) and whose delay slot is
 	 * ADD #-1,Rn.  Loop: do { Rn--; } while (Rn != 0); on loop exit
