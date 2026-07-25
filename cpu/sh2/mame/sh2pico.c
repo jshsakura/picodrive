@@ -181,14 +181,16 @@ unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
  * stamp words stay here (~44 B). The tables are touched every 32 insns
  * from the cold sample path, where an AHB access is irrelevant. */
 #define GNW_PCWALL_PERIOD    32
-/* Two-pass aiming: pass 1 (SHIFT=16) covers the whole 4 MB ROM in 64 KB
- * pages — the first device run showed 94.9% of msh2's wall in "ROM above
- * the 64 KB fine window", i.e. the QEMU-flagged loops were cold and the
- * real hot set was outside the window. Once pass 1 names the hot 64 KB
- * page(s), set SHIFT back to 10 and WIN_BASE to that page for the 1 KB
- * fine pass. */
-#define GNW_PCWALL_PAGE_SHIFT 16                  /* 16=64K pages, 10=1K   */
-#define GNW_PCWALL_WIN_BASE  0x00000000u          /* offset into ROM */
+/* Aiming history (Doom, device):
+ * pass 1 (SHIFT=10, BASE=0): rom<64K 0.0%, rom_hi 94.9%/99.9% — the
+ *   QEMU-flagged first-64K loops are cold on device.
+ * pass 2 (SHIFT=16, BASE=0, whole 4 MB): msh2 = 77.6% page 0x030000 +
+ *   17.3% page 0x040000; ssh2 = 84.6% page 0x040000 + 15.3% 0x030000.
+ *   The hot set is two adjacent 64 KB pages, split by core.
+ * pass 3 (current): 2 KB pages x 64 = exactly that 128 KB window —
+ *   function-sized resolution over 0x02030000..0x0204ffff. */
+#define GNW_PCWALL_PAGE_SHIFT 11                  /* 16=64K, 11=2K, 10=1K  */
+#define GNW_PCWALL_WIN_BASE  0x00030000u          /* offset into ROM */
 #define GNW_PCWALL_NBUCK     64
 #define GNW_PCWALL_WIN_SIZE  ((unsigned int)GNW_PCWALL_NBUCK << GNW_PCWALL_PAGE_SHIFT)
 enum { GNW_PCWALL_ROM_HI = 0, GNW_PCWALL_SDRAM, GNW_PCWALL_OTHER,
