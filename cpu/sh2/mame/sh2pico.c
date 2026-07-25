@@ -171,17 +171,30 @@ unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
  * shares in the one-shot /32x_dwt.txt dump; the disarmed per-insn cost
  * collapses to a counter decrement that never reaches zero. uint32 bucket
  * sums are safe: armed only from init to the ~64-frame dump (< 1 G cycles
- * total, far below wrap). */
+ * total, far below wrap).
+ *
+ * MEMORY PLACEMENT: the bucket tables live in a caller-provided AHB block
+ * (see gnw_sh2_pcwall_arm), NOT in this file's BSS — the MD32X overlay BSS
+ * was already within ~300 B of __RAM_EMU_END__ when MD32X_DEVICE_PROFILE
+ * first met the merged testbed tree, and 536 B of static tables tipped it
+ * over (link-time "MD32X BSS overflow"). Only the per-insn-hot countdown /
+ * stamp words stay here (~44 B). The tables are touched every 32 insns
+ * from the cold sample path, where an AHB access is irrelevant. */
 #define GNW_PCWALL_PERIOD    32
 #define GNW_PCWALL_WIN_BASE  0x00000000u          /* offset into ROM */
 #define GNW_PCWALL_WIN_SIZE  0x10000u             /* 64 KB fine window */
 #define GNW_PCWALL_NBUCK     (GNW_PCWALL_WIN_SIZE >> 10)
 enum { GNW_PCWALL_ROM_HI = 0, GNW_PCWALL_SDRAM, GNW_PCWALL_OTHER,
        GNW_PCWALL_NREGION };
+/* Caller-provided block word count: [core0 hist][core1 hist][core0 regions]
+ * [core1 regions] — md32x_profile.c allocates exactly this many uint32. */
+#define GNW_PCWALL_BLOCK_WORDS (2 * GNW_PCWALL_NBUCK + 2 * GNW_PCWALL_NREGION)
 int gnw_pcwall_armed;                             /* porting layer clears  */
 const unsigned int gnw_pcwall_win_base = GNW_PCWALL_WIN_BASE; /* for the dump */
-unsigned int gnw_pcwall_hist[2][GNW_PCWALL_NBUCK];/* cycles, ROM window    */
-unsigned int gnw_pcwall_region[2][GNW_PCWALL_NREGION]; /* cycles, coarse   */
+const unsigned int gnw_pcwall_nbuck = GNW_PCWALL_NBUCK;       /* for the dump */
+const unsigned int gnw_pcwall_block_words = GNW_PCWALL_BLOCK_WORDS; /* alloc size */
+unsigned int *gnw_pcwall_hist_p[2];               /* cycles, ROM window    */
+unsigned int *gnw_pcwall_region_p[2];             /* cycles, coarse        */
 unsigned int gnw_pcwall_samples[2];
 static int gnw_pcwall_cnt[2];
 static unsigned int gnw_pcwall_last[2];
@@ -205,22 +218,31 @@ static void __attribute__((noinline)) gnw_pcwall_sample(SH2 *sh2)
 	if (a - 0x02000000u < 0x400000u) {        /* 32X ROM, 4 MB */
 		unsigned int off = a - 0x02000000u - GNW_PCWALL_WIN_BASE;
 		if (off < GNW_PCWALL_WIN_SIZE)
-			gnw_pcwall_hist[core][off >> 10] += d;
+			gnw_pcwall_hist_p[core][off >> 10] += d;
 		else
-			gnw_pcwall_region[core][GNW_PCWALL_ROM_HI] += d;
+			gnw_pcwall_region_p[core][GNW_PCWALL_ROM_HI] += d;
 	} else if (a - 0x06000000u < 0x40000u) {  /* SDRAM, 256 KB */
-		gnw_pcwall_region[core][GNW_PCWALL_SDRAM] += d;
+		gnw_pcwall_region_p[core][GNW_PCWALL_SDRAM] += d;
 	} else {
-		gnw_pcwall_region[core][GNW_PCWALL_OTHER] += d;
+		gnw_pcwall_region_p[core][GNW_PCWALL_OTHER] += d;
 	}
 }
 
-/* Porting-layer entry point: arm (or re-arm) the probe. Must reset the
+/* Porting-layer entry point: arm (or re-arm) the probe. `block` is a zeroed
+ * uint32[gnw_pcwall_block_words] the caller owns (AHB — see MEMORY
+ * PLACEMENT above); NULL leaves the probe disarmed. Must reset the
  * countdowns — a tick that fired while disarmed parks its counter at 1<<30,
  * and flipping gnw_pcwall_armed alone would leave that core asleep. */
-void gnw_sh2_pcwall_arm(void)
+void gnw_sh2_pcwall_arm(unsigned int *block)
 {
 	unsigned int now = *(volatile unsigned int *)0xE0001004;
+
+	if (block == NULL)
+		return;
+	gnw_pcwall_hist_p[0]   = block;
+	gnw_pcwall_hist_p[1]   = block + GNW_PCWALL_NBUCK;
+	gnw_pcwall_region_p[0] = block + 2 * GNW_PCWALL_NBUCK;
+	gnw_pcwall_region_p[1] = block + 2 * GNW_PCWALL_NBUCK + GNW_PCWALL_NREGION;
 	gnw_pcwall_last[0] = gnw_pcwall_last[1] = now;
 	gnw_pcwall_cnt[0] = gnw_pcwall_cnt[1] = GNW_PCWALL_PERIOD;
 	gnw_pcwall_armed = 1;
