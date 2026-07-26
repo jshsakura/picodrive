@@ -1992,7 +1992,28 @@ typedef void REGPARM(3) (sh2_write_handler)(u32 a, u32 d, SH2 *sh2);
  * and interpreter dispatch — see sh2pico.c's fetch probe).  Deleted rather
  * than left switched off so the hot paths carry no dead scaffolding. */
 
-u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
+/* GNW: the six guest-bus entry points below are what the SH-2 interpreter
+ * calls on every load and store, and on the G&W that interpreter is linked
+ * into ITCM while the rest of this file stays in RAM_EMU -- 603 MB apart, so
+ * the linker was emitting a long-branch veneer per call.
+ *
+ * They cannot simply be named in the ITCM output section: the RAM_EMU overlay
+ * is matched FIRST and its `pico__32x__memory.o (.text .text*)` line swallows
+ * them, after which the ITCM rule matches nothing, the link succeeds and the
+ * move silently does nothing (verified in the map -- the veneers were still
+ * there). GNU ld cannot exclude an input section by name, so give them a
+ * section name that glob cannot claim and let the linker script place it.
+ *
+ * Both linker scripts that see GNW_32X_CORE must claim `.itcm_sh2bus`:
+ * STM32H7B0VBTx_SDCARD.ld (device, into .overlay_md32x_itc) and
+ * tools/m7_qemu_rig/mps2_an500_32x.ld (rig, anywhere in .text). */
+#ifdef GNW_32X_CORE
+#define GNW_SH2BUS __attribute__((section(".itcm_sh2bus")))
+#else
+#define GNW_SH2BUS
+#endif
+
+GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
 {
   /* SDRAM fastpath: 256KB at 0x06000000 (mirror 0x26000000 cache-through).
    * The map lookup costs ~11 cycles on device (call + index + deref);
@@ -2016,7 +2037,7 @@ u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
   }
 }
 
-u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
+GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
 {
   /* SDRAM fastpath — see read8 comment above. */
   u32 h = a & 0xff000000;
@@ -2037,7 +2058,7 @@ u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
   }
 }
 
-u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
+GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
 {
   /* SDRAM fastpath — see read8 comment above. */
   u32 h = a & 0xff000000;
@@ -2061,7 +2082,7 @@ u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
   }
 }
 
-void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
+GNW_SH2BUS void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
 {
   const void **sh2_wmap = sh2->write8_tab;
   sh2_write_handler *wh;
@@ -2070,7 +2091,7 @@ void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
   wh(a, d, sh2);
 }
 
-void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
+GNW_SH2BUS void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
 {
   const void **sh2_wmap = sh2->write16_tab;
   sh2_write_handler *wh;
@@ -2079,7 +2100,7 @@ void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
   wh(a, d, sh2);
 }
 
-void REGPARM(3) p32x_sh2_write32(u32 a, u32 d, SH2 *sh2)
+GNW_SH2BUS void REGPARM(3) p32x_sh2_write32(u32 a, u32 d, SH2 *sh2)
 {
   const void **sh2_wmap = sh2->write32_tab;
   sh2_write_handler *wh;

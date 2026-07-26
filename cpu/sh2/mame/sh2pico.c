@@ -98,6 +98,90 @@ extern unsigned int gnw_sh2_rom_fetch_mask;
                            + ((addr) & gnw_sh2_rom_fetch_mask))              \
      : (UINT32)(UINT16)RW(sh2, addr))
 
+#ifdef MD32X_DEVICE_PROFILE
+/* Guest DATA-access cost probe -- companion to the opcode-fetch probe below.
+ *
+ * The fetch probe answered its question (10.3-10.4 cycles, ~10-12% of a core's
+ * wall, stable across two very different scenes -- so external-flash latency is
+ * NOT what makes a guest instruction cost ~86 device cycles).  What is left is
+ * data accesses and the interpreter's own decode/execute.  This brackets the
+ * data side the same way, so the two per-event costs plus the instruction count
+ * account for the wall without a single scene-matched A/B -- which matters,
+ * because cyc/insn itself moved 101.6 -> 85.7 between two device dumps purely
+ * because the busier scene had better locality and longer slices.
+ *
+ * Deliberately a call, not an inline expansion: RB/RW/RL/WB/WW/WL appear at
+ * ~50 sites inside an 8 KB interpreter that lives in ITCM with 4 KB of head
+ * room, and inlining a bracket at each of them would not fit.  The cost of
+ * that extra call inflates the PROFILE build's cyc/insn (it is not in the
+ * release build), but it sits OUTSIDE the bracket, so the number this reports
+ * -- what one guest load or store really costs -- is unaffected.
+ *
+ * Prime period, and a different prime from the fetch probe's, so neither
+ * aliases a tight guest loop nor samples in lockstep with the other. */
+#define GNW_DA_PERIOD 29
+extern int gnw_pcwall_armed;
+unsigned int gnw_da_cyc[2], gnw_da_n[2];    /* reads,  per core */
+unsigned int gnw_daw_cyc[2], gnw_daw_n[2];  /* writes, per core */
+static int gnw_da_cnt[2], gnw_daw_cnt[2];
+
+static UINT32 __attribute__((noinline)) gnw_probe_rd(SH2 *sh2, UINT32 a, int k)
+{
+	int c = sh2->is_slave & 1;
+	unsigned int t0;
+	UINT32 v;
+
+	if (--gnw_da_cnt[c] > 0)
+		return k == 0 ? p32x_sh2_read8(a, sh2)
+		     : k == 1 ? p32x_sh2_read16(a, sh2)
+		              : p32x_sh2_read32(a, sh2);
+	t0 = *(volatile unsigned int *)0xE0001004;
+	v = k == 0 ? p32x_sh2_read8(a, sh2)
+	  : k == 1 ? p32x_sh2_read16(a, sh2)
+	           : p32x_sh2_read32(a, sh2);
+	gnw_da_cyc[c] += *(volatile unsigned int *)0xE0001004 - t0;
+	gnw_da_n[c]++;
+	gnw_da_cnt[c] = gnw_pcwall_armed ? GNW_DA_PERIOD : (1 << 30);
+	return v;
+}
+
+static void __attribute__((noinline)) gnw_probe_wr(SH2 *sh2, UINT32 a, UINT32 d, int k)
+{
+	int c = sh2->is_slave & 1;
+	unsigned int t0;
+
+	if (--gnw_daw_cnt[c] > 0) {
+		if (k == 0)      p32x_sh2_write8(a, d, sh2);
+		else if (k == 1) p32x_sh2_write16(a, d, sh2);
+		else             p32x_sh2_write32(a, d, sh2);
+		return;
+	}
+	t0 = *(volatile unsigned int *)0xE0001004;
+	if (k == 0)      p32x_sh2_write8(a, d, sh2);
+	else if (k == 1) p32x_sh2_write16(a, d, sh2);
+	else             p32x_sh2_write32(a, d, sh2);
+	gnw_daw_cyc[c] += *(volatile unsigned int *)0xE0001004 - t0;
+	gnw_daw_n[c]++;
+	gnw_daw_cnt[c] = gnw_pcwall_armed ? GNW_DA_PERIOD : (1 << 30);
+}
+
+/* GNW_FETCH_SD's fallback arm uses RW(), so a fetch that lands outside SDRAM
+ * and ROM would book itself as a data read. Both cores measure 0.0% outside
+ * those two regions, so this cannot bias anything in practice. */
+#undef RB
+#undef RW
+#undef RL
+#undef WB
+#undef WW
+#undef WL
+#define RB(sh2, a) gnw_probe_rd(sh2, a, 0)
+#define RW(sh2, a) gnw_probe_rd(sh2, a, 1)
+#define RL(sh2, a) gnw_probe_rd(sh2, a, 2)
+#define WB(sh2, a, d) gnw_probe_wr(sh2, a, d, 0)
+#define WW(sh2, a, d) gnw_probe_wr(sh2, a, d, 1)
+#define WL(sh2, a, d) gnw_probe_wr(sh2, a, d, 2)
+#endif /* MD32X_DEVICE_PROFILE */
+
 #endif
 
 // some stuff from sh2comn.h
@@ -358,6 +442,10 @@ void gnw_sh2_pcwall_arm(unsigned int *block)
 	gnw_fetch_n[0] = gnw_fetch_n[1] = 0;
 	gnw_fetch_cnt[0] = gnw_fetch_cnt[1] = GNW_FETCH_PERIOD;
 	gnw_sh2_slices[0] = gnw_sh2_slices[1] = 0;
+	gnw_da_cyc[0] = gnw_da_cyc[1] = gnw_da_n[0] = gnw_da_n[1] = 0;
+	gnw_daw_cyc[0] = gnw_daw_cyc[1] = gnw_daw_n[0] = gnw_daw_n[1] = 0;
+	gnw_da_cnt[0] = gnw_da_cnt[1] = GNW_DA_PERIOD;
+	gnw_daw_cnt[0] = gnw_daw_cnt[1] = GNW_DA_PERIOD;
 
 	gnw_pcwall_armed = 1;
 }
