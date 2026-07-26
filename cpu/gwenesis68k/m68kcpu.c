@@ -287,7 +287,89 @@ void m68k_set_irq_delay(unsigned int int_level)
   m68ki_check_interrupts(); /* Level triggered (IRQ) */
 }
 
-void m68k_run(unsigned int cycles) 
+#ifdef MD32X_DEVICE_PROFILE
+/* 68K profile probe (device only). The 0726 cost model closed msh2 -- memory
+ * is 25% of its wall, the rest is decode/execute, and both ITCM and DTCM
+ * placement are spent. What was never looked at is the 32% of the frame
+ * OUTSIDE msh2, of which the 68K is the largest slice at 12.9%.
+ *
+ * That number needs explaining before anything is built for it. On a 32X game
+ * the 68K should be nearly idle -- the SH-2s run the game -- and picodrive
+ * already has the machinery to skip it (m68k_poll_detect in pico/32x/memory.c
+ * calls SekSetStop, after which m68k_run returns for the rest of the slice).
+ * So there are two possibilities and they lead opposite ways:
+ *
+ *   stopped_cycles near the frame's 128 k -> the skip already works and the
+ *     remaining cost is real 68K work; the axis is closed.
+ *   stopped_cycles near zero -> Doom's 68K wait is NOT a 32X-register poll, so
+ *     detection never fires, and the same fold that took 18.8% off the frame
+ *     this morning applies here.
+ *
+ * Hence: guest cycles run vs skipped, dispatched instructions, and a PC
+ * histogram (32 KB pages over the first 1 MB of ROM, where a Genesis-side
+ * program lives) to say whether the time is one loop or spread out.
+ * Tables are caller-provided AHB, like the SH-2 probe -- the MD32X overlay
+ * BSS has 520 B and this file's BSS is inside it. */
+#define GNW_M68K_NBUCK      32
+#define GNW_M68K_PAGE_SHIFT 15                  /* 32 KB pages, 1 MB window */
+#define GNW_M68K_PERIOD     37                  /* prime; see the SH-2 probe */
+const unsigned int gnw_m68k_nbuck = GNW_M68K_NBUCK;
+const unsigned int gnw_m68k_page_shift = GNW_M68K_PAGE_SHIFT;
+const unsigned int gnw_m68k_block_words = GNW_M68K_NBUCK + 1;  /* +1 = other */
+unsigned int *gnw_m68k_hist_p;                  /* [NBUCK] + [NBUCK]=other  */
+unsigned long long gnw_m68k_insns;
+unsigned int gnw_m68k_run_cyc;                  /* guest cycles executed     */
+unsigned int gnw_m68k_stop_cyc;                 /* guest cycles skipped      */
+unsigned int gnw_m68k_stop_hits;                /* m68k_run calls that skipped */
+unsigned int gnw_m68k_samples;
+int gnw_m68k_armed;
+static int gnw_m68k_cnt;
+static unsigned int gnw_m68k_last;
+
+void gnw_m68k_prof_arm(unsigned int *block)
+{
+	if (block == NULL)
+		return;
+	gnw_m68k_hist_p = block;
+	gnw_m68k_insns = 0;
+	gnw_m68k_run_cyc = gnw_m68k_stop_cyc = gnw_m68k_stop_hits = 0;
+	gnw_m68k_samples = 0;
+	gnw_m68k_cnt = GNW_M68K_PERIOD;
+	gnw_m68k_last = *(volatile unsigned int *)0xE0001004;
+	gnw_m68k_armed = 1;
+}
+
+static void __attribute__((noinline)) gnw_m68k_sample(unsigned int pc)
+{
+	unsigned int now = *(volatile unsigned int *)0xE0001004;
+	unsigned int d;
+
+	if (!gnw_m68k_armed) {
+		gnw_m68k_cnt = 1 << 30;
+		return;
+	}
+	gnw_m68k_cnt = GNW_M68K_PERIOD;
+	d = now - gnw_m68k_last;
+	gnw_m68k_last = now;
+	gnw_m68k_samples++;
+
+	pc &= 0xffffff;
+	if (pc < ((unsigned int)GNW_M68K_NBUCK << GNW_M68K_PAGE_SHIFT))
+		gnw_m68k_hist_p[pc >> GNW_M68K_PAGE_SHIFT] += d;
+	else
+		gnw_m68k_hist_p[GNW_M68K_NBUCK] += d;
+}
+#define GNW_M68K_TICK(pc) do {                                               \
+	gnw_m68k_insns++;                                                    \
+	if (--gnw_m68k_cnt <= 0) gnw_m68k_sample(pc);                        \
+} while (0)
+#define GNW_M68K_ENTER() (gnw_m68k_last = *(volatile unsigned int *)0xE0001004)
+#else
+#define GNW_M68K_TICK(pc) ((void)0)
+#define GNW_M68K_ENTER()  ((void)0)
+#endif
+
+void m68k_run(unsigned int cycles)
 {
     //  printf("m68K_run current_cycles=%d add=%d STOP=%x\n",m68k.cycles,cycles,CPU_STOPPED);
 
@@ -303,12 +385,23 @@ void m68k_run(unsigned int cycles)
   /* Make sure we're not stopped */
   if (CPU_STOPPED)
   {
+#ifdef MD32X_DEVICE_PROFILE
+    if (gnw_m68k_armed) {
+      gnw_m68k_stop_cyc += cycles - m68k.cycles;
+      gnw_m68k_stop_hits++;
+    }
+#endif
     m68k.cycles = cycles;
     return;
   }
 
   /* Save end cycles count for when CPU is stopped */
   m68k.cycle_end = cycles;
+#ifdef MD32X_DEVICE_PROFILE
+  if (gnw_m68k_armed)
+    gnw_m68k_run_cyc += cycles - m68k.cycles;
+  GNW_M68K_ENTER();
+#endif
 
   /* Return point for when we have an address error (TODO: use goto) */
   m68ki_set_address_error_trap() /* auto-disable (see m68kcpu.h) */
@@ -340,6 +433,7 @@ void m68k_run(unsigned int cycles)
 //    printf("PC=%x IR=%x CYCLES=%d \n",m68k.pc,REG_IR,CYC_INSTRUCTION[REG_IR]);
 
     /* Execute instruction */
+    GNW_M68K_TICK(REG_PC);
     m68ki_instruction_jump_table[REG_IR]();
     USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
 
