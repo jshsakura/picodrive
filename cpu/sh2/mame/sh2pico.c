@@ -77,10 +77,25 @@ MAKE_WRITEFUNC(WL, p32x_sh2_write32)
  * p32x_sh2_read16()'s own SDRAM branch (pico/32x/memory.c), so a fetch
  * resolves to the identical byte either way; anything outside SDRAM still
  * goes through the full call. */
+extern unsigned int gnw_sh2_rom_fetch_mask;
+
+/* Cart ROM gets the same treatment (0726).  The SDRAM-only fast path above
+ * was written for "32X code lives in SDRAM", which is true of the 32X's own
+ * boot copy but not of the games: the device pcwall probe puts Doom's msh2 at
+ * sdram 0.0% / cart-ROM 100%, so every one of its ~173 k fetches per frame was
+ * still paying the cross-TU call.  gnw_sh2_rom_fetch_mask (pico/32x/memory.c)
+ * is the CS1 read16 map entry's own mask, or 0 when that entry is a handler
+ * (SSF2 banking) -- so the fast path resolves to the identical byte the map
+ * would, and disables itself when the map is not plain memory.
+ *
+ * Both region tests fold the cache-through mirror with one AND: 0x26->0x06 and
+ * 0x22->0x02 under 0xdf000000, and no other CS aliases onto them. */
 #define GNW_FETCH_SD(sh2, addr)                                              \
-  (((((addr) & 0xff000000) == 0x06000000) ||                                 \
-    (((addr) & 0xff000000) == 0x26000000))                                   \
+  ((((addr) & 0xdf000000) == 0x06000000)                                     \
      ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_sdram + ((addr) & 0x3fffe))     \
+   : ((((addr) & 0xdf000000) == 0x02000000) && gnw_sh2_rom_fetch_mask)       \
+     ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_rom                             \
+                           + ((addr) & gnw_sh2_rom_fetch_mask))              \
      : (UINT32)(UINT16)RW(sh2, addr))
 
 #endif
@@ -162,10 +177,10 @@ unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
  * the same interpreter slice — the stamp resets at slice entry, so time in
  * the other core / 68K / VDP never leaks in) to a bucket chosen by the
  * current ppc:
- *   - a 1 KB-granular histogram over a 64 KB ROM window (both Doom hot
- *     loops, 0x02005fa6 / 0x020023a8, sit in the first 32 KB; the window
- *     base is a define so a second pass can slide it if mass lands in
- *     rom_hi instead),
+ *   - a page histogram over a ROM window whose base and page size are
+ *     defines, so each pass can widen to re-find the hot set or narrow onto
+ *     it (see the aiming history below; mass landing in rom_hi is the
+ *     signal to slide the window),
  *   - whole-region sums for ROM-above-window, SDRAM, and everything else.
  * The porting layer (md32x_profile.c) freezes gnw_pcwall_armed and prints
  * shares in the one-shot /32x_dwt.txt dump; the disarmed per-insn cost
@@ -196,11 +211,20 @@ unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
  *   handshake polls + 256K ROM->SDRAM copy), the IRQ prologue, a SLEEP
  *   idle and the VInt ISR; 0x04e800 holds a TAS spinlock. Page resolution
  *   cannot split poll/memcpy/ISR/SLEEP costs.
- * pass 5 (current): 128 B pages x 64 = 0x04d000..0x04efff — instruction-
- *   run resolution over msh2's #1, msh2's #4 and ssh2's #1 pages.
- *   (msh2's #2, the 0x049000 render code, is a later pass if needed.) */
-#define GNW_PCWALL_PAGE_SHIFT 7                   /* 16=64K, 11=2K, 7=128B */
-#define GNW_PCWALL_WIN_BASE  0x0004d000u          /* offset into ROM */
+ * pass 5: 128 B pages x 64 = 0x04d000..0x04efff — instruction-run
+ *   resolution. Result: msh2 35.0% in the SINGLE page 0x0204df00, the
+ *   master's frame-wait spin (see gnw_sh2_fastloop's BT/S case); ssh2
+ *   63.6% in 0x0204e800, a TAS spinlock.
+ * pass 6 (same geometry, with the BT/S fold shipped): 0x0204df00 fell to
+ *   0.2% — the fold fires — and msh2's wall moved out from under the
+ *   window: rom_win 11.0%, rom_hi 88.9%, sdram 0.0%.  Frame wall -18.7%,
+ *   msh2 -27.3% against pass 5 on the same scene.
+ * pass 7 (current): 16 KB pages x 64 = ROM 0x000000..0x0fffff.  Re-widened
+ *   to re-find the post-fold hot set (pass 2 put all of Doom's mass in the
+ *   0x030000/0x040000 64 KB pages, so 1 MB covers it with rom_hi as the
+ *   escape hatch), at 4x the resolution of the pass-2 map. */
+#define GNW_PCWALL_PAGE_SHIFT 14                  /* 16=64K, 14=16K, 7=128B */
+#define GNW_PCWALL_WIN_BASE  0x00000000u          /* offset into ROM */
 #define GNW_PCWALL_NBUCK     64
 #define GNW_PCWALL_WIN_SIZE  ((unsigned int)GNW_PCWALL_NBUCK << GNW_PCWALL_PAGE_SHIFT)
 enum { GNW_PCWALL_ROM_HI = 0, GNW_PCWALL_SDRAM, GNW_PCWALL_OTHER,
@@ -218,6 +242,59 @@ unsigned int *gnw_pcwall_region_p[2];             /* cycles, coarse        */
 unsigned int gnw_pcwall_samples[2];
 static int gnw_pcwall_cnt[2];
 static unsigned int gnw_pcwall_last[2];
+
+/* Opcode-fetch cost probe, and the interpreter slice counter.
+ *
+ * pcwall says WHERE the wall is; the memory-dispatch ledger said it is not in
+ * the write path (1.1% of msh2).  What is left in the 101-134 cycles per
+ * dispatched guest instruction is fetch + dispatch + op body, and only the
+ * fetch can be a memory stall: the cart ROM is XIP out of external flash
+ * (diag "rom cached: addr=0x93210000") behind a 16 KB D-cache that the 256 KB
+ * SDRAM working set is also thrashing.  This brackets one fetch in every
+ * GNW_FETCH_PERIOD with DWT_CYCCNT so the dump can say what a fetch really
+ * costs.  Two readings decide the next lever: a few cycles means the fetch is
+ * cached and the cost is interpreter dispatch (specialise the hot ops); tens
+ * of cycles means it is flash latency (cache ROM in RAM, and the RAM budget
+ * question has to be reopened).
+ *
+ * The period is deliberately PRIME: a power of two aliases against tight
+ * guest loops (a 4-instruction loop sampled every 32 would sample the same
+ * instruction for ever) and against the 16-halfword D-cache line, so the
+ * sampled fetch would never be the line-filling one.
+ *
+ * Bias: only the non-delay-slot fetch site is instrumented (one site instead
+ * of two, for overlay text -- the MD32X overlay has ~100 B of margin), but
+ * every loop iteration fetches exactly one opcode, so total fetches equals
+ * the dispatched-instruction count either way.  The CYCCNT pair itself costs
+ * ~10 cycles; gnw_fetch_ovh_x8 is 8 back-to-back empty pairs measured at arm
+ * time, for the dump to subtract.
+ *
+ * The slice counter is the control: picodrive syncs the SH-2s every STEP_N
+ * (976) 68K cycles, ~131 slices/frame, but p32x_sh2_poll_detect can force
+ * early syncs.  If slices/frame ran into the thousands, per-slice overhead —
+ * not per-instruction cost — would be the disease, and insns/slice names it. */
+#define GNW_FETCH_PERIOD 31
+#define GNW_DWTC (*(volatile unsigned int *)0xE0001004)
+unsigned int gnw_fetch_cyc[2];      /* summed bracketed deltas, per core */
+unsigned int gnw_fetch_n[2];        /* bracketed fetches, per core       */
+unsigned int gnw_fetch_ovh_x8;      /* 8 empty CYCCNT pairs, calibration */
+unsigned int gnw_sh2_slices[2];     /* sh2_execute_interpreter entries   */
+static int gnw_fetch_cnt[2];
+
+#define GNW_FETCH(sh2, addr, dst) do {                                       \
+	int c_ = (sh2)->is_slave & 1;                                        \
+	if (--gnw_fetch_cnt[c_] > 0) {                                       \
+		(dst) = GNW_FETCH_SD(sh2, addr);                             \
+	} else {                                                             \
+		unsigned int t0_ = GNW_DWTC;                                 \
+		(dst) = GNW_FETCH_SD(sh2, addr);                             \
+		gnw_fetch_cyc[c_] += GNW_DWTC - t0_;                         \
+		gnw_fetch_n[c_]++;                                           \
+		gnw_fetch_cnt[c_] = gnw_pcwall_armed ? GNW_FETCH_PERIOD      \
+		                                     : (1 << 30);            \
+	}                                                                    \
+} while (0)
+#define GNW_SLICE_TICK(sh2) (gnw_sh2_slices[(sh2)->is_slave & 1]++)
 
 static void __attribute__((noinline)) gnw_pcwall_sample(SH2 *sh2)
 {
@@ -265,6 +342,23 @@ void gnw_sh2_pcwall_arm(unsigned int *block)
 	gnw_pcwall_region_p[1] = block + 2 * GNW_PCWALL_NBUCK + GNW_PCWALL_NREGION;
 	gnw_pcwall_last[0] = gnw_pcwall_last[1] = now;
 	gnw_pcwall_cnt[0] = gnw_pcwall_cnt[1] = GNW_PCWALL_PERIOD;
+
+	/* fetch probe: calibrate the CYCCNT-pair self-cost with 8 empty pairs,
+	 * then open its countdown on the same instant as everything else */
+	{
+		unsigned int i, s = 0;
+		for (i = 0; i < 8; i++) {
+			unsigned int a = GNW_DWTC;
+			unsigned int b = GNW_DWTC;
+			s += b - a;
+		}
+		gnw_fetch_ovh_x8 = s;
+	}
+	gnw_fetch_cyc[0] = gnw_fetch_cyc[1] = 0;
+	gnw_fetch_n[0] = gnw_fetch_n[1] = 0;
+	gnw_fetch_cnt[0] = gnw_fetch_cnt[1] = GNW_FETCH_PERIOD;
+	gnw_sh2_slices[0] = gnw_sh2_slices[1] = 0;
+
 	gnw_pcwall_armed = 1;
 }
 
@@ -274,10 +368,13 @@ void gnw_sh2_pcwall_arm(unsigned int *block)
 	(gnw_pcwall_last[(sh2)->is_slave & 1] = *(volatile unsigned int *)0xE0001004)
 #define GNW_PCWALL_TICK(sh2) \
 	((--gnw_pcwall_cnt[(sh2)->is_slave & 1] <= 0) ? gnw_pcwall_sample(sh2) : (void)0)
+
 #else
 #define GNW_SH2_INSN_TICK(sh2) ((void)0)
 #define GNW_PCWALL_ENTER(sh2) ((void)0)
 #define GNW_PCWALL_TICK(sh2) ((void)0)
+#define GNW_FETCH(sh2, addr, dst) ((dst) = GNW_FETCH_SD(sh2, addr))
+#define GNW_SLICE_TICK(sh2) ((void)0)
 #endif
 
 /* RIG_SH2_PC_HIST: SH-2 guest-PC histogram for the QEMU M7 feasibility rig.
@@ -835,6 +932,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		goto out;
 
 	GNW_PCWALL_ENTER(sh2);
+	GNW_SLICE_TICK(sh2);
 
 	const void *gnw_dt[16] = {
 		&&gnw_op0,  &&gnw_op1,  &&gnw_op2,  &&gnw_op3,
@@ -873,7 +971,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		else
 		{
 			sh2->ppc = sh2->pc;
-			opcode = GNW_FETCH_SD(sh2, sh2->pc);
+			GNW_FETCH(sh2, sh2->pc, opcode);
 #ifdef GNW_SH2_FASTLOOPS
 			gnw_direct = 1;
 #endif
@@ -893,10 +991,16 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 #ifdef GNW_SH2_FASTLOOPS
 		/* cheap opcode pre-filter first, then the negative-cache probe
 		 * inline (see gnw_dl_reject above), so ordinary hot loops
-		 * reject in a few instructions without calling the helper */
-		if ((((opcode & 0xff80) == 0x8b80) || ((opcode & 0xff80) == 0x8f80)
-		     || ((opcode & 0xff80) == 0x8980) || ((opcode & 0xff80) == 0x8d80)
-		     || opcode == 0xaffe)
+		 * reject in a few instructions without calling the helper.
+		 *
+		 * The four candidates are BT/BF/BT/S/BF/S with a negative
+		 * displacement -- 0x8980, 0x8b80, 0x8d80, 0x8f80 under mask
+		 * 0xff80.  Those are exactly the 0x8n80 opcodes whose n has
+		 * both bit3 and bit0 set (n = 9, B, D, F), so one masked
+		 * compare against 0xf980 covers all four with no false
+		 * positives -- four compare-and-branches per DISPATCHED
+		 * INSTRUCTION saved, on a path that runs ~173 k times a frame. */
+		if ((((opcode & 0xf980) == 0x8980) || opcode == 0xaffe)
 		    && gnw_direct && *GNW_DL_REJ_SLOT(sh2) != sh2->ppc
 		    && !sh2->test_irq && gnw_sh2_fastloops)
 			gnw_sh2_fastloop(sh2, opcode);

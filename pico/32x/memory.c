@@ -59,6 +59,19 @@ int carthw_ssf2_active;
 unsigned char carthw_ssf2_banks[8];
 #endif
 
+/* GNW: cart-ROM opcode-fetch fast path (read by sh2pico.c's GNW_FETCH_SD).
+ *
+ * Mirrors the sh2 read16 map entry for CS1 (0x02000000 / 0x22000000): a plain
+ * MAP_MEMORY(Pico.rom) with mask rs-1, so a fetch resolves to the identical
+ * byte either way.  Zero means "do not take the fast path" -- set whenever
+ * that map entry is a HANDLER instead (SSF2 bank switching), and before the
+ * map is built at all.  Device pcwall says Doom's msh2 executes 100% out of
+ * cart ROM and 0.0% out of SDRAM, so before this existed every one of its
+ * ~173 k fetches per frame paid the cross-TU p32x_sh2_read16 call that the
+ * SDRAM fast path was added to avoid. */
+unsigned int gnw_sh2_rom_fetch_mask;
+static unsigned int gnw_rom_map_mask;   /* rs-1 from PicoMemSetup32x */
+
 static void bank_switch_rom_68k(int b);
 
 static void (*m68k_write8_io)(u32 a, u32 d);
@@ -1964,36 +1977,20 @@ typedef void REGPARM(3) (sh2_write_handler)(u32 a, u32 d, SH2 *sh2);
 #define SH2MAP_ADDR2OFFS_W(a) \
   ((u32)(a) >> SH2_WRITE_SHIFT)
 
-#ifdef MD32X_DEVICE_PROFILE
-/* Generic memory-dispatch cost ledger (device DWT cycles, per core).
+/* RETIRED: the memory-dispatch cost ledger (MD32X_DEVICE_PROFILE, 0726) that
+ * used to wrap every read-handler branch and write-tab call here.  It was
+ * built to size the "every SH-2 write is an indirect call" hypothesis against
+ * the 101-134 cycles/guest-insn the device measures, and it answered:
  *
- * The pass-4/5 device probes measured 101-134 cycles per dispatched guest
- * instruction — 3-4x what a tuned M7 interpreter should cost — and that
- * disease is game-independent.  Reads have an SDRAM fastpath; every WRITE
- * is an indirect call through the write tab, and read handlers (VDP, sysreg,
- * ROM bank...) are calls too.  This ledger splits the window's SH-2 cycles
- * into handler-call cost vs everything else, per class, so the "make the
- * 32X itself faster" lever can be sized before it is built.  Gated on the
- * same window flag as the pcwall probe (armed at warmup expiry, frozen at
- * dump); zeroed by md32x_profile.c.  Self-cost ~10 cycles per counted call
- * (two DWT reads + adds) — the dump prints call counts so that bias can be
- * subtracted.  Nested dispatch (a handler reading through the map again)
- * double-books the inner call; rare, and fine for a diag ledger. */
-unsigned int gnw_memh_cyc[2][4];  /* [core][RH, W8, W16, W32] */
-unsigned int gnw_memh_cnt[2][4];
-extern int gnw_pcwall_armed;      /* sh2pico.c probe owns the window */
-#define GNW_MEMH(sh2i, idx, expr) do { \
-    if (gnw_pcwall_armed) { \
-      unsigned int _c = (sh2i)->is_slave & 1; \
-      unsigned int _t0 = *(volatile unsigned int *)0xE0001004; \
-      expr; \
-      gnw_memh_cyc[_c][idx] += *(volatile unsigned int *)0xE0001004 - _t0; \
-      gnw_memh_cnt[_c][idx]++; \
-    } else { expr; } \
-  } while (0)
-#else
-#define GNW_MEMH(sh2i, idx, expr) expr
-#endif
+ *   msh2  read_h 8,746 calls  write8 4,265  write16 467,092  write32 249,243
+ *         => 14.3 M of 1,276 M window cycles = 1.1% of the master's wall,
+ *            at 15-20 cycles per call INCLUDING the ~10-cycle probe self-cost.
+ *   ssh2  14.9% of its own wall, and ssh2 is 9.4% of the frame => ~1.4%.
+ *
+ * So the write path is already cheap and there is nothing to win by inlining
+ * or fast-pathing it; the per-instruction cost lives elsewhere (opcode fetch
+ * and interpreter dispatch — see sh2pico.c's fetch probe).  Deleted rather
+ * than left switched off so the hot paths carry no dead scaffolding. */
 
 u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
 {
@@ -2014,7 +2011,7 @@ u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
     return *(s8 *)((p << 1) + MEM_BE2(a & sh2_map->mask));
   else {
     u32 r_;
-    GNW_MEMH(sh2, 0, r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2));
+    r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
     return r_;
   }
 }
@@ -2035,7 +2032,7 @@ u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
     return *(s16 *)((p << 1) + (a & sh2_map->mask));
   else {
     u32 r_;
-    GNW_MEMH(sh2, 0, r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2));
+    r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
     return r_;
   }
 }
@@ -2059,7 +2056,7 @@ u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
     return CPU_BE2(*pd);
   } else {
     u32 r_;
-    GNW_MEMH(sh2, 0, r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2));
+    r_ = ((sh2_read_handler *)MAP_FUNC(p))(a, sh2);
     return r_;
   }
 }
@@ -2070,7 +2067,7 @@ void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
   sh2_write_handler *wh;
 
   wh = sh2_wmap[SH2MAP_ADDR2OFFS_W(a)];
-  GNW_MEMH(sh2, 1, wh(a, d, sh2));
+  wh(a, d, sh2);
 }
 
 void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
@@ -2079,7 +2076,7 @@ void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
   sh2_write_handler *wh;
 
   wh = sh2_wmap[SH2MAP_ADDR2OFFS_W(a)];
-  GNW_MEMH(sh2, 2, wh(a, d, sh2));
+  wh(a, d, sh2);
 }
 
 void REGPARM(3) p32x_sh2_write32(u32 a, u32 d, SH2 *sh2)
@@ -2088,7 +2085,7 @@ void REGPARM(3) p32x_sh2_write32(u32 a, u32 d, SH2 *sh2)
   sh2_write_handler *wh;
 
   wh = sh2_wmap[SH2MAP_ADDR2OFFS_W(a)];
-  GNW_MEMH(sh2, 3, wh(a, d, sh2));
+  wh(a, d, sh2);
 }
 
 void *p32x_sh2_get_mem_ptr(u32 a, u32 *mask, SH2 *sh2)
@@ -2459,6 +2456,9 @@ void Pico32xSwapDRAM(int b)
 
 static void bank_switch_rom_sh2(void)
 {
+  /* keep the fetch fast path in step with the map entry it mirrors */
+  gnw_sh2_rom_fetch_mask = carthw_ssf2_active ? 0 : gnw_rom_map_mask;
+
   if (!carthw_ssf2_active) {
     // easy
     msh2_read8_map[0x02/2].addr  = msh2_read8_map[0x22/2].addr  =
@@ -2572,7 +2572,11 @@ void PicoMemSetup32x(void)
   msh2_write32_map[0x00/2] = msh2_write32_map[0x20/2] = sh2_write32_cs0;
   // CS1 - ROM
   bank_switch_rom_sh2();
-  for (rs = 0x8000; rs < Pico.romsize && rs < 0x400000; rs *= 2) ; 
+  for (rs = 0x8000; rs < Pico.romsize && rs < 0x400000; rs *= 2) ;
+  /* now that rs is known, publish the fetch fast-path mask (bank_switch_rom_sh2
+   * ran above with it still zero, i.e. the fast path disabled) */
+  gnw_rom_map_mask = rs - 1;
+  gnw_sh2_rom_fetch_mask = carthw_ssf2_active ? 0 : gnw_rom_map_mask;
   msh2_read8_map[0x02/2].mask  = msh2_read8_map[0x22/2].mask  = rs-1;
   msh2_read16_map[0x02/2].mask = msh2_read16_map[0x22/2].mask = rs-1;
   msh2_read32_map[0x02/2].mask = msh2_read32_map[0x22/2].mask = rs-1;
