@@ -18,7 +18,37 @@
 #endif
 
 struct Pico32x Pico32x;
+
+/* GNW: the two SH-2 contexts are the interpreter's register file -- every
+ * dispatched instruction touches r[], pc, ppc, sr, t_flag, icount and delay,
+ * and every guest load or store is a call taking `sh2`, which forces the
+ * compiler to spill and reload those fields around it. The device cost model
+ * (0726) puts the whole memory side -- opcode fetch plus guest loads and
+ * stores -- at only 25% of the master's wall, so the other 75% is decode,
+ * execute and exactly this bookkeeping, and the interpreter itself already
+ * runs from zero-wait ITCM. Moving its state off AXI SRAM into DTCM is what
+ * is left: zero wait states, and 12 KB of the hottest data in the program
+ * stops competing for the 16 KB D-cache that Doom's texture reads thrash.
+ *
+ * A dedicated section name, not .bss: the MD32X overlay's BSS rule is matched
+ * first and its `build/md32x/*.o (.bss .bss*)` glob would claim this back --
+ * the same silent-no-op trap that already cost one build cycle on the guest-bus
+ * ITCM move (link succeeds, nothing moves). Excluding the whole file instead is
+ * not an option; gnw_32xmem's 520 KB lives here too.
+ *
+ * Consequences the linker script and porting layer must honour, both of which
+ * have precedent in .overlay_md32x_itc_bss:
+ *   - the output section must be NOLOAD, or this becomes 12 KB of zeros in
+ *     internal flash, the scarcest resource in the build;
+ *   - DTCM .bss is zeroed once at boot, while the overlay BSS is zeroed on
+ *     every core load -- so main_md32x.c must memset this explicitly, or a
+ *     second launch of the 32X core starts on the previous session's state.
+ * Both linker scripts that see GNW_32X_CORE must claim `.dtcm_sh2s`. */
+#ifdef GNW_32X_CORE
+SH2 sh2s[2] __attribute__((section(".dtcm_sh2s")));
+#else
 SH2 sh2s[2];
+#endif
 
 #define SH2_IDLE_STATES (SH2_STATE_CPOLL|SH2_STATE_VPOLL|SH2_STATE_RPOLL|SH2_STATE_SLEEP)
 
