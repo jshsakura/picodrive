@@ -133,8 +133,16 @@ static void convert_pal555(int invert_prio)
           } else                                                  \
             while (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
           { u32 pair = (u32)sv | ((u32)sv << 16);                \
-            for (n = run; n >= 4; n -= 4) { *(u32 *)(pd) = pair; *(u32 *)(pd+2) = pair; pd += 4; } \
-            for (; n >= 2; n -= 2) { *(u32 *)(pd) = pair; pd += 2; } \
+            /* pd can be 2 mod 4 (odd line offs / H32 stride). A fused \
+             * pair of u32 stores compiles to STRD, which faults on    \
+             * M-profile unless 4-byte aligned (same bug class as SM   \
+             * ClearBackdrop). Align first; the blast is then strd-safe. */ \
+            n = run;                                              \
+            if ((uintptr_t)pd & 3) { *pd = sv; pd++; n--; }      \
+            { u32 *p32 = (u32 *)(void *)pd;                       \
+              for (; n >= 4; n -= 4) { p32[0] = pair; p32[1] = pair; p32 += 2; pd += 4; } \
+              for (; n >= 2; n -= 2) { *p32++ = pair; pd += 2; }  \
+            }                                                     \
             if (n) { *pd = sv; pd++; }                           \
           }                                                       \
           pmd += run; p32x += run; i -= run;                      \
@@ -155,8 +163,16 @@ static void convert_pal555(int invert_prio)
                    *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
           /* blast bg+identical run */                            \
           { u32 pair = (u32)sv | ((u32)sv << 16);                \
-            for (n = run; n >= 4; n -= 4) { *(u32 *)(pd) = pair; *(u32 *)(pd+2) = pair; pd += 4; } \
-            for (; n >= 2; n -= 2) { *(u32 *)(pd) = pair; pd += 2; } \
+            /* pd can be 2 mod 4 (odd line offs / H32 stride). A fused \
+             * pair of u32 stores compiles to STRD, which faults on    \
+             * M-profile unless 4-byte aligned (same bug class as SM   \
+             * ClearBackdrop). Align first; the blast is then strd-safe. */ \
+            n = run;                                              \
+            if ((uintptr_t)pd & 3) { *pd = sv; pd++; n--; }      \
+            { u32 *p32 = (u32 *)(void *)pd;                       \
+              for (; n >= 4; n -= 4) { p32[0] = pair; p32[1] = pair; p32 += 2; pd += 4; } \
+              for (; n >= 2; n -= 2) { *p32++ = pair; pd += 2; }  \
+            }                                                     \
             if (n) { *pd = sv; pd++; }                           \
           }                                                       \
           pmd += run; p32x += run; i -= run;                      \
