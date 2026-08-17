@@ -1420,6 +1420,20 @@ static void PicoCartDetect(const char *carthw_cfg)
   }
 }
 
+#ifdef RIG_SRAM_FILL
+/* Rig-only probe helper (tools/m7_qemu_rig): the D32XR Z_Malloc failure on the
+ * device appeared only after a clean title-screen session had exited (which
+ * persists cart SRAM to the card). This getter lets the rig preload/dump
+ * Pico.sv.data to replay second-boot SRAM state — rig_32x.c cannot include
+ * pico_int.h (type clashes with its own stubs), so the accessor lives here.
+ * Never compiled by the firmware (RIG_SRAM_FILL is a rig EXTRA_DEF). */
+void *rig_sram_ptr(u32 *size)
+{
+  if (size != NULL) *size = Pico.sv.size;
+  return Pico.sv.data;
+}
+#endif
+
 static void PicoCartDetectMS(void)
 {
   memset(&Pico.sv, 0, sizeof(Pico.sv));
