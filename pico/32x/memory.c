@@ -830,7 +830,11 @@ static u32 p32x_sh2reg_read16(u32 a, SH2 *sh2)
     case 0x3c/2:
     case 0x3e/2:
       // no poll_detect: PWM writes/timer never fire poll_event, so a CPOLL
-      // here would never wake (D32XR slave freeze) - upstream parity
+      // here would never wake (D32XR slave freeze) - upstream parity.
+      // But keep the cross-sh2 sync: retail Doom's SH-2s poll PWM in a tight
+      // audio loop, and without this sync point neither CPU advances and both
+      // stall for good after a savestate resume (device-verified 2026-08-17).
+      sh2s_sync_on_read(sh2, sh2_cycles_done_m68k(sh2));
       return p32x_pwm_read16(a, sh2, sh2_cycles_done_m68k(sh2));
   }
 
