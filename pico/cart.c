@@ -1354,10 +1354,18 @@ static void PicoCartDetect(const char *carthw_cfg)
     parse_carthw(carthw_cfg, &fill_sram, &carthw_detected);
 
   // assume the standard mapper for large roms
-#ifndef GNW_32X_CORE
+  /* Kept for GNW_32X_CORE too. It was excluded with the rest of the carthw
+   * table, and that made every cartridge over 4 MiB unrunnable on the device --
+   * including the official D32XR release, which is 5 MiB and had therefore
+   * never been booted; only a cut-down 4 MiB bench build ever ran.
+   *
+   * It costs the device nothing extra to bank. The GNW guard further up binds
+   * Pico.rom straight at the flash-mapped image, zero-copy, so the whole cart
+   * is already linearly addressable and this mapper's cpu68k_map_set(...,
+   * Pico.rom + base, ...) is pointer arithmetic inside a window that exists.
+   * On a host it would have been a 5 MiB malloc; here it is an offset. */
   if (!carthw_detected && Pico.romsize > 0x400000)
     carthw_ssf2_startup();
-#endif
 
   if (Pico.sv.flags & SRF_ENABLED)
   {

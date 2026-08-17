@@ -50,14 +50,12 @@ static const char str_mars[] = "MARS";
 void *p32x_bios_g, *p32x_bios_m, *p32x_bios_s;
 struct Pico32xMem *Pico32xMem;
 
-#ifdef GNW_32X_CORE
-// The SSF2 cart mapper lives in pico/carthw/carthw.c, which the 32X core does not
-// compile. The 32X bank-switch code reads carthw_ssf2_active (always 0 here, so it
-// takes the plain-ROM path) and references carthw_ssf2_banks in its dead is-active
-// branches. Provide the storage so these resolve; SSF2 is effectively disabled.
-int carthw_ssf2_active;
-unsigned char carthw_ssf2_banks[8];
-#endif
+/* The stub definitions of carthw_ssf2_active / carthw_ssf2_banks that used to
+ * sit here are gone: pico/carthw/carthw.c is in the 32X source list now, so the
+ * real ones link. Everything below in this file was already bank-aware -- the
+ * SH-2 read paths, the $a130xx write handlers -- and was running against
+ * storage nothing ever set, which is why a cartridge over 4 MiB could not be
+ * banked and the official 5 MiB D32XR release had never booted here. */
 
 /* GNW: cart-ROM opcode-fetch fast path (read by sh2pico.c's GNW_FETCH_SD).
  *
