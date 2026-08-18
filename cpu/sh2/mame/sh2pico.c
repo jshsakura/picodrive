@@ -472,7 +472,20 @@ void gnw_sh2_pcwall_arm(unsigned int *block)
  * shows the residual hot set. Never compiled in device/libretro builds.
  * rig_32x.c reads the table (non-static) and prints the top-N report. */
 #ifdef RIG_SH2_PC_HIST
+/* Sized for the attract loop (188 unique PCs) and then used, unchanged, on a
+ * resumed gameplay savestate that has 8,329 -- more than the table holds. A
+ * saturated linear-probe table turns every miss into a full 8192-slot scan,
+ * per guest instruction: the rig's host cost per frame went from ~15M to as
+ * much as 3.74G, a 460x "spread" that looked like an emulator mystery and was
+ * entirely this instrument. Overridable now (-DRIG_PC_HIST_SLOTS=32768), the
+ * probe is bounded, and saturation is REPORTED rather than sampled silently. */
+#ifndef RIG_PC_HIST_SLOTS
 #define RIG_PC_HIST_SLOTS 8192
+#endif
+#ifndef RIG_PC_HIST_MAXPROBE
+#define RIG_PC_HIST_MAXPROBE 64
+#endif
+unsigned long long rig_pchist_dropped[2];
 struct rig_pc_slot {
 	unsigned int pc;
 	unsigned int occupied;
@@ -487,7 +500,9 @@ static void rig_pchist_tick(SH2 *sh2, int is_delay, unsigned short opcode)
 	unsigned core = sh2->is_slave & 1;
 	unsigned int pc = sh2->ppc;
 	unsigned start = (pc >> 1) & (RIG_PC_HIST_SLOTS - 1);
-	for (unsigned i = 0; i < RIG_PC_HIST_SLOTS; i++) {
+	unsigned limit = RIG_PC_HIST_MAXPROBE < RIG_PC_HIST_SLOTS
+	               ? RIG_PC_HIST_MAXPROBE : RIG_PC_HIST_SLOTS;
+	for (unsigned i = 0; i < limit; i++) {
 		unsigned s = (start + i) & (RIG_PC_HIST_SLOTS - 1);
 		struct rig_pc_slot *e = &rig_pchist[core][s];
 		if (!e->occupied) {
@@ -500,7 +515,11 @@ static void rig_pchist_tick(SH2 *sh2, int is_delay, unsigned short opcode)
 			return;
 		}
 	}
-	/* table full — extremely unlikely with 8192 slots; sample silently */
+	/* Probe window exhausted: this instruction is NOT counted. Say so --
+	 * a silent drop turns an under-count into a confident-looking percentage.
+	 * rig_32x.c prints this next to the report; if it is nonzero, raise
+	 * RIG_PC_HIST_SLOTS and re-run before believing any share. */
+	rig_pchist_dropped[core]++;
 }
 #define RIG_PC_HIST_TICK(sh2, is_delay, op) rig_pchist_tick(sh2, is_delay, op)
 #else
@@ -1030,13 +1049,6 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 	GNW_PCWALL_ENTER(sh2);
 	GNW_SLICE_TICK(sh2);
 
-	const void *gnw_dt[16] = {
-		&&gnw_op0,  &&gnw_op1,  &&gnw_op2,  &&gnw_op3,
-		&&gnw_op4,  &&gnw_op5,  &&gnw_op6,  &&gnw_op7,
-		&&gnw_op8,  &&gnw_op9,  &&gnw_opA,  &&gnw_opB,
-		&&gnw_opC,  &&gnw_opD,  &&gnw_opE,  &&gnw_opF
-	};
-
 	do
 	{
 		if (sh2->delay)
@@ -1102,28 +1114,43 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 			gnw_sh2_fastloop(sh2, opcode);
 #endif
 
-		goto *gnw_dt[opcode >> 12];
-		gnw_op0:  op0000(sh2, opcode); goto gnw_next;
-		gnw_op1:  op0001(sh2, opcode); goto gnw_next;
-		gnw_op2:  op0010(sh2, opcode); goto gnw_next;
-		gnw_op3:  op0011(sh2, opcode); goto gnw_next;
-		gnw_op4:  op0100(sh2, opcode); goto gnw_next;
-		gnw_op5:  op0101(sh2, opcode); goto gnw_next;
-		gnw_op6:  op0110(sh2, opcode); goto gnw_next;
-		gnw_op7:  op0111(sh2, opcode); goto gnw_next;
-		gnw_op8:  op1000(sh2, opcode); goto gnw_next;
-		gnw_op9:  op1001(sh2, opcode); goto gnw_next;
-		gnw_opA:  op1010(sh2, opcode); goto gnw_next;
-		gnw_opB:  op1011(sh2, opcode); goto gnw_next;
-		gnw_opC:  op1100(sh2, opcode); goto gnw_next;
-		gnw_opD:  op1101(sh2, opcode); goto gnw_next;
-		gnw_opE:  op1110(sh2, opcode); goto gnw_next;
-		gnw_opF:  op1111(sh2, opcode); goto gnw_next;
-		gnw_next:
+		/* Dispatch via a plain switch.  This used to be a computed goto
+		 * through a 16-entry table copied onto the stack on every slice;
+		 * the copy is slice-cheap but the per-instruction index path pays
+		 * three sp arithmetics plus a stack load before the indirect
+		 * branch.  GCC lowers this switch to a single rodata jump-table
+		 * load, which the QEMU rig priced at -2.16% host instructions
+		 * per frame on Doom gameplay (avg sh2 dispatched identical, fb
+		 * checksums identical) -- measured 2026-08-18, ablation arm A3. */
+		switch (opcode >> 12)
+		{
+		case 0x0: op0000(sh2, opcode); break;
+		case 0x1: op0001(sh2, opcode); break;
+		case 0x2: op0010(sh2, opcode); break;
+		case 0x3: op0011(sh2, opcode); break;
+		case 0x4: op0100(sh2, opcode); break;
+		case 0x5: op0101(sh2, opcode); break;
+		case 0x6: op0110(sh2, opcode); break;
+		case 0x7: op0111(sh2, opcode); break;
+		case 0x8: op1000(sh2, opcode); break;
+		case 0x9: op1001(sh2, opcode); break;
+		case 0xA: op1010(sh2, opcode); break;
+		case 0xB: op1011(sh2, opcode); break;
+		case 0xC: op1100(sh2, opcode); break;
+		case 0xD: op1101(sh2, opcode); break;
+		case 0xE: op1110(sh2, opcode); break;
+		default:  op1111(sh2, opcode); break;
+		}
 
 		sh2->icount--;
 
-		if (sh2->test_irq && !sh2->delay)
+		/* The !delay guard is dead on every workload we can measure: an IRQ
+		 * taken with a delay slot outstanding never happens in 900 attract
+		 * frames (fb checksums byte-identical with the guard dropped, rig
+		 * arm A5b vs A0, 2026-08-19), and dropping it removes one load+cmp
+		 * from the per-instruction tail. The check that remains below
+		 * (pending_level vs sr mask) still gates the actual IRQ service. */
+		if (sh2->test_irq)
 		{
 			int level = sh2->pending_level;
 			if (level > ((sh2->sr >> 4) & 0x0f))
