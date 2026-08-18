@@ -1322,7 +1322,30 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		 * arm A5b vs A0, 2026-08-19), and dropping it removes one load+cmp
 		 * from the per-instruction tail. The check that remains below
 		 * (pending_level vs sr mask) still gates the actual IRQ service. */
-		if (sh2->test_irq)
+		/* RESTORED 2026-08-19. The `&& !sh2->delay` guard was dropped on the
+		 * strength of "never happens in 900 attract frames". It is
+		 * load-bearing, and the mechanism is exact rather than statistical.
+		 *
+		 * sh2_do_irq pushes sh2->pc and overwrites it with the vector. It
+		 * neither reads nor clears sh2->delay. So when a delayed branch has
+		 * just executed -- delay = slot address, pc = branch target -- and the
+		 * IRQ is serviced here, the next iteration still sees delay set,
+		 * executes the delay-slot instruction, and then does its `pc -= 2`.
+		 * That `-= 2` is written for a pc holding the branch target; it now
+		 * holds the interrupt handler's entry, so the handler starts two bytes
+		 * short.
+		 *
+		 * Rare, silent and state-corrupting, in exchange for one load and one
+		 * compare per instruction. Attract frames failing to reproduce it is
+		 * not evidence of safety: attract and gameplay are demonstrably
+		 * different programs here -- 188 unique guest PCs against 8,586 -- and
+		 * gameplay carries far more interrupts and far more branches.
+		 *
+		 * The loop's own exit condition states the invariant this restores:
+		 * while (icount > 0 || sh2->delay) -- "can't interrupt before delay".
+		 * The other interpreter in this file (sh2_execute_interpreter_trace)
+		 * never lost it; the two forms disagreed until now. */
+		if (sh2->test_irq && !sh2->delay)
 		{
 			int level = sh2->pending_level;
 			if (level > ((sh2->sr >> 4) & 0x0f))
