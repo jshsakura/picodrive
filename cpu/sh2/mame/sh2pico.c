@@ -526,6 +526,89 @@ static void rig_pchist_tick(SH2 *sh2, int is_delay, unsigned short opcode)
 #define RIG_PC_HIST_TICK(sh2, is_delay, op) ((void)0)
 #endif
 
+/* RIG_ABLATE_LOOPS: price the texture inner loops by REMOVING their work, not
+ * by reading their share off a profile -- this repo has been wrong twice about
+ * a lever whose profile share looked large and whose ablation delta did not
+ * (memory stalls do not appear in an instruction count, and an instruction
+ * count is all a guest-PC histogram is).
+ *
+ * Doom's two hot loops are counted down by DT on a register: 0x02049084 with
+ * R12, 0x02049284 with R6, together ~37% of all guest SH-2 instructions in the
+ * resumed gameplay window. Clamping the counter to 1 at loop entry collapses
+ * each to a single iteration: the loop still runs, still exits through its own
+ * BFS, and every register it touches is left in a shape its caller accepts --
+ * so control flow downstream is unchanged and only the pixels are missing.
+ * The screen is wrong on purpose. The number is the ceiling on any HLE of it.
+ *
+ *   EXTRA_DEF="-DRIG_ABLATE_LOOPS"                 both loops
+ *   EXTRA_DEF="-DRIG_ABLATE_LOOPS -DRIG_ABL_PC2=0" loop 1 only
+ * Addresses are this build of retail Doom; override with -DRIG_ABL_PC1/PC2. */
+#ifdef RIG_ABLATE_LOOPS
+#ifndef RIG_ABL_PC1
+#define RIG_ABL_PC1 0x02049084
+#endif
+#ifndef RIG_ABL_REG1
+#define RIG_ABL_REG1 12
+#endif
+#ifndef RIG_ABL_PC2
+#define RIG_ABL_PC2 0x02049284
+#endif
+#ifndef RIG_ABL_REG2
+#define RIG_ABL_REG2 6
+#endif
+unsigned long long rig_abl_hits[2], rig_abl_iters_skipped[2];
+static void rig_ablate_tick(SH2 *sh2)
+{
+	unsigned int pc = sh2->ppc;
+	if (RIG_ABL_PC1 && pc == (unsigned)RIG_ABL_PC1 && sh2->r[RIG_ABL_REG1] > 1) {
+		rig_abl_hits[0]++;
+		rig_abl_iters_skipped[0] += sh2->r[RIG_ABL_REG1] - 1;
+		sh2->r[RIG_ABL_REG1] = 1;
+	} else if (RIG_ABL_PC2 && pc == (unsigned)RIG_ABL_PC2 && sh2->r[RIG_ABL_REG2] > 1) {
+		rig_abl_hits[1]++;
+		rig_abl_iters_skipped[1] += sh2->r[RIG_ABL_REG2] - 1;
+		sh2->r[RIG_ABL_REG2] = 1;
+	}
+}
+#define RIG_ABLATE_TICK(sh2) rig_ablate_tick(sh2)
+#else
+#define RIG_ABLATE_TICK(sh2) ((void)0)
+#endif
+
+/* RIG_LOOP_REGS: dump the register file at the texture loops' entry, first N
+ * visits. The question it answers is narrow and decisive: WHICH REGION do the
+ * loop's loads and stores address? p32x_sh2_read8/16/32 have a fast path for
+ * SDRAM (0x06/0x26) and nothing else, so a loop reading its texels out of cart
+ * ROM (0x02/0x22) pays the full map lookup on every pixel -- the same shape as
+ * the opcode-fetch path, which measured "sdram 0.0% / cart-ROM 100%" and got
+ * gnw_sh2_rom_fetch_mask for exactly that reason. If the data side has the
+ * same miss, it is the same one-line-class fix on 68% of the frame. */
+#ifdef RIG_LOOP_REGS
+#ifndef RIG_LOOP_REGS_N
+#define RIG_LOOP_REGS_N 6
+#endif
+extern int printf(const char *, ...);
+static int rig_lr_n[2];
+static void rig_loop_regs_tick(SH2 *sh2)
+{
+	unsigned int pc = sh2->ppc;
+	int which = pc == 0x02049084u ? 0 : pc == 0x02049284u ? 1 : -1;
+	if (which < 0 || rig_lr_n[which] >= RIG_LOOP_REGS_N)
+		return;
+	rig_lr_n[which]++;
+	printf("[lr] loop%d pc=%08x r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x "
+	       "r5=%08x r6=%08x r7=%08x r8=%08x r9=%08x r10=%08x r12=%08x\n",
+	       which + 1, pc,
+	       (unsigned)sh2->r[0], (unsigned)sh2->r[1], (unsigned)sh2->r[2],
+	       (unsigned)sh2->r[3], (unsigned)sh2->r[4], (unsigned)sh2->r[5],
+	       (unsigned)sh2->r[6], (unsigned)sh2->r[7], (unsigned)sh2->r[8],
+	       (unsigned)sh2->r[9], (unsigned)sh2->r[10], (unsigned)sh2->r[12]);
+}
+#define RIG_LOOP_REGS_TICK(sh2) rig_loop_regs_tick(sh2)
+#else
+#define RIG_LOOP_REGS_TICK(sh2) ((void)0)
+#endif
+
 /* RIG_POLL_PEEK: diagnostic for the QEMU M7 rig. On the first visit to each
  * backward-branch site (BF/BFS/BT/BTS with negative disp8), snapshot the full
  * register file + gbr so the rig can resolve each spin loop's poll address
@@ -1094,6 +1177,8 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		GNW_SH2_INSN_TICK(sh2);
 		GNW_PCWALL_TICK(sh2);
 		RIG_PC_HIST_TICK(sh2, rig_is_delay, (unsigned short)opcode);
+		RIG_ABLATE_TICK(sh2);
+		RIG_LOOP_REGS_TICK(sh2);
 		RIG_POLL_PEEK_HOOK(sh2, opcode);
 
 #ifdef GNW_SH2_FASTLOOPS

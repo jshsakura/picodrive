@@ -2168,6 +2168,20 @@ GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
   u32 h = a & 0xff000000;
   if (h == 0x06000000 || h == 0x26000000)
     return ((u8 *)sh2->p_sdram)[MEM_BE2(a & 0x3ffff)];
+  /* Cart-ROM fast path, the DATA-side mirror of GNW_FETCH_SD's (sh2pico.c).
+   * The fetch side got one when the device pcwall probe put Doom's msh2 at
+   * "sdram 0.0% / cart-ROM 100%"; the data side never did, and the rig's
+   * register dump at Doom's two texture inner loops shows every load coming
+   * from 0x02xxxxxx -- texels at r3=0x021ddec1, the colormap at r0=0x0220fab8
+   * -- so every pixel was paying the full map lookup twice. Same mask the
+   * fetch path uses: the CS1 map entry's own, or 0 when that entry is a
+   * handler (SSF2 banking), so this resolves to the byte the map would and
+   * disables itself when the map is not plain memory. Signedness mirrors the
+   * map branch below deliberately, not the SDRAM branch above. */
+#ifndef GNW_NO_ROM_DATA_FASTPATH
+  if ((a & 0xdf000000) == 0x02000000 && gnw_sh2_rom_fetch_mask)
+    return *(s8 *)((u8 *)sh2->p_rom + MEM_BE2(a & gnw_sh2_rom_fetch_mask));
+#endif
 
   const sh2_memmap *sh2_map = sh2->read8_map;
   uptr p;
@@ -2189,6 +2203,11 @@ GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
   u32 h = a & 0xff000000;
   if (h == 0x06000000 || h == 0x26000000)
     return *(u16 *)((u8 *)sh2->p_sdram + (a & 0x3fffe));
+  /* Cart-ROM fast path -- see read8. */
+#ifndef GNW_NO_ROM_DATA_FASTPATH
+  if ((a & 0xdf000000) == 0x02000000 && gnw_sh2_rom_fetch_mask)
+    return *(s16 *)((u8 *)sh2->p_rom + (a & gnw_sh2_rom_fetch_mask));
+#endif
 
   const sh2_memmap *sh2_map = sh2->read16_map;
   uptr p;
@@ -2212,6 +2231,13 @@ GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
     u32 *pd = (u32 *)((u8 *)sh2->p_sdram + (a & 0x3fffc));
     return CPU_BE2(*pd);
   }
+  /* Cart-ROM fast path -- see read8. */
+#ifndef GNW_NO_ROM_DATA_FASTPATH
+  if ((a & 0xdf000000) == 0x02000000 && gnw_sh2_rom_fetch_mask) {
+    u32 *pd = (u32 *)((u8 *)sh2->p_rom + (a & gnw_sh2_rom_fetch_mask));
+    return CPU_BE2(*pd);
+  }
+#endif
 
   const sh2_memmap *sh2_map = sh2->read32_map;
   uptr p;
