@@ -1161,14 +1161,22 @@ static void PicoWrite8_32x_on_io_cd(u32 a, u32 d)
   if (a == 0xa130f1)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
+#endif
 
+/* not behind GNW_32X_CORE: D32XR (5 MiB) boots into 32X mode and has its
+ * SH-2 read ROM through 512K windows, asking the 68K over comm
+ * (comm0 = 0x1600 | bank << 3 | slot) to program $a130f1 + 2*slot.  The
+ * plain io handler below drops every bank register but f1, which froze
+ * carthw_ssf2_banks at identity and landed every windowed lump pointer
+ * one 512K window too low (TEXTURE1 -> "aa" garbage -> Z_Malloc 797752,
+ * device + rig, observed 2026-08-18).  carthw_ssf2_write8/16 live in
+ * carthw.c unconditionally, so this compiles in GNW builds too. */
 static void PicoWrite8_32x_on_io_ssf2(u32 a, u32 d)
 {
   carthw_ssf2_write8(a, d);
   if ((a & ~0x0e) == 0xa130f1)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
-#endif
 
 static void PicoWrite16_32x_on(u32 a, u32 d)
 {
@@ -1217,14 +1225,15 @@ static void PicoWrite16_32x_on_io_cd(u32 a, u32 d)
   if (a == 0xa130f0)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
+#endif
 
+/* same reasoning as PicoWrite8_32x_on_io_ssf2 above */
 static void PicoWrite16_32x_on_io_ssf2(u32 a, u32 d)
 {
   carthw_ssf2_write16(a, d);
   if (a == 0x130f0)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
-#endif // !GNW_32X_CORE
 
 // before ADEN
 u32 PicoRead8_32x(u32 a)
@@ -2554,13 +2563,14 @@ void PicoMemSetup32x(void)
     m68k_write8_io  = PicoWrite8_32x_on_io_cd;
     m68k_write16_io = PicoWrite16_32x_on_io_cd;
   }
-  else if (carthw_ssf2_active) {
+  else
+#endif
+  if (carthw_ssf2_active) {
+    /* must be reachable in GNW builds too, see PicoWrite8_32x_on_io_ssf2 */
     m68k_write8_io  = PicoWrite8_32x_on_io_ssf2;
     m68k_write16_io = PicoWrite16_32x_on_io_ssf2;
   }
-  else
-#endif
-  {
+  else {
     m68k_write8_io  = PicoWrite8_32x_on_io;
     m68k_write16_io = PicoWrite16_32x_on_io;
   }
