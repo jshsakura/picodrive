@@ -1193,7 +1193,27 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		 * compare against 0xf980 covers all four with no false
 		 * positives -- four compare-and-branches per DISPATCHED
 		 * INSTRUCTION saved, on a path that runs ~173 k times a frame. */
+		/* One more gate in front of the pre-filter, and a cheaper one.
+		 * Both candidate families live in 0x8xxx (BT/BF/BT.S/BF.S) and
+		 * 0xaxxx (BRA), and (op & 0xd000) == 0x8000 accepts exactly
+		 * those two nibbles and nothing else -- 0x9/0xb/0xc-0xf and
+		 * 0x0-0x7 all fail it. That is an AND with an encodable Thumb-2
+		 * immediate, a compare and a branch: three instructions, against
+		 * the eight gcc emits for the pair of masked compares below
+		 * (it rebuilds both movw constants every iteration rather than
+		 * hoisting them, register pressure being what it is in this
+		 * loop). Instructions outside those two nibbles -- the large
+		 * majority -- now pay three instead of eight.
+		 *
+		 * Strictly a superset test: everything the old condition
+		 * accepted still reaches it, so behaviour is identical and the
+		 * framebuffer and audio hashes must not move. */
+#ifdef GNW_NO_FASTLOOP_NIBBLE_GATE
 		if ((((opcode & 0xf980) == 0x8980) || opcode == 0xaffe)
+#else
+		if ((opcode & 0xd000) == 0x8000
+		    && (((opcode & 0xf980) == 0x8980) || opcode == 0xaffe)
+#endif
 		    && gnw_direct && *GNW_DL_REJ_SLOT(sh2) != sh2->ppc
 		    && !sh2->test_irq && gnw_sh2_fastloops)
 			gnw_sh2_fastloop(sh2, opcode);
