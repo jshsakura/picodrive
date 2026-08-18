@@ -623,7 +623,32 @@ static int state_load(void *file)
       case CHUNK_SSH2_DATA:   CHECKED_READ_BUFF(sh2s[1].data_array); break;
       case CHUNK_SSH2_PERI:   CHECKED_READ_BUFF(sh2s[1].peri_regs); break;
       case CHUNK_32XSYS:      CHECKED_READ_BUFF(Pico32x); break;
-      case CHUNK_M68K_BIOS:   CHECKED_READ_BUFF(Pico32xMem->m68k_rom); break;
+      case CHUNK_M68K_BIOS:
+#ifdef GNW_32X_CORE
+        /* GNW: m68k_rom is a POINTER here, not an array -- the 64K composed
+         * bank image lives outside the struct, in AHB SRAM (see pico_int.h).
+         * So CHECKED_WRITE_BUFF put four bytes of ADDRESS in the file, and
+         * reading them back installs the SAVING machine's pointer on the
+         * LOADING one. On the console that is invisible: ahb_malloc is
+         * deterministic, so the address comes back identical -- which is
+         * precisely what makes it dangerous, because it stays invisible right
+         * up until the allocation moves. It is not invisible anywhere else:
+         * the QEMU rig loaded a device savestate, took the device's address
+         * into a completely different address space, and went silent on the
+         * very next frame.
+         * Consume the chunk and keep our own pointer. Nothing is lost -- the
+         * buffer's CONTENTS were never in the file, only its address was. The
+         * save side is left alone so the file format, and every savestate
+         * already on a user's card, stays byte-identical. */
+        {
+          unsigned char *m68k_rom_live = Pico32xMem->m68k_rom;
+          CHECKED_READ_BUFF(Pico32xMem->m68k_rom);
+          Pico32xMem->m68k_rom = m68k_rom_live;
+        }
+#else
+        CHECKED_READ_BUFF(Pico32xMem->m68k_rom);
+#endif
+        break;
       case CHUNK_MSH2_BIOS:   CHECKED_READ_BUFF(Pico32xMem->sh2_rom_m); break;
       case CHUNK_SSH2_BIOS:   CHECKED_READ_BUFF(Pico32xMem->sh2_rom_s); break;
       case CHUNK_SDRAM:       CHECKED_READ_BUFF(Pico32xMem->sdram); break;
