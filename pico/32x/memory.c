@@ -68,6 +68,65 @@ struct Pico32xMem *Pico32xMem;
  * ~173 k fetches per frame paid the cross-TU p32x_sh2_read16 call that the
  * SDRAM fast path was added to avoid. */
 unsigned int gnw_sh2_rom_fetch_mask;
+
+/* GNW_BUS_CENSUS: guest DATA accesses by region, plus a hot-page histogram of
+ * the cart-ROM reads.
+ *
+ * The device probe (gnw_probe_rd) measures what ONE guest read costs. This
+ * measures how many there are and, more to the point, WHERE they land. Those
+ * two numbers multiply, and neither machine can produce both: the rig has no
+ * flash and no caches, and the device cannot be asked to count without
+ * perturbing what it is counting.
+ *
+ * The page histogram is the SNES page-cache question in 32X form. Doom reads
+ * its texels and its colormap out of XIP flash once per pixel. If those reads
+ * cluster into a handful of pages, a small RAM cache catches nearly all of
+ * them; if they are spread over megabytes of texture, nothing small will.
+ * A 256-entry 16-bit colormap is 512 bytes -- one page here. */
+#ifdef GNW_BUS_CENSUS
+#define GNW_CENSUS_PAGE_SHIFT 9          /* 512-byte pages */
+#define GNW_CENSUS_PAGES 512             /* distinct pages tracked */
+unsigned long long gnw_census[6][5];     /* [r8,r16,r32,w8,w16,w32][region] */
+unsigned int gnw_census_page[GNW_CENSUS_PAGES];
+unsigned long long gnw_census_pagehit[GNW_CENSUS_PAGES];
+unsigned long long gnw_census_page_missed;   /* reads past a full table */
+int gnw_census_npages;
+
+static int gnw_census_region(u32 a)
+{
+  switch (a & 0xdf000000) {
+  case 0x06000000: return 0;   /* SDRAM */
+  case 0x02000000: return 1;   /* cart ROM (CS1) */
+  case 0x04000000: return 2;   /* 32X DRAM / frame buffer */
+  case 0x00000000: return 3;   /* CS0: BIOS, regs */
+  default:         return 4;
+  }
+}
+
+void gnw_census_tick(u32 a, int op)
+{
+  int rgn = gnw_census_region(a);
+  gnw_census[op][rgn]++;
+  if (rgn != 1 || op > 2)
+    return;                    /* page histogram: cart-ROM READS only */
+  {
+    unsigned int pg = a >> GNW_CENSUS_PAGE_SHIFT;
+    int i;
+    for (i = 0; i < gnw_census_npages; i++)
+      if (gnw_census_page[i] == pg) { gnw_census_pagehit[i]++; return; }
+    if (gnw_census_npages < GNW_CENSUS_PAGES) {
+      gnw_census_page[gnw_census_npages] = pg;
+      gnw_census_pagehit[gnw_census_npages] = 1;
+      gnw_census_npages++;
+      return;
+    }
+    gnw_census_page_missed++;
+  }
+}
+#define GNW_CENSUS(a, op) gnw_census_tick((a), (op))
+#else
+#define GNW_CENSUS(a, op) ((void)0)
+#endif
 static unsigned int gnw_rom_map_mask;   /* rs-1 from PicoMemSetup32x */
 
 static void bank_switch_rom_68k(int b);
@@ -2161,6 +2220,7 @@ typedef void REGPARM(3) (sh2_write_handler)(u32 a, u32 d, SH2 *sh2);
 
 GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
 {
+  GNW_CENSUS(a, 0);
   /* SDRAM fastpath: 256KB at 0x06000000 (mirror 0x26000000 cache-through).
    * The map lookup costs ~11 cycles on device (call + index + deref);
    * direct p_sdram access costs ~2 cycles.  Write path already uses
@@ -2199,6 +2259,7 @@ GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
 
 GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
 {
+  GNW_CENSUS(a, 1);
   /* SDRAM fastpath — see read8 comment above. */
   u32 h = a & 0xff000000;
   if (h == 0x06000000 || h == 0x26000000)
@@ -2225,6 +2286,7 @@ GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2)
 
 GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
 {
+  GNW_CENSUS(a, 2);
   /* SDRAM fastpath — see read8 comment above. */
   u32 h = a & 0xff000000;
   if (h == 0x06000000 || h == 0x26000000) {
@@ -2256,6 +2318,7 @@ GNW_SH2BUS u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
 
 GNW_SH2BUS void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
 {
+  GNW_CENSUS(a, 3);
   const void **sh2_wmap = sh2->write8_tab;
   sh2_write_handler *wh;
 
@@ -2265,6 +2328,7 @@ GNW_SH2BUS void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2)
 
 GNW_SH2BUS void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
 {
+  GNW_CENSUS(a, 4);
   const void **sh2_wmap = sh2->write16_tab;
   sh2_write_handler *wh;
 
@@ -2274,6 +2338,7 @@ GNW_SH2BUS void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2)
 
 GNW_SH2BUS void REGPARM(3) p32x_sh2_write32(u32 a, u32 d, SH2 *sh2)
 {
+  GNW_CENSUS(a, 5);
   const void **sh2_wmap = sh2->write32_tab;
   sh2_write_handler *wh;
 
