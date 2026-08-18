@@ -109,6 +109,16 @@ static void convert_pal555(int invert_prio)
 // are handled per-pixel with the pre-converted color (no pal[] lookup per
 // pixel).  The entire run is always consumed, so detection never re-fires
 // O(n^2) on the same identical pixels.
+/* Ablation switch for the solid-run detector below. On a textured 3D scene the
+ * four-pixel probe mostly fails, and a failed probe is pure tax on the
+ * per-pixel path that follows. Whether the runs it does catch pay for that is a
+ * measurement, not an opinion: build with -DGNW_PP_NO_RUNDET to price it. */
+#ifdef GNW_PP_NO_RUNDET
+#define GNW_PP_RUNDET 0
+#else
+#define GNW_PP_RUNDET 1
+#endif
+
 #define do_line_pp(pd, p32x, pmd, pmd_draw_code)                  \
 {                                                                 \
   unsigned short t, t0, t1, v;                                    \
@@ -116,7 +126,7 @@ static void convert_pal555(int invert_prio)
   _Static_assert(320 % 2 == 0, "line must be an even pixel count"); \
   while (i > 0) {                                                 \
     /* --- solid-run detection (draw_arm.S labels 5-9) --- */     \
-    if (i >= 4) {                                                 \
+    if (GNW_PP_RUNDET && i >= 4) {                                \
       unsigned char b0 = *(unsigned char *)(MEM_BE2((uintptr_t)(p32x))); \
       if (b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1))) && \
           b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+2))) && \
