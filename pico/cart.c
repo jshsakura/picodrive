@@ -1442,6 +1442,20 @@ void *rig_sram_ptr(u32 *size)
 }
 #endif
 
+#ifdef RIG_DEATH_STACK
+/* Rig-only probe helper (tools/m7_qemu_rig): the D32XR 68K boot block copies
+ * its game code from ROM ($ff0000 blob = file 0x5a30+) into 68K RAM at boot,
+ * so the running code can differ from the ROM bytes (relocation/self-mod).
+ * comm-write pcs observed with RIG_LM_TRACE did not match the ROM disasm at
+ * those addresses — this getter hands the rig the live 64K so the death dump
+ * can disassemble what actually executed. Never compiled by the firmware. */
+void *rig_pico_ram(int *len)
+{
+  if (len != NULL) *len = sizeof(PicoMem.ram);
+  return PicoMem.ram;
+}
+#endif
+
 static void PicoCartDetectMS(void)
 {
   memset(&Pico.sv, 0, sizeof(Pico.sv));

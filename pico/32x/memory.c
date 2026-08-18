@@ -606,6 +606,15 @@ static void p32x_reg_write16(u32 a, u32 d)
   u16 *r = Pico32x.regs;
   a &= 0x3e;
 
+#ifdef RIG_LM_TRACE
+  // [lm] 68K-side comm/adapter writes: who sends what over comm0/2 (bank cmd protocol)
+  if ((a & 0x3e) >= 0x20 && (a & 0x3e) <= 0x2e || (a & 0x3e) <= 0x06) {
+    extern int rig_frame_no;
+    extern void lprintf(const char *fmt, ...);
+    lprintf("[lm] f=%d m68k-wr16 a=%02x d=%04x pc=%06x\n", rig_frame_no, a, d & 0xffff, SekPc);
+  }
+#endif
+
   // for things like bset on comm port
   m68k_poll.cnt = 0;
 
@@ -959,6 +968,15 @@ static void p32x_sh2reg_write16(u32 a, u32 d, SH2 *sh2)
 {
   a &= 0x3e;
 
+#ifdef RIG_LM_TRACE
+  // [lm] SH-2-side comm writes (bank cmd 0x1600|bank<<3|slot originates here)
+  if ((a & 0x3e) >= 0x20 && (a & 0x3e) <= 0x2e) {
+    extern int rig_frame_no;
+    extern void lprintf(const char *fmt, ...);
+    lprintf("[lm] f=%d sh%d-wr16 a=%02x d=%04x ppc=%08x\n", rig_frame_no, sh2->is_slave, a, d & 0xffff, sh2->ppc);
+  }
+#endif
+
   sh2->poll_cnt = 0;
 
   switch (a/2) {
@@ -1149,6 +1167,20 @@ static void PicoWrite8_32x_on(u32 a, u32 d)
 
 static void PicoWrite8_32x_on_io(u32 a, u32 d)
 {
+#ifdef RIG_WALK_TRACE
+  /* Probe: does the game program the SSF2 bank regs ($a130f3..ff) in 32X mode?
+   * GNW builds route $a130xx writes here (plain io handler) where every bank
+   * register but f1 is dropped -- the log line proves the write reached us
+   * while the bank array stays frozen at identity. */
+  if ((a & ~0x0e) == 0xa130f1) {
+    extern int rig_frame_no;
+    extern void lprintf(const char *, ...);
+    lprintf("[bnkw] f=%d a=%08x d=%02x banks=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+      rig_frame_no, a, d & 0xff, carthw_ssf2_banks[0], carthw_ssf2_banks[1],
+      carthw_ssf2_banks[2], carthw_ssf2_banks[3], carthw_ssf2_banks[4],
+      carthw_ssf2_banks[5], carthw_ssf2_banks[6], carthw_ssf2_banks[7]);
+  }
+#endif
   PicoWrite8_io(a, d);
   if (a == 0xa130f1)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
@@ -1213,6 +1245,18 @@ static void PicoWrite16_32x_on(u32 a, u32 d)
 
 static void PicoWrite16_32x_on_io(u32 a, u32 d)
 {
+#ifdef RIG_WALK_TRACE
+  /* w16 companion of [bnkw]: SSF2 bank regs can also be hit by move.w --
+   * a word store to $a130f2..fe carries the bank byte in one lane. */
+  if ((a & ~0x0f) == 0xa130f0) {
+    extern int rig_frame_no;
+    extern void lprintf(const char *, ...);
+    lprintf("[bnkw16] f=%d a=%08x d=%04x banks=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+      rig_frame_no, a, d & 0xffff, carthw_ssf2_banks[0], carthw_ssf2_banks[1],
+      carthw_ssf2_banks[2], carthw_ssf2_banks[3], carthw_ssf2_banks[4],
+      carthw_ssf2_banks[5], carthw_ssf2_banks[6], carthw_ssf2_banks[7]);
+  }
+#endif
   PicoWrite16_io(a, d);
   if (a == 0xa130f0)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
@@ -1621,6 +1665,26 @@ static u32 REGPARM(2) sh2_read8_rom(u32 a, SH2 *sh2)
 {
   u32 bank = carthw_ssf2_banks[(a >> 19) & 7] << 19;
   s8 *p = sh2->p_rom;
+#ifdef RIG_WALK_TRACE
+  {
+    // [rd8]: LZ lump decoder (guest 0x02018bb0-0x02018c30, magic window from
+    // capstone disasm of H=0x02018b68) reads its input through this handler.
+    // ppc = the mov.b itself (interpreter sets ppc=pc before executing), so a
+    // plain range check catches decoder reads. First reads reveal the source
+    // stream the cache pointer produced (runtime decoded "aa" where the ROM
+    // decodes numtextures=74). Probe, not for commit.
+    static int rd8_hits;
+    u32 pc = sh2->ppc;
+    if (rd8_hits < 64 && pc >= 0x02018bb0 && pc <= 0x02018c30) {
+      extern int rig_frame_no;
+      extern void lprintf(const char *, ...);
+      lprintf("[rd8] f=%d a=%08x d=%02x ppc=%08x r2=%08x r6=%08x\n",
+        rig_frame_no, a, (unsigned char)p[MEM_BE2(bank + (a & 0x7ffff))],
+        pc, sh2->r[2], sh2->r[6]);
+      rd8_hits++;
+    }
+  }
+#endif
   return p[MEM_BE2(bank + (a & 0x7ffff))];
 }
 
@@ -1676,6 +1740,21 @@ static u32 REGPARM(2) sh2_read16_rom(u32 a, SH2 *sh2)
 {
   u32 bank = carthw_ssf2_banks[(a >> 19) & 7] << 19;
   s16 *p = sh2->p_rom;
+#ifdef RIG_WALK_TRACE
+  /* probe: catch the W_CheckNumForName walk sweeping the banked window --
+   * the returned T_START index (0x6161) is impossible for the death-time
+   * table/count, so the reads themselves must show where it really walked.
+   * Second variant: log only reads whose value equals a half of the
+   * normalized name "T_START\0" -- that is exactly the walk's match read. */
+  if (a >= 0x0208d000 && a < 0x02090000) {
+    extern int rig_frame_no;
+    extern void lprintf(const char *, ...);
+    static int n;
+    if (n < 300)
+      lprintf("[wk] f=%d r16 a=%08x pc=%08x\n", rig_frame_no, a, sh2->ppc);
+    n++;
+  }
+#endif
   return p[(bank + (a & 0x7fffe)) / 2];
 }
 
@@ -1697,6 +1776,45 @@ static u32 REGPARM(2) sh2_read32_rom(u32 a, SH2 *sh2)
   u32 bank = carthw_ssf2_banks[(a >> 19) & 7] << 19;
   u32 *p = sh2->p_rom;
   u32 d = p[(bank + (a & 0x7fffc)) / 4];
+#ifdef RIG_WALK_TRACE
+  /* probe: see sh2_read16_rom -- the walk's name compares are mov.l.
+   * Log the match reads: value == either half of normalized "T_START\0". */
+  {
+    extern int rig_frame_no;
+    extern void lprintf(const char *, ...);
+    u32 g = CPU_BE2(d);
+    /* probe: the walk body's two compare loads are uniquely identifiable by
+     * ppc -- dump the live registers so the loop bounds, table and compare
+     * targets are observed, not inferred (0x6161 return is impossible for
+     * the post-mortem table/count, so the walk state must differ) */
+    if ((sh2->ppc == 0x02016842 || sh2->ppc == 0x02016848)
+        && sh2->r[3] == 0x545f5354) {
+      static int n;
+      if (n < 3000)
+        lprintf("[wkr] f=%d pc=%08x a=%08x d=%08x r0=%08x r3=%08x r4=%08x r6=%08x r10=%08x\n",
+                rig_frame_no, sh2->ppc, a, g, sh2->r[0], sh2->r[3],
+                sh2->r[4], sh2->r[6], sh2->r[10]);
+      n++;
+    }
+    /* probe: 0x0201a50c is the delayed `mov.l @r13+,r4` that feeds the
+     * byteswap whose return becomes the fatal allocation count -- the read
+     * address+value here show where "numtextures" really came from */
+    if (sh2->ppc == 0x0201a50c) {
+      static int m;
+      if (m < 32)
+        lprintf("[tpl] f=%d a=%08x d=%08x r13=%08x\n",
+                rig_frame_no, a, g, sh2->r[13]);
+      m++;
+    }
+    if (g == 0x41525400 || g == 0x545f5354) {
+      static int n;
+      if (n < 200)
+        lprintf("[wkm] f=%d a=%08x d=%08x pc=%08x\n", rig_frame_no, a, g,
+                sh2->ppc);
+      n++;
+    }
+  }
+#endif
   return CPU_BE2(d);
 }
 
@@ -1875,6 +1993,23 @@ static void REGPARM(3) sh2_write16_sdram(u32 a, u32 d, SH2 *sh2)
 {
   u32 a1 = a & 0x3fffe;
   ((u16 *)sh2->p_sdram)[a1 / 2] = d;
+#ifdef RIG_WALK_TRACE
+  /* speculative lane probe: the 0x06008222 count slot is where the fatal
+   * T_START lookup result lands (0x6161 observed at death) - log every
+   * writer to tell "walk returned 0x6161" from "someone overwrote 242" */
+  {
+    extern int rig_frame_no;
+    extern void lprintf(const char *fmt, ...);
+    static int s_wsw_hits;
+    if ((a & 0x3ffff) == 0x8222 && s_wsw_hits < 64) {
+      u32 *p32 = (u32 *)sh2->p_sdram;
+      s_wsw_hits++;
+      lprintf("[wsw] f=%d d=%04x ppc=%08x cnt=%08x tbl=%08x tex=%08x\n",
+        rig_frame_no, d & 0xffff, sh2->ppc,
+        p32[0x3ad9c / 4], p32[0x8164 / 4], p32[0x3ad90 / 4]);
+    }
+  }
+#endif
 #ifdef DRC_SH2
   u8 *p = sh2->p_drcblk_ram;
   u32 t = p[a1 >> SH2_DRCBLK_RAM_SHIFT];
