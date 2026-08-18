@@ -90,6 +90,11 @@ extern unsigned int gnw_sh2_rom_fetch_mask;
  *
  * Both region tests fold the cache-through mirror with one AND: 0x26->0x06 and
  * 0x22->0x02 under 0xdf000000, and no other CS aliases onto them. */
+struct gnw_fetch_win { unsigned int region, mask; unsigned char *base; };
+extern struct gnw_fetch_win gnw_fw_rom;
+
+/* GNW_FETCH_OLD_WINDOW restores the pre-window form for A/B. */
+#ifdef GNW_FETCH_OLD_WINDOW
 #define GNW_FETCH_SD(sh2, addr)                                              \
   ((((addr) & 0xdf000000) == 0x06000000)                                     \
      ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_sdram + ((addr) & 0x3fffe))     \
@@ -97,6 +102,18 @@ extern unsigned int gnw_sh2_rom_fetch_mask;
      ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_rom                             \
                            + ((addr) & gnw_sh2_rom_fetch_mask))              \
      : (UINT32)(UINT16)RW(sh2, addr))
+#else
+/* __builtin_expect because gcc otherwise lays SDRAM out as the fall-through
+ * and branches the ROM arm away, which costs a taken branch plus a branch back
+ * on the path that runs ~165 k times a frame -- eating most of what the window
+ * saves. The device pcwall probe measured Doom's msh2 at cart-ROM 100%. */
+#define GNW_FETCH_SD(sh2, addr)                                              \
+  (__builtin_expect(((addr) & 0xdf000000) == gnw_fw_rom.region, 1)           \
+     ? (UINT32)*(UINT16 *)(gnw_fw_rom.base + ((addr) & gnw_fw_rom.mask))     \
+   : (((addr) & 0xdf000000) == 0x06000000)                                   \
+     ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_sdram + ((addr) & 0x3fffe))     \
+     : (UINT32)(UINT16)RW(sh2, addr))
+#endif
 
 #ifdef MD32X_DEVICE_PROFILE
 /* Guest DATA-access cost probe -- companion to the opcode-fetch probe below.

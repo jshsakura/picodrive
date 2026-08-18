@@ -69,6 +69,20 @@ struct Pico32xMem *Pico32xMem;
  * SDRAM fast path was added to avoid. */
 unsigned int gnw_sh2_rom_fetch_mask;
 
+/* Cart-ROM fetch window: region tag, mask and base in one object, so the
+ * opcode fetch resolves with one compare against a tag instead of a region
+ * compare AND a separate load-and-test of the mask global. When SSF2 banking
+ * is active the tag is set to a value no address can produce, which retires
+ * the "is the mask zero" test entirely -- the same information, carried by the
+ * comparison that had to happen anyway.
+ *
+ * A global, deliberately, not a field on SH2: CHUNK_MSH2 dumps the CPU struct
+ * into a savestate, and growing it would silently invalidate every save on
+ * every card. Both cores can share one window because p_rom is the same
+ * pointer for master and slave. */
+struct gnw_fetch_win { unsigned int region, mask; unsigned char *base; };
+struct gnw_fetch_win gnw_fw_rom = { 0xffffffffu, 0, 0 };
+
 /* GNW_BUS_CENSUS: guest DATA accesses by region, plus a hot-page histogram of
  * the cart-ROM reads.
  *
@@ -2716,6 +2730,9 @@ static void bank_switch_rom_sh2(void)
 {
   /* keep the fetch fast path in step with the map entry it mirrors */
   gnw_sh2_rom_fetch_mask = carthw_ssf2_active ? 0 : gnw_rom_map_mask;
+  gnw_fw_rom.region = carthw_ssf2_active ? 0xffffffffu : 0x02000000u;
+  gnw_fw_rom.mask   = gnw_rom_map_mask;
+  gnw_fw_rom.base   = (unsigned char *)Pico.rom;
 
   if (!carthw_ssf2_active) {
     // easy
@@ -2836,6 +2853,9 @@ void PicoMemSetup32x(void)
    * ran above with it still zero, i.e. the fast path disabled) */
   gnw_rom_map_mask = rs - 1;
   gnw_sh2_rom_fetch_mask = carthw_ssf2_active ? 0 : gnw_rom_map_mask;
+  gnw_fw_rom.region = carthw_ssf2_active ? 0xffffffffu : 0x02000000u;
+  gnw_fw_rom.mask   = gnw_rom_map_mask;
+  gnw_fw_rom.base   = (unsigned char *)Pico.rom;
   msh2_read8_map[0x02/2].mask  = msh2_read8_map[0x22/2].mask  = rs-1;
   msh2_read16_map[0x02/2].mask = msh2_read16_map[0x22/2].mask = rs-1;
   msh2_read32_map[0x02/2].mask = msh2_read32_map[0x22/2].mask = rs-1;
