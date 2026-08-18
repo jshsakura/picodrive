@@ -599,7 +599,15 @@ static inline void rig_spd_sample(unsigned int pc, unsigned int bop1,
  * Off (#undef) compiles byte-identical to upstream; gnw_sh2_fastloops is a
  * runtime kill-switch for on-device A/B. */
 #if defined(GNW_32X_CORE) && !defined(DRC_SH2)
+/* Ablation switch. The pre-filter below costs ~7 host instructions on EVERY
+ * guest instruction (three movw of its constants, two compares, two branches)
+ * to catch loops it can skip. This tree's own rule is that a test which adds
+ * work to skip work tends to lose on this chip, so the tax has to be priced
+ * against the saving rather than assumed: build with -DGNW_SH2_NO_FASTLOOPS to
+ * measure without it. */
+#ifndef GNW_SH2_NO_FASTLOOPS
 #define GNW_SH2_FASTLOOPS 1
+#endif
 #endif
 
 #ifdef GNW_SH2_FASTLOOPS
