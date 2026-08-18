@@ -51,9 +51,59 @@ MAKE_WRITEFUNC(WL, p32x_sh2_write32)
 
 #else
 
+/* Inline data-read fast paths, the same move the opcode fetch got and for the
+ * same reason: every guest load was a cross-TU call (LTO is off) into a
+ * function whose first act is to re-derive the region. The bus census says
+ * 87,086 guest data accesses per frame against 165,262 dispatched
+ * instructions -- more than half of all instructions pay this -- and it also
+ * says which region each class lands in, which fixes the test order here:
+ *
+ *   r8   cart-ROM 88%   SDRAM  2%      -> ROM first
+ *   r16  cart-ROM 93%   SDRAM  5%      -> ROM first
+ *   r32  SDRAM    82%   cart-ROM 14%   -> SDRAM first
+ *
+ * Each arm reproduces byte for byte what p32x_sh2_read8/16/32 would return for
+ * that region, signedness included -- the ROM arm sign-extends like the map
+ * branch, the SDRAM arm zero-extends like its own -- so this cannot change a
+ * value even where a caller does not immediately cast. Anything else still
+ * takes the call.
+ *
+ * The old objection to inlining here was ITCM: RB/RW/RL/WB/WW/WL appear at ~50
+ * sites in an 8 KB interpreter with 4 KB of head room. That objection was
+ * about inlining a DWT probe BRACKET at each site. A fast path is a few
+ * instructions, and the measured text growth is well inside the head room.
+ *
+ * GNW_NO_INLINE_DATA_READ restores the plain calls for A/B. */
+#ifdef GNW_NO_INLINE_DATA_READ
 #define RB(sh2, a) p32x_sh2_read8(a, sh2)
 #define RW(sh2, a) p32x_sh2_read16(a, sh2)
 #define RL(sh2, a) p32x_sh2_read32(a, sh2)
+#else
+#define GNW_MEM_BE2(a) ((a) ^ 1)
+#ifdef GNW_INLINE_READ_L_ONLY
+#define RB(sh2, a) p32x_sh2_read8(a, sh2)
+#define RW(sh2, a) p32x_sh2_read16(a, sh2)
+#else
+#define RB(sh2, a) ({ UINT32 a_ = (a); UINT32 h_ = a_ & 0xdf000000;          \
+  h_ == gnw_fw_rom.region                                                    \
+    ? (UINT32)*(INT8 *)(gnw_fw_rom.base + GNW_MEM_BE2(a_ & gnw_fw_rom.mask)) \
+  : h_ == 0x06000000                                                         \
+    ? (UINT32)((UINT8 *)(sh2)->p_sdram)[GNW_MEM_BE2(a_ & 0x3ffff)]           \
+    : p32x_sh2_read8(a_, sh2); })
+#define RW(sh2, a) ({ UINT32 a_ = (a); UINT32 h_ = a_ & 0xdf000000;          \
+  h_ == gnw_fw_rom.region                                                    \
+    ? (UINT32)*(INT16 *)(gnw_fw_rom.base + (a_ & gnw_fw_rom.mask))           \
+  : h_ == 0x06000000                                                         \
+    ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_sdram + (a_ & 0x3fffe))          \
+    : p32x_sh2_read16(a_, sh2); })
+#endif
+#define RL(sh2, a) ({ UINT32 a_ = (a); UINT32 h_ = a_ & 0xdf000000;          \
+  h_ == 0x06000000                                                           \
+    ? CPU_BE2(*(UINT32 *)((UINT8 *)(sh2)->p_sdram + (a_ & 0x3fffc)))         \
+  : h_ == gnw_fw_rom.region                                                  \
+    ? CPU_BE2(*(UINT32 *)(gnw_fw_rom.base + (a_ & gnw_fw_rom.mask)))         \
+    : p32x_sh2_read32(a_, sh2); })
+#endif
 #define WB(sh2, a, d) p32x_sh2_write8(a, d, sh2)
 #define WW(sh2, a, d) p32x_sh2_write16(a, d, sh2)
 #define WL(sh2, a, d) p32x_sh2_write32(a, d, sh2)
