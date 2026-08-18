@@ -431,6 +431,14 @@ static const do_loop_func do_loop_rl_f[] = { do_loop_rl, do_loop_rl_h32, do_loop
 
 void PicoDraw32xLayer(int offs, int lines, int md_bg)
 {
+#ifdef GNW_MD_ABLATE
+  /* Measurement build only: kill every MD VDP layer so the pprof "draw" bucket
+   * collapses to whatever is irreducible. Prices the ceiling on any MD-side
+   * optimisation, and shows whether the MD layer contributes anything the 32X
+   * does not already cover (compare framebuffer hashes). Never define this in a
+   * shipping build -- it deletes the layer, it does not speed it up. */
+  Pico.video.debug_p |= PVD_KILL_A | PVD_KILL_B | PVD_KILL_S_LO | PVD_KILL_S_HI;
+#endif
   int have_scan = PicoScan32xBegin != NULL && PicoScan32xEnd != NULL;
   const do_loop_func *do_loop;
   unsigned short *dram;
