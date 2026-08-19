@@ -346,9 +346,8 @@ TileFlipMakerAS(TileFlipSH_AS_and, pix_sh_as_and)
  * verdict. Deliberately NOT applied to the VSRam strips: those move
  * nametab per cell, so no fixed row key exists. Small by design: the
  * MD32X overlay BSS is flush against __RAM_EMU_END__; 4 direct-mapped
- * slots hold both planes' current rows only because the slot index is a
- * multiply hash — a plain (nametab>>4)&3 pinned stride-64/128 rows and
- * both plane bases (all multiples of 0x800) into one or two slots. */
+ * slots still hold both planes' current rows (a miss costs one re-scan
+ * per row change, ~2x30 times per frame). */
 u32 gnw_rowcache_gen;
 struct gnw_rowcache_ent { u32 nametab; u32 gen; u8 blank; u8 any_lo; };
 static struct gnw_rowcache_ent gnw_rowcache[4];
@@ -363,11 +362,7 @@ static struct gnw_rowcache_ent gnw_rowcache[4];
 static int gnw_rowcache_lookup(u32 nametab, u32 xmask, int yshift, int ymask,
     u8 *any_lo_p)
 {
-  /* Multiply hash: the row stride is 32/64/128 words and both plane bases
-   * are multiples of 0x800, so (nametab>>4)&N bits up in fixed patterns
-   * (stride 64/128 rows and both planes land in the same slots). The
-   * Fibonacci multiply spreads rows uniformly regardless of stride. */
-  struct gnw_rowcache_ent *e = &gnw_rowcache[(nametab * 0x9E3779B1u) >> 30];
+  struct gnw_rowcache_ent *e = &gnw_rowcache[(nametab >> 4) & 3];
   u32 n = xmask + 1, i, code = ~0u;
   u8 any_lo = 0;
 
