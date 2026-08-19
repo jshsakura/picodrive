@@ -572,6 +572,51 @@ void gnw_sh2_pcwall_arm(unsigned int *block)
 #define GNW_SLICE_TICK(sh2) ((void)0)
 #endif
 
+/* Hoisted-window fetch (2026-08-20).
+ *
+ * GNW_FETCH_SD reads three fields of the global gnw_fw_rom on EVERY fetched
+ * guest instruction: `ldr region` plus an `ldrd mask, base`. gcc cannot keep
+ * them in registers across the dispatch loop because the op bodies call the
+ * memory handlers, which are extern and may write anything.
+ *
+ * They do not change inside a slice, and that is a property of the code, not
+ * an assumption: gnw_fw_rom is written only by bank_switch_rom_sh2(), whose
+ * two callers are PicoMemSetup32x() and p32x_update_banks(); the values it
+ * derives from -- Pico.rom, gnw_rom_map_mask and carthw_ssf2_active -- are all
+ * fixed at cart load (carthw_ssf2_startup / carthw_ssf2_unload). Neither
+ * caller can run from inside sh2_execute_interpreter.
+ *
+ * So hoist them once per slice (~570 dispatched instructions) instead of once
+ * per instruction. -DGNW_FW_NO_HOIST restores the per-instruction loads.
+ *
+ * IF YOU ADD A RUNTIME WRITER OF gnw_fw_rom, this breaks silently: a slice in
+ * flight keeps fetching through the old base. End the run there, or turn the
+ * hoist off. */
+#define GNW_FETCH_SD_W(sh2, addr, R_, M_, B_)                                \
+  (__builtin_expect(((addr) & 0xdf000000) == (R_), 1)                        \
+     ? (UINT32)*(UINT16 *)((B_) + ((addr) & (M_)))                           \
+   : (((addr) & 0xdf000000) == 0x06000000)                                   \
+     ? (UINT32)*(UINT16 *)((UINT8 *)(sh2)->p_sdram + ((addr) & 0x3fffe))     \
+     : (UINT32)(UINT16)RW(sh2, addr))
+
+#if defined(GNW_FW_NO_HOIST) || defined(GNW_FETCH_OLD_WINDOW) \
+    || defined(MD32X_DEVICE_PROFILE)
+/* The profile build brackets the fetch with a DWT pair and must keep the exact
+ * shape it measures; the old-window arm has no window to hoist. */
+#define GNW_FW_HOIST_DECL()   ((void)0)
+#define GNW_FETCH_H(sh2, addr, dst)  GNW_FETCH(sh2, addr, dst)
+#define GNW_FETCH_SD_H(sh2, addr)    GNW_FETCH_SD(sh2, addr)
+#else
+#define GNW_FW_HOIST_DECL()                                                  \
+	const unsigned int gnw_fw_r_ = gnw_fw_rom.region;                    \
+	const unsigned int gnw_fw_m_ = gnw_fw_rom.mask;                      \
+	unsigned char * const gnw_fw_b_ = gnw_fw_rom.base
+#define GNW_FETCH_H(sh2, addr, dst)                                          \
+	((dst) = GNW_FETCH_SD_W(sh2, addr, gnw_fw_r_, gnw_fw_m_, gnw_fw_b_))
+#define GNW_FETCH_SD_H(sh2, addr)                                            \
+	GNW_FETCH_SD_W(sh2, addr, gnw_fw_r_, gnw_fw_m_, gnw_fw_b_)
+#endif
+
 /* RIG_SH2_PC_HIST: SH-2 guest-PC histogram for the QEMU M7 feasibility rig.
  * Two sparse open-addressed tables (master/slave), keyed by ppc, counting
  * direct vs delay-slot executions. Reveals which guest loops eat the msh2/
@@ -1456,6 +1501,8 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 	int rig_is_delay = 0;
 #endif
 
+	GNW_FW_HOIST_DECL();
+
 	sh2->icount = cycles;
 
 	if (sh2->icount <= 0)
@@ -1469,7 +1516,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		if (sh2->delay)
 		{
 			sh2->ppc = sh2->delay;
-			opcode = GNW_FETCH_SD(sh2, sh2->delay);
+			opcode = GNW_FETCH_SD_H(sh2, sh2->delay);
 
 			// TODO: more branch types
 		if ((opcode >> 13) == 5) { // BRA/BSR
@@ -1502,7 +1549,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		{
 			UINT32 cur_pc = sh2->pc;
 			sh2->ppc = cur_pc;
-			GNW_FETCH(sh2, cur_pc, opcode);
+			GNW_FETCH_H(sh2, cur_pc, opcode);
 			sh2->pc = cur_pc + 2;
 #ifdef GNW_SH2_FASTLOOPS
 			gnw_direct = 1;
