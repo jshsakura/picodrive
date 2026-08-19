@@ -457,6 +457,16 @@ static const do_loop_func do_loop_rl_f[] = { do_loop_rl, do_loop_rl_h32, do_loop
 
 void PicoDraw32xLayer(int offs, int lines, int md_bg)
 {
+#ifdef GNW_MD_ABLATE_SPR
+  /* Measurement build only: kill just the MD sprite layers, leaving the planes.
+   * Prices the sprite pipeline on its own -- if Doom's MD layer is a plane-only
+   * HUD, every cycle here is pure overhead and the number says how much. */
+  Pico.video.debug_p |= PVD_KILL_S_LO | PVD_KILL_S_HI;
+#endif
+#ifdef GNW_MD_ABLATE_PLANES
+  /* ... and the mirror: planes only killed, sprites left. */
+  Pico.video.debug_p |= PVD_KILL_A | PVD_KILL_B;
+#endif
 #ifdef GNW_MD_ABLATE
   /* Measurement build only: kill every MD VDP layer so the pprof "draw" bucket
    * collapses to whatever is irreducible. Prices the ceiling on any MD-side
