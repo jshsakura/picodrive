@@ -118,10 +118,16 @@ static void convert_pal555(int invert_prio)
 #else
 #define GNW_PP_RUNDET 1
 #endif
+#ifdef GNW_PP_NO_QUAD
+#define GNW_PP_QUAD 0
+#else
+#define GNW_PP_QUAD 1
+#endif
 
 #define do_line_pp(pd, p32x, pmd, pmd_draw_code)                  \
 {                                                                 \
   unsigned short t, t0, t1, v;                                    \
+  const u32 mdbg4 = (u32)(mdbg & 0x3f) * 0x01010101u;             \
   int i = 320;                                                    \
   _Static_assert(320 % 2 == 0, "line must be an even pixel count"); \
   while (i > 0) {                                                 \
@@ -207,6 +213,26 @@ static void convert_pal555(int invert_prio)
     }                                                             \
     /* MD-background run: 32X pixel shown unconditionally */      \
     for (; i > 0 && (*pmd & 0x3f) == mdbg; ) {                    \
+      /* Four at a time. Doom's 3D view leaves the MD layer at    \
+       * background for whole lines, so this is the path that     \
+       * actually runs, and the pair loop below asks the MD byte  \
+       * twice per two pixels -- two loads, two ANDs, two         \
+       * compares. One word load answers for four. Guarded on the \
+       * three pointers being aligned, which is the common case;  \
+       * anything else falls through to the pair path unchanged.  \
+       * GNW_PP_NO_QUAD prices it. */                             \
+      if (GNW_PP_QUAD && i >= 4                                   \
+          && !(((uintptr_t)pmd | (uintptr_t)pd) & 3)              \
+          && !((uintptr_t)(p32x) & 1)                             \
+          && (*(u32 *)pmd & 0x3f3f3f3fu) == mdbg4) {              \
+        u32 q = *(u32 *)(p32x);                                   \
+        u16 a0 = pal[(q >>  8) & 0xff], a1 = pal[q & 0xff];       \
+        u16 a2 = pal[(q >> 24) & 0xff], a3 = pal[(q >> 16) & 0xff]; \
+        ((u32 *)pd)[0] = (u32)a0 | ((u32)a1 << 16);               \
+        ((u32 *)pd)[1] = (u32)a2 | ((u32)a3 << 16);               \
+        pd += 4; pmd += 4; p32x += 4; i -= 4;                     \
+        continue;                                                 \
+      }                                                           \
       if (i >= 2 && (pmd[1] & 0x3f) == mdbg) {                    \
         if (!((uintptr_t)(p32x) & 1)) {                           \
           v = *(u16 *)(p32x);                                     \
