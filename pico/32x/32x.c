@@ -37,6 +37,180 @@ static int REGPARM(2) sh2_irq_cb(SH2 *sh2, int level)
   }
 }
 
+#ifdef GNW_SSH2_SND_HLE
+/* Doom 32X slave sound-service HLE (2026-08-19).
+ *
+ * The slave's PWM-irq handler (0x020361a4 - the irq is P32XI_PWM, the
+ * sole bit ever pending in sh2irqi[1] on this title, measured 2026-08-19)
+ * only does three modelled things:
+ * clear PWM irq (0x2000401c=0), bump a frame counter at 0x06001178, and
+ * call the sound service at 0x0204e81a: tas-lock a struct at 0x0600117c,
+ * prime/refill the PWM MONO fifo from the last sample, mix two 36-byte
+ * channel structs at 0x0600118c/+36 (seq ptr, volume, sample ptr, 4-deep
+ * page counter, reload counter, page base, loopback offset), write the
+ * mixed sample back as the new "last sample", release the lock.
+ *
+ * This HLE runs that entire sequence natively on the host and skips the
+ * guest handler, the GBA M4A pattern: the interpreter is paid to emulate
+ * an interpreter; the host does the same arithmetic for ~nothing.  The
+ * slave's cycle slice is still granted (it just parks in the bra-self
+ * idle loop), so the m68k timeline is unchanged - only host work is
+ * removed.  Gated on two ROM literals unique to Doom so no other title
+ * can hit it, and only when the PWM irq is the slave's sole pending irq so
+ * the guest path still runs whenever anything else is pending.  The gate for
+ * shipping is the rig snd hash: bit-identical to the non-HLE build. */
+u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2);
+u32 REGPARM(2) p32x_sh2_read16(u32 a, SH2 *sh2);
+u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2);
+void REGPARM(3) p32x_sh2_write8(u32 a, u32 d, SH2 *sh2);
+void REGPARM(3) p32x_sh2_write16(u32 a, u32 d, SH2 *sh2);
+void REGPARM(3) p32x_sh2_write32(u32 a, u32 d, SH2 *sh2);
+
+/* one channel of the DMX mixer at 0x0204e7ce - bit-exact port */
+static int ssh2_hle_mix(u32 ch, SH2 *sh)
+{
+  u32 r0 = p32x_sh2_read32(ch + 0, sh);            // remaining samples
+  if (r0 == 0)
+    return 0;                                      // rts path: sext8(0)
+  u32 r2 = r0 - 1;
+  u32 r1 = p32x_sh2_read32(ch + 24, sh);           // seq ptr
+  u32 r3 = p32x_sh2_read32(ch + 4, sh);            // volume
+  u32 r4 = p32x_sh2_read32(ch + 8, sh);            // sample read ptr
+  u32 r5 = p32x_sh2_read32(ch + 12, sh);           // page counter (4)
+  u32 r6 = p32x_sh2_read32(ch + 16, sh);           // reload counter
+
+  if (--r5 != 0)                                   // dt r5; bf sample
+    goto have_sample;
+  if (--r6 != 0)                                   // dt r6; bf fetch
+    goto fetch_index;
+  p32x_sh2_write32(ch + 28, r1, sh);               // new page base = seq ptr
+  r1 += p32x_sh2_read32(ch + 32, sh);              // loopback jump
+  r6 = p32x_sh2_read32(ch + 20, sh);               // reload restore
+fetch_index:
+  r4 = p32x_sh2_read8(r1, sh); r1++;               // mov.b @r1+
+  r5 = p32x_sh2_read32(ch + 28, sh);               // page base
+  r4 = ((r4 & 0xffu) << 2) + r5;                   // extu.b (read8 sign-extends) ; shll2 ; add r5
+  r5 = 4;
+have_sample:
+  r0 = p32x_sh2_read8(r4, sh); r4++;               // mov.b @r4+
+  // extu.b + add #-64 twice == (u8)v - 128
+  s32 mac = (s32)(s16)(u16)r3 * ((s32)(u8)r0 - 128); // muls.w -> MACL
+  p32x_sh2_write32(ch + 24, r1, sh);
+  p32x_sh2_write32(ch + 0, r2, sh);
+  p32x_sh2_write32(ch + 8, r4, sh);
+  p32x_sh2_write32(ch + 12, r5, sh);
+  p32x_sh2_write32(ch + 16, r6, sh);
+  return (s8)(u8)((u32)mac >> 8);                  // sts macl; shlr8; exts.b
+}
+
+/* sound service 0x0204e81a, returns 1 if it ran (signature matched) */
+/* Timing alignment knobs, tuned against the guest PWM-write trace:
+ * LAT shifts the service's write clock relative to the PWM irq event time,
+ * WI1/WI2 reproduce the guest's in-group write cadence (+18,+5 observed). */
+#ifndef GNW_SSH2_HLE_LAT
+#define GNW_SSH2_HLE_LAT 0
+#endif
+#ifndef GNW_SSH2_HLE_WI1
+#define GNW_SSH2_HLE_WI1 18
+#endif
+#ifndef GNW_SSH2_HLE_WI2
+#define GNW_SSH2_HLE_WI2 5
+#endif
+
+/* Engine fingerprint for the Doom DMX sound service, resolved once at the
+ * first PWM irq. We do NOT key on absolute addresses (they are this ROM
+ * build's layout): we verify the service prologue opcode sequence and read
+ * the struct/PWM/channel pointers out of its own literal pool, exactly the
+ * way the guest loads them. On mismatch we go quiet (state=-1, no printf,
+ * no reject side effects) and leave the guest path untouched. */
+static struct {
+  u32 base, pwm, ch, cnt;
+  int state; /* 0=unchecked, 1=fingerprint ok, -1=rejected */
+} snd_fp;
+
+static void ssh2_hle_resolve(SH2 *sh)
+{
+  /* push r12-r14 / mov.l @(0x1c,PC),r14 / mov.l @(4,r14),r0 / cmp/eq #0,r0
+   * / bf / tas.b @r14 / bf -- the Doom slave sound service prologue */
+  static const u16 op[] = { 0x2fc6, 0x2fd6, 0x2fe6, 0xde1c,
+                            0x50e1, 0x8800, 0x8b31, 0x4e1b, 0x8b2f };
+  enum { SVC = 0x0204e81a };
+  int i;
+
+  for (i = 0; i < (int)(sizeof(op) / sizeof(op[0])); i++)
+    if ((u16)p32x_sh2_read16(SVC + 2 * i, sh) != op[i]) {  // read16 sign-extends
+      snd_fp.state = -1;
+      return;
+    }
+
+  /* literal pool slots for r14/r12/r13 loads: ((insn+4)&~3) + disp*4 */
+  snd_fp.base = p32x_sh2_read32(((SVC + 6 + 4) & ~3) + 0x1c * 4, sh);
+  snd_fp.pwm  = p32x_sh2_read32(((SVC + 0x26 + 4) & ~3) + 0x15 * 4, sh);
+  snd_fp.ch   = p32x_sh2_read32(((SVC + 0x38 + 4) & ~3) + 0x12 * 4, sh);
+
+  /* sanity: channel table sits at base+0x10, struct in SDRAM, PWM in the
+   * 32x register window -- otherwise this is not the engine we ported */
+  if (snd_fp.ch != snd_fp.base + 0x10 ||
+      (snd_fp.base & 0xdf000000) != 0x06000000 ||
+      (snd_fp.pwm & 0x3ffc0) != 0x4000) {
+    snd_fp.state = -1;
+    return;
+  }
+  snd_fp.cnt = snd_fp.base - 4; /* handler's frame counter literal */
+  snd_fp.state = 1;
+}
+
+static int ssh2_hle_sound_service(SH2 *sh, u32 evt_cyc)
+{
+  u32 w_idx = 0; /* in-group write index: 0=group start,1=+WI1,2=+WI2 */
+  u32 BASE = snd_fp.base, PWM_MONO = snd_fp.pwm, CH = snd_fp.ch;
+
+  // handler prologue side effects
+  p32x_sh2_write32(snd_fp.cnt, p32x_sh2_read32(snd_fp.cnt, sh) + 1, sh);
+  p32x_sh2_write16(0x2000401c, 0, sh);                // clear PWM irq (32x reg, fixed by spec)
+
+  /* anchor the write clock to the irq event time: without this the
+   * write16 calls timestamp at ssh2's stale slice clock, ~39 m68k cycles
+   * late vs the guest's handler entry, and the drain interleaving (and
+   * thus the audio stream) diverges */
+  sh->m68krcycles_done = evt_cyc + GNW_SSH2_HLE_LAT;
+  w_idx = 0;
+
+  if (p32x_sh2_read32(BASE + 4, sh) != 0)             // guest: cmp/eq #0; bf exit -- 0 means "run"
+    return 1;
+  if (p32x_sh2_read8(BASE, sh))                       // tas fails: locked
+    return 1;
+  p32x_sh2_write8(BASE, 1, sh);                       // tas acquire
+
+  u32 r7 = p32x_sh2_read32(BASE + 8, sh);             // fifo fill count
+  u32 last = p32x_sh2_read16(BASE + 12, sh);          // last sample (u16)
+  u32 ch = CH;
+
+  for (;;) {
+    do {
+      u32 st = p32x_sh2_read8(PWM_MONO, sh);          // 0x80 in high byte
+      if (st & 0x80)                                  // P32XP_FULL: stop
+        goto full;
+      sh->m68krcycles_done += (w_idx == 1) ? GNW_SSH2_HLE_WI1 :
+                               (w_idx == 2) ? GNW_SSH2_HLE_WI2 : 0;
+      if (w_idx < 2) w_idx++;
+      p32x_sh2_write16(PWM_MONO, last, sh);
+    } while (--r7 != 0);                              // dt r7; bf fill
+
+    int m1 = ssh2_hle_mix(ch, sh);                    // bsr + delay mov #2,r7
+    int m2 = ssh2_hle_mix(ch + 36, sh);               // bsr + delay ch += 36
+    last = ((((u32)m1 + (u32)m2) + 256) << 1) + 1;
+    p32x_sh2_write16(BASE + 12, last, sh);
+    r7 = 2;                                           // bra fill with r7=2
+  }
+
+full:
+  p32x_sh2_write32(BASE + 8, r7, sh);                 // remaining count
+  p32x_sh2_write32(BASE + 0, 0, sh);                  // release lock
+  return 1;
+}
+#endif // GNW_SSH2_SND_HLE
+
 // MUST specify active_sh2 when called from sh2 memhandlers
 void p32x_update_irls(SH2 *active_sh2, unsigned int m68k_cycles)
 {
@@ -62,6 +236,57 @@ void p32x_update_irls(SH2 *active_sh2, unsigned int m68k_cycles)
   if (irqs >= 0x10)     slvl += 8, irqs >>= 4;
   if (irqs >= 0x04)     slvl += 4, irqs >>= 2;
   if (irqs >= 0x02)     slvl += 2, irqs >>= 1;
+
+#ifdef RIG_SND_STRUCT_DUMP
+/* Throwaway rig probe: snapshot the Doom slave sound-state struct at every
+ * PWM irq RAISE (edge-detected), before any handler/HLE service mutates it.
+ * Runs in both baseline and HLE builds so the struct evolution can be
+ * diffed to find the first diverging field. Same magic windows as the HLE
+ * gate (0x0600117c struct / 0x0600118c ch1 / +36 ch2). */
+{
+  static int s_prev_set;
+  static u32 s_seq;
+  if (Pico32x.sh2irqi[1] & P32XI_PWM) {
+    if (!s_prev_set && s_seq < 70000) {
+      int c, w;
+      printf("[sndst] %u %x %x %x %x",
+        s_seq,
+        p32x_sh2_read32(0x0600117c + 0, &ssh2),
+        p32x_sh2_read32(0x0600117c + 4, &ssh2),
+        p32x_sh2_read32(0x0600117c + 8, &ssh2),
+        p32x_sh2_read32(0x0600117c + 12, &ssh2));
+      for (c = 0; c < 2; c++) {
+        printf(" |");
+        for (w = 0; w < 9; w++)
+          printf(" %x", p32x_sh2_read32(0x0600118c + c*36 + w*4, &ssh2));
+      }
+      printf("\n");
+      s_seq++;
+    }
+    s_prev_set = 1;
+  } else {
+    s_prev_set = 0;
+  }
+}
+#endif
+
+#ifdef GNW_SSH2_SND_HLE
+  /* replace the Doom slave PWM-irq handler with the native port above;
+   * sole-pending-bit condition keeps the guest path for anything else */
+  {
+    u32 v = Pico32x.sh2irqi[1];
+    if ((v & P32XI_PWM) && v == P32XI_PWM) {
+      if (snd_fp.state == 0)
+        ssh2_hle_resolve(&ssh2);
+      if (snd_fp.state == 1 &&
+          ssh2_hle_sound_service(&ssh2, m68k_cycles)) {
+        /* service ack'ed the PWM bit via the bus write; skip the guest
+         * handler entirely (native port replaced it) */
+        slvl = 0;
+      }
+    }
+  }
+#endif
 
   mrun = sh2_irl_irq(&msh2, mlvl, msh2.state & SH2_STATE_RUN);
   if (mrun) {
