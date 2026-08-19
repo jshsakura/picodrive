@@ -123,10 +123,18 @@ static void convert_pal555(int invert_prio)
 #else
 #define GNW_PP_QUAD 1
 #endif
-#if defined(GNW_PP_NO_OCTA) || defined(GNW_PP_NO_QUAD)
-#define GNW_PP_OCTA 0
-#else
+/* DEFAULT OFF, and not because it lost. It wins on the rig (-1.02%) and the
+ * device has never seen it: the md32x overlay has 12 bytes of RAM_EMU
+ * headroom (_OVERLAY_MD32X_BSS_END = 0x240ffff4, read from the ELF), and this
+ * path costs 592 -- its ~150 B body is instantiated once per make_do_loop
+ * variant inside PicoDraw32xLayer, which the linker script pins in RAM_EMU.
+ * A flagless build must link, so it is off until the bytes exist. Turn it on
+ * with -DGNW_PP_OCTA_ON and bench it on the device; 32X_CLOSED.md says where
+ * the bytes would have to come from. */
+#if defined(GNW_PP_OCTA_ON) && !defined(GNW_PP_NO_OCTA) && !defined(GNW_PP_NO_QUAD)
 #define GNW_PP_OCTA 1
+#else
+#define GNW_PP_OCTA 0
 #endif
 
 #define do_line_pp(pd, p32x, pmd, pmd_draw_code)                  \
