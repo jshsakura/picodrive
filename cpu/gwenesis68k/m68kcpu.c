@@ -369,6 +369,96 @@ static void __attribute__((noinline)) gnw_m68k_sample(unsigned int pc)
 #define GNW_M68K_ENTER()  ((void)0)
 #endif
 
+/* GNW_M68K_IDLE_FOLD: sleep the 68K in the spin loops picodrive already knows
+ * how to recognise but this CPU core never asked about.
+ *
+ * pico/sek.c carries upstream's idle-loop whitelist (SekIsIdleCode) and two
+ * backends that use it -- Cyclone and FAME -- both by PATCHING the branch
+ * opcode. gwenesis' jump table is compile-time const, so it was never wired,
+ * and the cost of that is not theoretical: on Doom's gameplay anchor the rig
+ * puts 75.2% of all 68K instructions in ONE two-instruction loop,
+ *
+ *     0x8832a2  tst.b  $ff1134.l      ; a flag in the 68K's own work RAM
+ *     0x8832a8  beq.b  $8832a2        ; wait for the VInt handler to set it
+ *
+ * which is `SekIsIdleCode`'s 6-byte `tst.b ($xxxxxxxx)` case, verbatim.
+ * picodrive's other stop path (p32x's 32X-register poll detect, which does
+ * call SekSetStop) cannot see this one: the address it polls is RAM, not a
+ * 32X register.
+ *
+ * Rather than patch, detect at the branch: a TAKEN short backward Bcc/BRA
+ * whose body passes SekIsIdleCode, verdict cached per branch site so the
+ * check runs once per site and never in the loop. The action is exactly what
+ * the 32X poll path already does -- SekSetStop(1) -- so the CPU consumes the
+ * rest of its timeslice without executing and wakes on the next interrupt,
+ * which is the only thing that can set a flag in its own RAM anyway.
+ *
+ * Two guards. It never stops with interrupts masked at or above the level of
+ * VInt (FLAG_INT_MASK >= 6), because then nothing could wake it. And the
+ * verdict cache is keyed on the branch target, so a site that fails the
+ * whitelist is asked once and never again.
+ *
+ * -DGNW_M68K_NO_IDLE_FOLD prices it. Only for GNW_32X_CORE. */
+#if defined(GNW_32X_CORE) && !defined(GNW_M68K_NO_IDLE_FOLD)
+#define GNW_M68K_IDLE_FOLD 1
+#endif
+
+#ifdef GNW_M68K_IDLE_FOLD
+extern int SekIsIdleCode(unsigned short *dst, int bytes);
+
+#define GNW_M68K_IDLE_SLOTS 32
+static struct gnw_idle_slot { unsigned int at; signed char verdict; }
+	gnw_m68k_idle_cache[GNW_M68K_IDLE_SLOTS];
+unsigned int gnw_m68k_idle_stops;      /* diagnostic counter */
+
+static int __attribute__((noinline)) gnw_m68k_idle_probe(unsigned int target,
+                                                         int bytes)
+{
+	struct gnw_idle_slot *sl_ =
+		&gnw_m68k_idle_cache[(target >> 1) & (GNW_M68K_IDLE_SLOTS - 1)];
+	unsigned short body[6];
+	int i, n;
+
+	if (sl_->at == target)
+		return sl_->verdict;
+
+	sl_->at = target;
+	sl_->verdict = 0;
+	if (bytes < 2 || bytes > 12 || (bytes & 1))
+		return 0;
+	n = bytes >> 1;
+	for (i = 0; i < n; i++)
+		body[i] = (unsigned short)m68ki_read_16(target + i * 2);
+	sl_->verdict = SekIsIdleCode(body, bytes) ? 1 : 0;
+	return sl_->verdict;
+}
+#endif
+
+/* RIG_M68K_HIST: what the 68K is doing, on the rig.
+ *
+ * The phase table charges Doom's frame ~6% for the 68K and the July device
+ * probe put it at 12.9% of the device's, and nobody has ever looked at WHERE
+ * those instructions are. If they are a spin the emulator does not recognise
+ * as one, that is a lever; if they are spread over real code, the axis is
+ * closed. A direct-mapped exact-PC table answers it without DWT, which the rig
+ * does not have. Rig-only; off => no code emitted. */
+#ifdef RIG_M68K_HIST
+#define RIG_M68K_SLOTS 1024
+unsigned long long rig_m68k_insns;
+struct rig_m68k_slot { unsigned int at, hits; };
+struct rig_m68k_slot rig_m68k_tab[RIG_M68K_SLOTS];
+unsigned long long rig_m68k_evict;
+#define RIG_M68K_TICK(pc) do {                                               \
+	unsigned int p_ = (pc) & 0xffffff;                                   \
+	struct rig_m68k_slot *sl_ = &rig_m68k_tab[(p_ >> 1) & (RIG_M68K_SLOTS - 1)]; \
+	rig_m68k_insns++;                                                    \
+	if (sl_->at == p_ || sl_->hits == 0) { sl_->at = p_; sl_->hits++; }  \
+	else rig_m68k_evict++;                                               \
+} while (0)
+#else
+#define RIG_M68K_TICK(pc) ((void)0)
+#endif
+
 void m68k_run(unsigned int cycles)
 {
     //  printf("m68K_run current_cycles=%d add=%d STOP=%x\n",m68k.cycles,cycles,CPU_STOPPED);
@@ -413,6 +503,9 @@ void m68k_run(unsigned int cycles)
   /* GNW: compare against m68k.cycle_end (not the call argument) so that
    * picodrive memory handlers can shrink the running timeslice via
    * SekEndRun()/SekSetStop() by lowering cycle_end mid-run. */
+#ifdef GNW_M68K_IDLE_FOLD
+  unsigned int gnw_br_pc;
+#endif
   while (m68k.cycles < m68k.cycle_end)
   {
     /* Set tracing accodring to T1. */
@@ -432,10 +525,38 @@ void m68k_run(unsigned int cycles)
 
 //    printf("PC=%x IR=%x CYCLES=%d \n",m68k.pc,REG_IR,CYC_INSTRUCTION[REG_IR]);
 
+#ifdef GNW_M68K_IDLE_FOLD
+    /* Short backward Bcc/BRA (not BSR, not the .w/.l displacement forms).
+     * REG_PC is already past the opcode word, so this is the address of the
+     * instruction AFTER the branch. */
+    gnw_br_pc = (((REG_IR & 0xf000) == 0x6000) && (REG_IR & 0x0080)
+                 && (REG_IR & 0x00ff) != 0x00ff
+                 && (REG_IR & 0x0f00) != 0x0100) ? REG_PC : 0;
+#endif
+
     /* Execute instruction */
     GNW_M68K_TICK(REG_PC);
+    RIG_M68K_TICK(REG_PC);
     m68ki_instruction_jump_table[REG_IR]();
     USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+
+#ifdef GNW_M68K_IDLE_FOLD
+    if (gnw_br_pc && REG_PC < gnw_br_pc && FLAG_INT_MASK < 0x0600
+        && gnw_m68k_idle_probe(REG_PC, (int)(gnw_br_pc - 2 - REG_PC))) {
+      gnw_m68k_idle_stops++;
+      /* Set the stop flag and leave; do NOT go through SekSetStop, whose
+       * SekEndRun rebases Pico.t.m68c_cnt. Rebasing rewinds the master clock
+       * by the unspent cycles, which moves every sound sync point downstream
+       * and changed the audio hash (af8c118b -> 8c20ba95) on an otherwise
+       * pixel-identical frame. Leaving the counters alone models what the
+       * guest was actually doing -- spinning -- so the emulated timeline is
+       * unchanged and only the work disappears. The next m68k_run() sees
+       * CPU_STOPPED and fast-forwards m68k.cycles to its target; an interrupt
+       * clears the flag in m68ki_exception_interrupt(). */
+      CPU_STOPPED = STOP_LEVEL_STOP;
+      break;
+    }
+#endif
 
     /* Trace m68k_exception, if necessary */
     m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */
