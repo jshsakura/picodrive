@@ -390,6 +390,44 @@ void FinalizeLine32xRGB555(int sh, int line, struct PicoEState *est)
   PicoScan32xEnd(l + (lines_sft_offs & 0xff)); \
   Pico.est.DrawLineDest = (char *)Pico.est.DrawLineDest + DrawLineDestIncrement32x; \
 
+/* RIG_PP_CENSUS: the two facts that decide whether the LTDC's L8 mode can
+ * replace this compositor (see docs/32X_NEXT_SESSION.md).
+ *
+ *  1. How many DISTINCT 32X packed-pixel indices a scene uses. The LTDC CLUT
+ *     holds 256; if the game leaves some free, the MD layer's colours can have
+ *     them and hardware scanout becomes possible without a second layer.
+ *  2. Where the MD layer is non-background. If it is confined to a rectangle
+ *     (Doom's status bar), a second LTDC layer covering only that rectangle is
+ *     the other way in.
+ *
+ * Whole-run figures, not per-frame: a CLUT and a layer rectangle have to serve
+ * every frame of a scene. Rig-only; off => no code emitted. */
+#ifdef RIG_PP_CENSUS
+unsigned char rig_pp_idx_seen[256];
+int rig_pp_md_l0 = 9999, rig_pp_md_l1 = -1;
+int rig_pp_md_x0 = 9999, rig_pp_md_x1 = -1;
+unsigned long long rig_pp_md_px, rig_pp_px;
+static void rig_pp_census(int l, const unsigned char *p32x,
+                          const unsigned char *pmd, int mdbg)
+{
+  int x;
+  for (x = 0; x < 320; x++) {
+    rig_pp_idx_seen[p32x[(unsigned)x ^ 1]] = 1;
+    rig_pp_px++;
+    if ((pmd[x] & 0x3f) != mdbg) {
+      rig_pp_md_px++;
+      if (l < rig_pp_md_l0) rig_pp_md_l0 = l;
+      if (l > rig_pp_md_l1) rig_pp_md_l1 = l;
+      if (x < rig_pp_md_x0) rig_pp_md_x0 = x;
+      if (x > rig_pp_md_x1) rig_pp_md_x1 = x;
+    }
+  }
+}
+#define RIG_PP_CENSUS(l, p32x, pmd, mdbg) rig_pp_census(l, p32x, pmd, mdbg)
+#else
+#define RIG_PP_CENSUS(l, p32x, pmd, mdbg) ((void)0)
+#endif
+
 #define make_do_loop(name, pre_code, post_code, md_code)        \
 /* Direct Color Mode */                                         \
 static void do_loop_dc##name(unsigned short *dst,               \
@@ -430,6 +468,7 @@ static void do_loop_pp##name(unsigned short *dst,               \
     pre_code;                                                   \
     p32x = (void *)(dram + dram[l + (lines_sft_offs >> 24)]);   \
     p32x += (lines_sft_offs >> 8) & 1;                          \
+    RIG_PP_CENSUS(l, p32x, pmd, mdbg);                          \
     do_line_pp(dst, p32x, pmd, md_code);                        \
     post_code;                                                  \
     dst += DrawLineDestIncrement32x/2 - 320;                    \
