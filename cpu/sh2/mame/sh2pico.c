@@ -190,6 +190,18 @@ extern struct gnw_fetch_win gnw_fw_rom;
 extern int gnw_pcwall_armed;
 unsigned int gnw_da_cyc[2], gnw_da_n[2];    /* reads,  per core */
 unsigned int gnw_daw_cyc[2], gnw_daw_n[2];  /* writes, per core */
+/* Region buckets (2026-08-19): the flat average mixes slow cart-ROM (XIP
+ * flash) reads with fast on-MCU SDRAM reads, underpricing any cache-the-ROM
+ * lever by ~2x. 0=SDRAM(0x06/0x26) 1=ROM(0x02/0x22) 2=DRAM(0x04/0x24)
+ * 3=other; mirrors fold via a & 0xdf000000. */
+unsigned int gnw_da_cyc_b[4][2], gnw_da_n_b[4][2];
+/* Write buckets omitted: writes are ~14k/frame (minor) and the overlay BSS
+ * has no room for a second 64 B pair (2026-08-19 overflow round). */
+static int gnw_da_region(UINT32 a)
+{
+	UINT32 h = a & 0xdf000000u;
+	return h == 0x06000000u ? 0 : h == 0x02000000u ? 1 : h == 0x04000000u ? 2 : 3;
+}
 static int gnw_da_cnt[2], gnw_daw_cnt[2];
 
 static UINT32 __attribute__((noinline)) gnw_probe_rd(SH2 *sh2, UINT32 a, int k)
@@ -206,8 +218,14 @@ static UINT32 __attribute__((noinline)) gnw_probe_rd(SH2 *sh2, UINT32 a, int k)
 	v = k == 0 ? p32x_sh2_read8(a, sh2)
 	  : k == 1 ? p32x_sh2_read16(a, sh2)
 	           : p32x_sh2_read32(a, sh2);
-	gnw_da_cyc[c] += *(volatile unsigned int *)0xE0001004 - t0;
-	gnw_da_n[c]++;
+	{
+		unsigned int d = *(volatile unsigned int *)0xE0001004 - t0;
+		int b = gnw_da_region(a);
+		gnw_da_cyc[c] += d;
+		gnw_da_n[c]++;
+		gnw_da_cyc_b[b][c] += d;
+		gnw_da_n_b[b][c]++;
+	}
 	gnw_da_cnt[c] = gnw_pcwall_armed ? GNW_DA_PERIOD : (1 << 30);
 	return v;
 }
@@ -1060,6 +1078,104 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 		}
 		target = sh2->ppc + disp8 * 2 + 4;	/* BFS taken pc */
 		bfs_at = sh2->ppc;
+
+#ifndef GNW_NO_TEXCOL_HLE
+		/* Texture-column loop (R_DrawColumn): seven body instructions,
+		 * ~38% of all guest SH-2 instructions in Doom 32X gameplay, and
+		 * the largest single lever left inside the core. Ablating it
+		 * entirely (clamping the counter to 1) is worth -15.4% of frame
+		 * cost, so a native execution that still does the real memory
+		 * work should land just under that.
+		 *
+		 *   MOV.B  @Rsrc,Rt        texel, sign-extended
+		 *   ADDC   Rfs,Rfrac       fixed-point fraction, carry out
+		 *   ADDC   Ris,Rsrc        source pointer + carry
+		 *   SHLL   Rt              index *= 2  (writes T, dead: DT follows)
+		 *   MOV.W  @(R0,Rt),Rt     colormap lookup
+		 *   DT     Rcnt            count--, T = (count == 0)
+		 *   MOV.W  Rt,@Rdst        pixel store
+		 *   BFS    back
+		 *   ADD    Rstride,Rdst    delay slot: next scanline
+		 *
+		 * Matched structurally -- opcode forms plus register agreement,
+		 * never an address -- so it fits any build of this renderer
+		 * rather than one cart. The register numbers are read out of the
+		 * matched opcodes, not assumed.
+		 *
+		 * Entry state is: the body of the current iteration has run, T is
+		 * DT's result, and the delay slot has NOT. Each folded iteration
+		 * therefore replays [delay slot of the previous] + [one body],
+		 * which leaves exactly that same shape behind -- so the
+		 * interpreter resumes on the real BFS with nothing to fix up.
+		 *
+		 * Every access goes through RB/RW/WW, the interpreter's own
+		 * macros, so the bytes and the side effects are identical; the
+		 * framebuffer and audio hashes are the gate. GNW_NO_TEXCOL_HLE
+		 * disables it for A/B. */
+		if (target + 14 == bfs_at) {
+			UINT32 b0 = (UINT32)(UINT16)RW(sh2, target);
+			UINT32 b1 = (UINT32)(UINT16)RW(sh2, target + 2);
+			UINT32 b2 = (UINT32)(UINT16)RW(sh2, target + 4);
+			UINT32 b3 = (UINT32)(UINT16)RW(sh2, target + 6);
+			UINT32 b4 = (UINT32)(UINT16)RW(sh2, target + 8);
+			UINT32 b5 = (UINT32)(UINT16)RW(sh2, target + 10);
+			UINT32 b6 = (UINT32)(UINT16)RW(sh2, target + 12);
+			UINT32 ds = (UINT32)(UINT16)RW(sh2, bfs_at + 2);
+			int rt   = (b0 >> 8) & 0xf, rsrc = (b0 >> 4) & 0xf;
+			int rfrac= (b1 >> 8) & 0xf, rfs  = (b1 >> 4) & 0xf;
+			int ris  = (b2 >> 4) & 0xf;
+			int rcnt = (b5 >> 8) & 0xf;
+			int rdst = (b6 >> 8) & 0xf, rstr = (ds >> 4) & 0xf;
+
+			if ((b0 & 0xf00f) == 0x6000		/* MOV.B @Rsrc,Rt  */
+			 && (b1 & 0xf00f) == 0x300e		/* ADDC Rfs,Rfrac  */
+			 && (b2 & 0xf00f) == 0x300e		/* ADDC Ris,Rsrc   */
+			 && ((b2 >> 8) & 0xf) == rsrc
+			 && (b3 & 0xf0ff) == 0x4000		/* SHLL Rt         */
+			 && ((b3 >> 8) & 0xf) == rt
+			 && (b4 & 0xf00f) == 0x000d		/* MOV.W @(R0,Rt),Rt */
+			 && ((b4 >> 8) & 0xf) == rt && ((b4 >> 4) & 0xf) == rt
+			 && (b5 & 0xf0ff) == 0x4010		/* DT Rcnt         */
+			 && (b6 & 0xf00f) == 0x2001		/* MOV.W Rt,@Rdst  */
+			 && ((b6 >> 4) & 0xf) == rt
+			 && (ds & 0xf00f) == 0x300c		/* ADD Rstride,Rdst */
+			 && ((ds >> 8) & 0xf) == rdst) {
+				/* 7 body insns + BFS taken + delay slot, on the
+				 * same convention the single-insn case above uses
+				 * (1 body insn there costs 5). */
+				const int iter_cost = 11;
+
+				if (sh2->t_flag)	/* BFS not taken: loop is ending */
+					return;
+				/* Call the interpreter's OWN op functions, in
+				 * order, rather than reimplementing them. sh2.c
+				 * is included above this point, so they are in
+				 * scope -- and that is the difference between
+				 * "should be identical" and "is". Reimplementing
+				 * would have to reproduce ADDC's exact carry
+				 * form, SHLL writing T, DT also setting
+				 * no_polling, and every op's sh2->ea update, any
+				 * one of which is a silent divergence. */
+				while (sh2->icount >= iter_cost && sh2->r[rcnt] >= 2) {
+					ADD(sh2, rstr, rdst);	/* delay slot   */
+					MOVBL(sh2, rsrc, rt);	/* texel        */
+					ADDC(sh2, rfs, rfrac);	/* frac + carry */
+					ADDC(sh2, ris, rsrc);	/* src  + carry */
+					SHLL(sh2, rt);		/* index *= 2   */
+					MOVWL0(sh2, rt, rt);	/* colormap     */
+					DT(sh2, rcnt);		/* count--, T   */
+					MOVWS(sh2, rt, rdst);	/* pixel store  */
+
+					sh2->icount -= iter_cost;
+					if (sh2->t_flag)	/* loop ends here */
+						return;
+				}
+				return;
+			}
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
+#endif
 		if (target + 2 != bfs_at) {		/* exactly 1 body insn */
 			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
 			return;
