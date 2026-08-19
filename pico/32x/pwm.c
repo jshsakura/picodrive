@@ -209,6 +209,18 @@ void p32x_pwm_write16(u32 a, unsigned int d, SH2 *sh2, unsigned int m68k_cycles)
   unsigned short *fifo;
   int idx;
 
+#ifdef RIG_PWM_TRACE
+  /* throwaway A/B probe: log every MONO FIFO write to diff the guest's
+   * sample stream against the HLE one (audio-hash gate forensics) */
+  extern void lprintf(const char *fmt, ...);
+  if ((a & 0x3e) == 0x38) {
+    static int pwm_trace_n;
+    if (pwm_trace_n < (1 << 20))
+      lprintf("[pwmt] %d %04x %u %d%d\n", pwm_trace_n++, d & 0xffff, m68k_cycles,
+              Pico32x.pwm_p[0], Pico32x.pwm_p[1]);
+  }
+#endif
+
   elprintf(EL_PWM, "pwm: %u: w16 %02x %04x (p %d %d)",
     m68k_cycles, a & 0x0e, d, Pico32x.pwm_p[0], Pico32x.pwm_p[1]);
 
