@@ -1175,6 +1175,98 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
 			return;
 		}
+
+		/* Span loop (R_DrawSpan): eleven body instructions, the second
+		 * of Doom's two renderer inner loops and ~17.9% of guest master
+		 * instructions on its own. Two fixed-point coordinates are
+		 * combined into a texture offset with SWAP.W + masks + OR, the
+		 * texel goes through the colormap, and the pixel is stored with a
+		 * PRE-DECREMENT -- the span is written right to left.
+		 *
+		 *   SWAP.W Rq,Racc          ADD    Rs1,Rq
+		 *   AND    Rk1,Racc         ADD    Rs2,Rp
+		 *   AND    Rk2,Rtmp         SHLL   Racc
+		 *   OR     Rtmp,Racc        MOV.W  @(R0,Rc),Racc
+		 *   MOV.B  @(R0,Rb),Racc    DT     Rcnt
+		 *                           MOV.W  Racc,@-Rdst
+		 *   BFS back / SWAP.W Rp,Rtmp in the delay slot
+		 *
+		 * Written out straight rather than through a general folder.
+		 * A general version was built and measured first: it identified
+		 * both loops correctly and still came out SLOWER than this one
+		 * loop alone (12,797,823 against 12,560,257), because a per-op
+		 * dispatch inside the fold costs more than it saves. Zero
+		 * dispatch is the whole point. */
+		if (target + 22 == bfs_at) {
+			UINT32 b0 = (UINT32)(UINT16)RW(sh2, target);
+			UINT32 b1 = (UINT32)(UINT16)RW(sh2, target + 2);
+			UINT32 b2 = (UINT32)(UINT16)RW(sh2, target + 4);
+			UINT32 b3 = (UINT32)(UINT16)RW(sh2, target + 6);
+			UINT32 b4 = (UINT32)(UINT16)RW(sh2, target + 8);
+			UINT32 b5 = (UINT32)(UINT16)RW(sh2, target + 10);
+			UINT32 b6 = (UINT32)(UINT16)RW(sh2, target + 12);
+			UINT32 b7 = (UINT32)(UINT16)RW(sh2, target + 14);
+			UINT32 b8 = (UINT32)(UINT16)RW(sh2, target + 16);
+			UINT32 b9 = (UINT32)(UINT16)RW(sh2, target + 18);
+			UINT32 b10 = (UINT32)(UINT16)RW(sh2, target + 20);
+			UINT32 ds = (UINT32)(UINT16)RW(sh2, bfs_at + 2);
+			int acc = (b0 >> 8) & 0xf, q   = (b0 >> 4) & 0xf;
+			int k1  = (b1 >> 4) & 0xf;
+			int tmp = (b2 >> 8) & 0xf, k2  = (b2 >> 4) & 0xf;
+			int b_  = (b4 >> 4) & 0xf;
+			int s1  = (b5 >> 4) & 0xf;
+			int p   = (b6 >> 8) & 0xf, s2  = (b6 >> 4) & 0xf;
+			int c   = (b8 >> 4) & 0xf;
+			int cnt = (b9 >> 8) & 0xf;
+			int dst = (b10 >> 8) & 0xf;
+
+			if ((b0 & 0xf00f) == 0x6009			/* SWAP.W Rq,Racc   */
+			 && (b1 & 0xf00f) == 0x2009			/* AND Rk1,Racc     */
+			 && ((b1 >> 8) & 0xf) == acc
+			 && (b2 & 0xf00f) == 0x2009			/* AND Rk2,Rtmp     */
+			 && (b3 & 0xf00f) == 0x200b			/* OR Rtmp,Racc     */
+			 && ((b3 >> 8) & 0xf) == acc && ((b3 >> 4) & 0xf) == tmp
+			 && (b4 & 0xf00f) == 0x000c			/* MOV.B @(R0,Rb),Racc */
+			 && ((b4 >> 8) & 0xf) == acc
+			 && (b5 & 0xf00f) == 0x300c			/* ADD Rs1,Rq       */
+			 && ((b5 >> 8) & 0xf) == q
+			 && (b6 & 0xf00f) == 0x300c			/* ADD Rs2,Rp       */
+			 && (b7 & 0xf0ff) == 0x4000			/* SHLL Racc        */
+			 && ((b7 >> 8) & 0xf) == acc
+			 && (b8 & 0xf00f) == 0x000d			/* MOV.W @(R0,Rc),Racc */
+			 && ((b8 >> 8) & 0xf) == acc
+			 && (b9 & 0xf0ff) == 0x4010			/* DT Rcnt          */
+			 && (b10 & 0xf00f) == 0x2005			/* MOV.W Racc,@-Rdst */
+			 && ((b10 >> 4) & 0xf) == acc
+			 && (ds & 0xf00f) == 0x6009			/* SWAP.W Rp,Rtmp   */
+			 && ((ds >> 8) & 0xf) == tmp && ((ds >> 4) & 0xf) == p) {
+				const int iter_cost = 15;	/* 11 body + BFS + delay */
+
+				if (sh2->t_flag)
+					return;
+				while (sh2->icount >= iter_cost && sh2->r[cnt] >= 2) {
+					SWAPW(sh2, p, tmp);	/* delay slot */
+					SWAPW(sh2, q, acc);
+					AND(sh2, k1, acc);
+					AND(sh2, k2, tmp);
+					OR(sh2, tmp, acc);
+					MOVBL0(sh2, b_, acc);
+					ADD(sh2, s1, q);
+					ADD(sh2, s2, p);
+					SHLL(sh2, acc);
+					MOVWL0(sh2, c, acc);
+					DT(sh2, cnt);
+					MOVWM(sh2, acc, dst);
+
+					sh2->icount -= iter_cost;
+					if (sh2->t_flag)
+						return;
+				}
+				return;
+			}
+			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
+			return;
+		}
 #endif
 		if (target + 2 != bfs_at) {		/* exactly 1 body insn */
 			*GNW_DL_REJ_SLOT(sh2) = sh2->ppc;
