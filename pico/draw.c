@@ -334,6 +334,92 @@ TileFlipMakerAS(TileFlipSH_AS_and, pix_sh_as_and)
   }									\
 }
 
+#ifdef GNW_32X_CORE
+/* Blank nametable-row cache (GNW only). Doom's 3D view leaves both plane
+ * name tables blank; DrawLayer re-walks the same 40-entry row for all 8
+ * lines of a tile row. Cached verdict: "this whole row points only at
+ * all-zero tiles". Invalidated by gnw_rowcache_gen, bumped at every VRAM
+ * mutation site (VideoWriteVRAM, VideoWriteVRAM128, DmaCopy, DmaFill);
+ * one missed site means a stale blank row, and the fb hash only catches
+ * that on scenes which exercise it. Keyed by the row address ts->nametab
+ * (plane base + row offset), so vertical scroll changes the key, not the
+ * verdict. Deliberately NOT applied to the VSRam strips: those move
+ * nametab per cell, so no fixed row key exists. Small by design: the
+ * MD32X overlay BSS is flush against __RAM_EMU_END__; 4 direct-mapped
+ * slots still hold both planes' current rows (a miss costs one re-scan
+ * per row change, ~2x30 times per frame). */
+u32 gnw_rowcache_gen;
+struct gnw_rowcache_ent { u32 nametab; u32 gen; u8 blank; u8 any_lo; };
+static struct gnw_rowcache_ent gnw_rowcache[4];
+
+/* verdict over the whole row (xmask+1 cells). A code's tile must be zero
+ * across every word DrawTile can reach at any line within the row:
+ * words base..base+(ymask<<1)+1, base=((code<<yshift)&0x7ff0) — flips
+ * only permute addresses inside that same span. any_lo reports whether
+ * any cell is low-priority (the LF_LPRIO side effect must be replayed
+ * when the strip is skipped; computed over the full row, matching the
+ * 0818 handoff spec). */
+static int gnw_rowcache_lookup(u32 nametab, u32 xmask, int yshift, int ymask,
+    u8 *any_lo_p)
+{
+  struct gnw_rowcache_ent *e = &gnw_rowcache[(nametab >> 4) & 3];
+  u32 n = xmask + 1, i, code = ~0u;
+  u8 any_lo = 0;
+
+  if (e->nametab == nametab && e->gen == gnw_rowcache_gen) {
+    *any_lo_p = e->any_lo;
+    return e->blank;
+  }
+
+  e->blank = 1;
+  for (i = 0; i < n; i++) {
+    u32 c = PicoMem.vram[nametab + i];
+    if (!(c & 0x8000)) any_lo = 1;
+    if (c == code) continue;
+    code = c;
+    {
+      u32 base = (code << yshift) & 0x7ff0;
+      u32 *tile = (u32 *)(PicoMem.vram + base);
+      u32 w, nw = (ymask << 1) + 2;
+      for (w = 0; w < nw >> 1; w++)
+        if (tile[w]) { e->blank = 0; break; }
+      if (!e->blank) break;
+    }
+  }
+  e->nametab = nametab;
+  e->gen = gnw_rowcache_gen;
+  e->any_lo = any_lo;
+  *any_lo_p = any_lo;
+  return e->blank;
+}
+
+/* Strip-level fast path, called from DrawStripMaker. Whole row blank and
+ * no shadow: the strip would draw nothing. Replay its only remaining
+ * side effects — LF_LPRIO (a low-prio cell's first occurrence always
+ * enters DrawTile), the hcache terminator, and the plane-hi-prio hint —
+ * then tell the caller to return. Returns 0 when the strip must run. */
+static int gnw_rowcache_strip_skip(const struct TileStrip *ts, int lflags,
+    int yshift, int ymask, u32 *hc)
+{
+  u8 any_lo;
+  if ((lflags & LF_SH) != 0) return 0;
+  if (!gnw_rowcache_lookup(ts->nametab, ts->xmask, yshift, ymask, &any_lo))
+    return 0;
+  if (any_lo) lflags |= LF_LPRIO;
+  *hc = 0;
+  if ((lflags & (LF_LINE|LF_LPRIO)) == LF_LINE)
+    Pico.est.rendstatus |= PDRAW_PLANE_HI_PRIO;
+  return 1;
+}
+#else
+static __inline int gnw_rowcache_strip_skip(const struct TileStrip *ts,
+    int lflags, int yshift, int ymask, u32 *hc)
+{
+  (void)ts; (void)lflags; (void)yshift; (void)ymask; (void)hc;
+  return 0;
+}
+#endif
+
 #define DrawStripMaker(funcname,yshift,ymask,hpcode,drawtile,cache)	\
 void funcname(struct TileStrip *ts, int lflags, int cellskip)		\
 {									\
@@ -351,6 +437,7 @@ void funcname(struct TileStrip *ts, int lflags, int cellskip)		\
   cells = ts->cells - cellskip;						\
   dx+=cellskip<<3;							\
 									\
+  if (gnw_rowcache_strip_skip(ts, lflags, yshift, ymask, hc)) return;	\
 /*  int force = (plane_sh&LF_FORCE) << 13; */				\
   if (dx & 7) {								\
     code = PicoMem.vram[ts->nametab + (tilex & ts->xmask)];		\
