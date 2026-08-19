@@ -1491,6 +1491,29 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 #define GNW_FASTLOOP_GATE_A(sh2, opcode, direct) do { } while (0)
 #endif
 
+/* RIG_OPHIST: which SH-2 opcode groups the frame is actually made of.
+ *
+ * Dispatch-shape questions -- is a flatter table worth it, which op body is
+ * worth hand-tuning -- need the distribution, not a guess. The first answer it
+ * gave closed a lever rather than opening one: on Doom gameplay msh2 spends
+ * 12.08% of its dispatched instructions in the 0x00xx group, of which 64.7% is
+ * NOP (7.8% of everything) and 28.0% is RTS -- and short-circuiting NOP ahead
+ * of op0000's second-level switch was worth 0.10%, i.e. nothing. gcc's jump
+ * table for that switch is already cheap.
+ *
+ * Rig-only; off => no code emitted. */
+#ifdef RIG_OPHIST
+unsigned int rig_ophist[2][256];
+unsigned int rig_ophist_lo0[2][256];   /* low byte of the 0x00xx group */
+#define RIG_OPHIST_TICK(sh2, op) do {                                        \
+	int c_ = (sh2)->is_slave & 1;                                        \
+	rig_ophist[c_][((op) >> 8) & 0xff]++;                                \
+	if ((((op) >> 8) & 0xff) == 0) rig_ophist_lo0[c_][(op) & 0xff]++;    \
+} while (0)
+#else
+#define RIG_OPHIST_TICK(sh2, op) ((void)0)
+#endif
+
 int sh2_execute_interpreter(SH2 *sh2, int cycles)
 {
 	UINT32 opcode;
@@ -1560,6 +1583,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		}
 
 		RIG_SH2_TICK();
+		RIG_OPHIST_TICK(sh2, opcode);
 		GNW_SH2_INSN_TICK(sh2);
 		GNW_PCWALL_TICK(sh2);
 		RIG_PC_HIST_TICK(sh2, rig_is_delay, (unsigned short)opcode);
