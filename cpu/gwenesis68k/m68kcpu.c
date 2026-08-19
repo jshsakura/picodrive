@@ -406,14 +406,19 @@ static void __attribute__((noinline)) gnw_m68k_sample(unsigned int pc)
 #ifdef GNW_M68K_IDLE_FOLD
 extern int SekIsIdleCode(unsigned short *dst, int bytes);
 
-/* Four slots of four bytes, and not one byte more: this lives in the md32x
- * overlay's BSS, which has had 44 bytes of headroom (see 32X_CLOSED.md). A
- * struct-per-slot version cost 260 B and failed the link outright.
+/* Two slots of four bytes, and not one byte more: this lives in the md32x
+ * overlay's BSS, whose measured headroom is **12 bytes**
+ * (_OVERLAY_MD32X_BSS_END = 0x240ffff4 against __RAM_EMU_END__ = 0x24100000,
+ * read out of the ELF -- the build log does not print it). A struct-per-slot
+ * version cost 260 B and failed the link outright; four slots at 16 B failed
+ * it too, by four bytes.
  *
  * 68K instructions are word-aligned, so a branch target's bit 0 is always
  * zero and is free to carry the verdict. Slot 0 means "nothing cached here".
- * A miss only costs a re-probe, never correctness. */
-#define GNW_M68K_IDLE_SLOTS 4
+ * A miss only costs a re-probe, never correctness -- and the census that
+ * motivated this fold found Doom's spin to be a single site, so two slots is
+ * not the compromise it looks like. */
+#define GNW_M68K_IDLE_SLOTS 2
 static unsigned int gnw_m68k_idle_cache[GNW_M68K_IDLE_SLOTS];
 
 static int __attribute__((noinline)) gnw_m68k_idle_probe(unsigned int target,
