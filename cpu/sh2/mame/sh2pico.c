@@ -1483,10 +1483,20 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		 * Strictly a superset test: everything the old condition
 		 * accepted still reaches it, so behaviour is identical and the
 		 * framebuffer and audio hashes must not move. */
+		/* Gate on the SAME top nibble the dispatch below switches on.
+		 * Both candidate families live in 0x8xxx and 0xaxxx, and the
+		 * switch already needs opcode >> 12, so asking there costs one
+		 * compare instead of a masked compare against a constant gcc
+		 * was hoisting into a register of its own. Freeing that
+		 * register matters more than the instruction: with the fetch
+		 * window holding one and the gate constant another, gcc had
+		 * started spilling the opcode to the stack and reloading it
+		 * two instructions later, which is two more memory operations
+		 * on every dispatched instruction. */
 #ifdef GNW_NO_FASTLOOP_NIBBLE_GATE
 		if ((((opcode & 0xf980) == 0x8980) || opcode == 0xaffe)
 #else
-		if ((opcode & 0xd000) == 0x8000
+		if (((opcode >> 12) == 8 || (opcode >> 12) == 0xa)
 		    && (((opcode & 0xf980) == 0x8980) || opcode == 0xaffe)
 #endif
 		    && gnw_direct && *GNW_DL_REJ_SLOT(sh2) != sh2->ppc
