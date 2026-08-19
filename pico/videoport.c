@@ -12,10 +12,6 @@
 #define NEED_DMA_SOURCE
 #include "memory.h"
 
-#ifdef GNW_32X_CORE
-extern u32 gnw_rowcache_gen; /* defined in draw.c, bumped at every VRAM mutation */
-#endif
-
 
 enum { clkdiv = 2 };    // CPU clock granularity: one of 1,2,4,8
 
@@ -461,9 +457,6 @@ static NOINLINE void VideoWriteVRAM128(u32 a, u16 d)
   // nasty
   u32 b = ((a & 2) >> 1) | ((a & 0x400) >> 9) | (a & 0x3FC) | ((a & 0x1F800) >> 1);
 
-#ifdef GNW_32X_CORE
-  gnw_rowcache_gen++; /* blank-row cache invalidation, see pico_int.h */
-#endif
   ((u8 *)PicoMem.vram)[b] = d;
   if (!(u16)((b^SATaddr) & SATmask))
     Pico.est.rendstatus |= PDRAW_DIRTY_SPRITES;
@@ -689,9 +682,6 @@ static void DmaCopy(int len)
   u8 inc = pvid->reg[0xf];
   int source;
   elprintf(EL_VDPDMA, "DmaCopy len %i [%u]", len, SekCyclesDone());
-#ifdef GNW_32X_CORE
-  gnw_rowcache_gen++; /* blank-row cache invalidation, see pico_int.h */
-#endif
 
   // XXX implement VRAM 128k? Is this even working? xfer/count still in bytes?
   SekCyclesBurnRun(PicoVideoFIFOWrite(2*len, FQ_BGDMA, // 2 slots each (rd+wr)
@@ -725,9 +715,6 @@ static NOINLINE void DmaFill(int data)
 
   len = GetDmaLength();
   elprintf(EL_VDPDMA, "DmaFill len %i inc %i [%u]", len, inc, SekCyclesDone());
-#ifdef GNW_32X_CORE
-  gnw_rowcache_gen++; /* covers the memset fast path below too */
-#endif
 
   SekCyclesBurnRun(PicoVideoFIFOWrite(len, FQ_BGDMA, // 1 slot each (wr)
                               PVS_CPUWR | PVS_DMAFILL, SR_DMA | PVS_DMABG));

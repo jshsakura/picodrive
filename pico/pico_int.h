@@ -1014,13 +1014,6 @@ static __inline void UpdateSAT(u32 a, u32 d)
 }
 static __inline void VideoWriteVRAM(u32 a, u16 d)
 {
-#ifdef GNW_32X_CORE
-  /* invalidates the blank nametable-row cache (draw.c); one missed VRAM
-   * mutation site means a stale blank row, and the fb hash only catches
-   * that on scenes which exercise it */
-  extern u32 gnw_rowcache_gen;
-  gnw_rowcache_gen++;
-#endif
   PicoMem.vram [(u16)a >> 1] = d;
 
   if (((a^SATaddr) & SATmask) == 0)
