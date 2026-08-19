@@ -406,31 +406,36 @@ static void __attribute__((noinline)) gnw_m68k_sample(unsigned int pc)
 #ifdef GNW_M68K_IDLE_FOLD
 extern int SekIsIdleCode(unsigned short *dst, int bytes);
 
-#define GNW_M68K_IDLE_SLOTS 32
-static struct gnw_idle_slot { unsigned int at; signed char verdict; }
-	gnw_m68k_idle_cache[GNW_M68K_IDLE_SLOTS];
-unsigned int gnw_m68k_idle_stops;      /* diagnostic counter */
+/* Four slots of four bytes, and not one byte more: this lives in the md32x
+ * overlay's BSS, which has had 44 bytes of headroom (see 32X_CLOSED.md). A
+ * struct-per-slot version cost 260 B and failed the link outright.
+ *
+ * 68K instructions are word-aligned, so a branch target's bit 0 is always
+ * zero and is free to carry the verdict. Slot 0 means "nothing cached here".
+ * A miss only costs a re-probe, never correctness. */
+#define GNW_M68K_IDLE_SLOTS 4
+static unsigned int gnw_m68k_idle_cache[GNW_M68K_IDLE_SLOTS];
 
 static int __attribute__((noinline)) gnw_m68k_idle_probe(unsigned int target,
                                                          int bytes)
 {
-	struct gnw_idle_slot *sl_ =
+	unsigned int *sl_ =
 		&gnw_m68k_idle_cache[(target >> 1) & (GNW_M68K_IDLE_SLOTS - 1)];
 	unsigned short body[6];
-	int i, n;
+	int i, n, ok;
 
-	if (sl_->at == target)
-		return sl_->verdict;
+	if ((*sl_ & ~1u) == target && *sl_ != 0)
+		return (int)(*sl_ & 1u);
 
-	sl_->at = target;
-	sl_->verdict = 0;
-	if (bytes < 2 || bytes > 12 || (bytes & 1))
-		return 0;
-	n = bytes >> 1;
-	for (i = 0; i < n; i++)
-		body[i] = (unsigned short)m68ki_read_16(target + i * 2);
-	sl_->verdict = SekIsIdleCode(body, bytes) ? 1 : 0;
-	return sl_->verdict;
+	ok = 0;
+	if (bytes >= 2 && bytes <= 12 && !(bytes & 1)) {
+		n = bytes >> 1;
+		for (i = 0; i < n; i++)
+			body[i] = (unsigned short)m68ki_read_16(target + i * 2);
+		ok = SekIsIdleCode(body, bytes) ? 1 : 0;
+	}
+	*sl_ = (target & ~1u) | (unsigned)ok;
+	return ok;
 }
 #endif
 
@@ -543,7 +548,6 @@ void m68k_run(unsigned int cycles)
 #ifdef GNW_M68K_IDLE_FOLD
     if (gnw_br_pc && REG_PC < gnw_br_pc && FLAG_INT_MASK < 0x0600
         && gnw_m68k_idle_probe(REG_PC, (int)(gnw_br_pc - 2 - REG_PC))) {
-      gnw_m68k_idle_stops++;
       /* Set the stop flag and leave; do NOT go through SekSetStop, whose
        * SekEndRun rebases Pico.t.m68c_cnt. Rebasing rewinds the master clock
        * by the unspent cycles, which moves every sound sync point downstream
