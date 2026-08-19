@@ -1523,6 +1523,56 @@ INLINE void SHAR(sh2_state *sh2, UINT32 n)
 {
 	sh2->t_flag = (sh2->r[n] & T);
 	sh2->r[n] = (UINT32)((INT32)sh2->r[n] >> 1);
+
+#ifndef GNW_NO_SHAR_RUN
+	/* Fold a run of identical SHAR Rn into one shift.
+	 *
+	 * Doom 32X compiles a variable arithmetic shift as a LADDER of SHAR Rn
+	 * ending in RTS, entered part-way down according to how far to shift.
+	 * With the two renderer loops HLE'd it is the hottest thing left in the
+	 * guest BY COUNT: 0x0204e5c6..0x0204e5e4 is fourteen SHAR R4 plus RTS,
+	 * and its top sixteen PCs are 10.76% of dispatched guest instructions.
+	 * (Call counts differ per entry -- 28,142 at 0x0204e5c6 against 35,162
+	 * at 0x0204e5d6 -- which is what shows these are separate entry points
+	 * into one ladder.)
+	 *
+	 * The check costs nothing on any other instruction because it lives
+	 * inside SHAR, and SHAR is where the work is. That is the distinction
+	 * the "a test that skips work loses on this chip" rule turns on: not a
+	 * check added to the common path, a check on the path that dominates.
+	 *
+	 * Exactness: k successive SHARs are one arithmetic shift by k, and the T
+	 * each writes is dead but the last -- nothing in the ladder reads T --
+	 * so T must end as the bit the LAST shift ejected, bit (k-1) of the
+	 * pre-run value. icount is charged per folded instruction and the fold
+	 * stops at the slice boundary, so cycle accounting is unchanged, and pc
+	 * lands exactly where the skipped instructions would have left it.
+	 *
+	 * Worth its own note: this is 10.76% of guest instructions and only
+	 * -2.15% of frame cost, because SHAR touches no memory. In this
+	 * interpreter an instruction's share of the COUNT says very little about
+	 * its share of the COST -- the two renderer loops were 20.3% and 17.9%
+	 * of count for -7.37% and -9.88% of cost. Choose fold targets by memory
+	 * traffic, not by histogram rank.
+	 *
+	 * GNW_NO_SHAR_RUN disables it. */
+	{
+		const UINT16 self = (UINT16)(0x4021 | (n << 8));	/* SHAR Rn */
+		UINT32 pc = sh2->pc;
+		int k = 0;
+
+		while (sh2->icount > k + 1
+		       && (UINT16)RW(sh2, pc + k * 2) == self)
+			k++;
+		if (k > 0) {
+			UINT32 v = sh2->r[n];
+			sh2->t_flag = ((v >> (k - 1)) & T);
+			sh2->r[n] = (UINT32)((INT32)v >> k);
+			sh2->pc = pc + k * 2;
+			sh2->icount -= k;
+		}
+	}
+#endif
 }
 
 /*  SHLL    Rn      (same as SHAL) */
