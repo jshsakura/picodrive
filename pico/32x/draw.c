@@ -123,6 +123,11 @@ static void convert_pal555(int invert_prio)
 #else
 #define GNW_PP_QUAD 1
 #endif
+#if defined(GNW_PP_NO_OCTA) || defined(GNW_PP_NO_QUAD)
+#define GNW_PP_OCTA 0
+#else
+#define GNW_PP_OCTA 1
+#endif
 
 #define do_line_pp(pd, p32x, pmd, pmd_draw_code)                  \
 {                                                                 \
@@ -221,6 +226,29 @@ static void convert_pal555(int invert_prio)
        * three pointers being aligned, which is the common case;  \
        * anything else falls through to the pair path unchanged.  \
        * GNW_PP_NO_QUAD prices it. */                             \
+      /* Eight at a time, same test twice over. The quad path measures     \
+       * 3.0% of the frame on the rig -- and the rig UNDER-prices wide      \
+       * stores, having no cache or write buffer (2026-08-20: it called     \
+       * removing the solid-run detector a 0.48% gain and the device        \
+       * charged 2.95%). So the octa path is deliberately built for the     \
+       * device to judge, not the rig. -DGNW_PP_NO_OCTA prices it. */       \
+      if (GNW_PP_OCTA && i >= 8                                   \
+          && !(((uintptr_t)pmd | (uintptr_t)pd) & 3)              \
+          && !((uintptr_t)(p32x) & 1)                             \
+          && (((u32 *)pmd)[0] & 0x3f3f3f3fu) == mdbg4             \
+          && (((u32 *)pmd)[1] & 0x3f3f3f3fu) == mdbg4) {          \
+        u32 q0 = ((u32 *)(p32x))[0], q1 = ((u32 *)(p32x))[1];     \
+        u16 b0 = pal[(q0 >>  8) & 0xff], b1 = pal[q0 & 0xff];     \
+        u16 b2 = pal[(q0 >> 24) & 0xff], b3 = pal[(q0 >> 16) & 0xff]; \
+        u16 b4 = pal[(q1 >>  8) & 0xff], b5 = pal[q1 & 0xff];     \
+        u16 b6 = pal[(q1 >> 24) & 0xff], b7 = pal[(q1 >> 16) & 0xff]; \
+        ((u32 *)pd)[0] = (u32)b0 | ((u32)b1 << 16);               \
+        ((u32 *)pd)[1] = (u32)b2 | ((u32)b3 << 16);               \
+        ((u32 *)pd)[2] = (u32)b4 | ((u32)b5 << 16);               \
+        ((u32 *)pd)[3] = (u32)b6 | ((u32)b7 << 16);               \
+        pd += 8; pmd += 8; p32x += 8; i -= 8;                     \
+        continue;                                                 \
+      }                                                           \
       if (GNW_PP_QUAD && i >= 4                                   \
           && !(((uintptr_t)pmd | (uintptr_t)pd) & 3)              \
           && !((uintptr_t)(p32x) & 1)                             \
