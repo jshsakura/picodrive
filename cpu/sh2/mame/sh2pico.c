@@ -3,6 +3,28 @@
 #ifdef DRC_CMP
 #include "../compiler.h"
 #define BUSY_LOOP_HACKS 0
+#elif defined(GNW_32X_CORE) && !defined(GNW_KEEP_BUSY_LOOP_HACKS)
+/* BUSY_LOOP_HACKS is DEAD CODE in this dispatch loop, and it is not free.
+ *
+ * Both blocks (mame/sh2.c BRA and DT) do
+ *     next_opcode = RW(sh2, sh2->ppc & AM)
+ * and compare it against the opcode they expect to FOLLOW them -- 0x0009 (NOP)
+ * after BRA, 0x8bfd (BF $-2) after DT. But sh2->ppc in this loop is the
+ * EXECUTING instruction's own address, not the next one, so what comes back is
+ * the BRA/DT opcode itself. 0xaffe != 0x0009 and 0x4n10 != 0x8bfd: neither
+ * comparison can ever be true. sh2pico.c's own fastloop comment already says
+ * so ("inert here").
+ *
+ * Inert, but it still issues a guest 16-bit read on EVERY dispatched DT and
+ * EVERY dispatched BRA -- and DT is the counter of the countdown loops this
+ * core spends its time in. Compiling it out removes a whole guest read from
+ * two hot op bodies and changes nothing a hash can see; the read has no side
+ * effects here (guest PCs are cart ROM or SDRAM, both of which take RW's
+ * inline fast path, so no handler, no poll detect, no icount charge).
+ *
+ * Only for GNW_32X_CORE: upstream builds keep the upstream behaviour.
+ * -DGNW_KEEP_BUSY_LOOP_HACKS restores it for an A/B. */
+#define BUSY_LOOP_HACKS 0
 #else
 #define BUSY_LOOP_HACKS 1
 #endif
@@ -1389,6 +1411,41 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 
 #endif /* GNW_SH2_FASTLOOPS */
 
+/* The fastloop gate, moved OFF the per-instruction path (2026-08-20).
+ *
+ * It used to run ahead of the dispatch switch: `bic r0, nibble, #2; cmp r0, #8;
+ * bne` on EVERY dispatched guest instruction, to find candidates that by
+ * construction live only in the 0x8xxx and 0xaxxx nibbles -- the same two
+ * values the switch below is already about to branch on. Asking the question
+ * twice is what cost the three instructions. Inside the case labels the top
+ * nibble is known, so the test that remains is the part the nibble does not
+ * already answer:
+ *
+ *   case 0x8: (opcode & 0xf980) == 0x8980  ->  (opcode & 0x0980) == 0x0980
+ *   case 0xA: opcode == 0xaffe             ->  unchanged, one compare
+ *
+ * Semantics are identical: the gate still runs BEFORE the operation executes,
+ * and gnw_sh2_fastloop still leaves the final iteration to be interpreted for
+ * real by the op body that follows it. Build -DGNW_FASTLOOP_GATE_IN_LOOP to
+ * restore the old shape for an A/B. */
+#if defined(GNW_SH2_FASTLOOPS) && !defined(GNW_FASTLOOP_GATE_IN_LOOP)
+#define GNW_FASTLOOP_GATE_8(sh2, opcode, direct) do {                        \
+	if (((opcode) & 0x0980) == 0x0980 && (direct)                        \
+	    && *GNW_DL_REJ_SLOT(sh2) != (sh2)->ppc                           \
+	    && !(sh2)->test_irq && gnw_sh2_fastloops)                        \
+		gnw_sh2_fastloop((sh2), (opcode));                           \
+} while (0)
+#define GNW_FASTLOOP_GATE_A(sh2, opcode, direct) do {                        \
+	if ((opcode) == 0xaffe && (direct)                                   \
+	    && *GNW_DL_REJ_SLOT(sh2) != (sh2)->ppc                           \
+	    && !(sh2)->test_irq && gnw_sh2_fastloops)                        \
+		gnw_sh2_fastloop((sh2), (opcode));                           \
+} while (0)
+#else
+#define GNW_FASTLOOP_GATE_8(sh2, opcode, direct) do { } while (0)
+#define GNW_FASTLOOP_GATE_A(sh2, opcode, direct) do { } while (0)
+#endif
+
 int sh2_execute_interpreter(SH2 *sh2, int cycles)
 {
 	UINT32 opcode;
@@ -1426,7 +1483,14 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 				opcode = 9; // NOP
 			}
 
-			sh2->pc -= 2;
+			/* `sh2->pc -= 2` here and `sh2->pc += 2` after the
+			 * if/else cancelled exactly; the round trip is gone and
+			 * pc is now advanced only where it actually advances.
+			 * Clearing delay moved in here too -- the else arm is
+			 * reached only when delay is already 0, so that store
+			 * was writing a zero over a zero on every ordinary
+			 * instruction. */
+			sh2->delay = 0;
 #ifdef GNW_SH2_FASTLOOPS
 			gnw_direct = 0;
 #endif
@@ -1436,8 +1500,10 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		}
 		else
 		{
-			sh2->ppc = sh2->pc;
-			GNW_FETCH(sh2, sh2->pc, opcode);
+			UINT32 cur_pc = sh2->pc;
+			sh2->ppc = cur_pc;
+			GNW_FETCH(sh2, cur_pc, opcode);
+			sh2->pc = cur_pc + 2;
 #ifdef GNW_SH2_FASTLOOPS
 			gnw_direct = 1;
 #endif
@@ -1446,8 +1512,6 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 #endif
 		}
 
-		sh2->delay = 0;
-		sh2->pc += 2;
 		RIG_SH2_TICK();
 		GNW_SH2_INSN_TICK(sh2);
 		GNW_PCWALL_TICK(sh2);
@@ -1493,15 +1557,15 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		 * started spilling the opcode to the stack and reloading it
 		 * two instructions later, which is two more memory operations
 		 * on every dispatched instruction. */
-#ifdef GNW_NO_FASTLOOP_NIBBLE_GATE
-		if ((((opcode & 0xf980) == 0x8980) || opcode == 0xaffe)
-#else
+#ifdef GNW_FASTLOOP_GATE_IN_LOOP
+		/* Ablation arm: the pre-2026-08-20 shape, where the nibble test
+		 * ran on every dispatched instruction ahead of the switch. */
 		if (((opcode >> 12) == 8 || (opcode >> 12) == 0xa)
 		    && (((opcode & 0xf980) == 0x8980) || opcode == 0xaffe)
-#endif
 		    && gnw_direct && *GNW_DL_REJ_SLOT(sh2) != sh2->ppc
 		    && !sh2->test_irq && gnw_sh2_fastloops)
 			gnw_sh2_fastloop(sh2, opcode);
+#endif
 #endif
 
 		/* Dispatch via a plain switch.  This used to be a computed goto
@@ -1512,7 +1576,11 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		 * load, which the QEMU rig priced at -2.16% host instructions
 		 * per frame on Doom gameplay (avg sh2 dispatched identical, fb
 		 * checksums identical) -- measured 2026-08-18, ablation arm A3. */
-		switch (opcode >> 12)
+		/* `& 0xf` and all sixteen labels present, so there is no value
+		 * left for a default to catch: gcc drops the `cmp #14 / bhi`
+		 * bounds check in front of the tbh. opcode comes from a ldrh
+		 * (or the literal 9), so the mask is a hint, never a change. */
+		switch ((opcode >> 12) & 0xf)
 		{
 		case 0x0: op0000(sh2, opcode); break;
 		case 0x1: op0001(sh2, opcode); break;
@@ -1522,14 +1590,16 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		case 0x5: op0101(sh2, opcode); break;
 		case 0x6: op0110(sh2, opcode); break;
 		case 0x7: op0111(sh2, opcode); break;
-		case 0x8: op1000(sh2, opcode); break;
+		case 0x8: GNW_FASTLOOP_GATE_8(sh2, opcode, gnw_direct);
+		          op1000(sh2, opcode); break;
 		case 0x9: op1001(sh2, opcode); break;
-		case 0xA: op1010(sh2, opcode); break;
+		case 0xA: GNW_FASTLOOP_GATE_A(sh2, opcode, gnw_direct);
+		          op1010(sh2, opcode); break;
 		case 0xB: op1011(sh2, opcode); break;
 		case 0xC: op1100(sh2, opcode); break;
 		case 0xD: op1101(sh2, opcode); break;
 		case 0xE: op1110(sh2, opcode); break;
-		default:  op1111(sh2, opcode); break;
+		case 0xF: op1111(sh2, opcode); break;
 		}
 
 		sh2->icount--;
