@@ -123,18 +123,18 @@ static void convert_pal555(int invert_prio)
 #else
 #define GNW_PP_QUAD 1
 #endif
-/* DEFAULT OFF, and not because it lost. It wins on the rig (-1.02%) and the
- * device has never seen it: the md32x overlay has 12 bytes of RAM_EMU
- * headroom (_OVERLAY_MD32X_BSS_END = 0x240ffff4, read from the ELF), and this
- * path costs 592 -- its ~150 B body is instantiated once per make_do_loop
- * variant inside PicoDraw32xLayer, which the linker script pins in RAM_EMU.
- * A flagless build must link, so it is off until the bytes exist. Turn it on
- * with -DGNW_PP_OCTA_ON and bench it on the device; 32X_CLOSED.md says where
- * the bytes would have to come from. */
-#if defined(GNW_PP_OCTA_ON) && !defined(GNW_PP_NO_OCTA) && !defined(GNW_PP_NO_QUAD)
-#define GNW_PP_OCTA 1
-#else
+/* ON by default since 2026-08-20, once there were bytes for it.
+ *
+ * It was shelved for half a day at 592 B against 44 B of overlay headroom --
+ * ~100 B of body, times the eight places do_line_pp used to be expanded.
+ * Folding that into gnw_line_pp() left one copy, so this costs 160 B now, and
+ * the same commit freed 1,632. Device: ppo1 26.343 avg against idl2's
+ * same-session 26.163, +0.69%, framebuffer and audio hashes bit-identical.
+ * -DGNW_PP_NO_OCTA prices it; -DGNW_PP_NO_QUAD disables both. */
+#if defined(GNW_PP_NO_OCTA) || defined(GNW_PP_NO_QUAD)
 #define GNW_PP_OCTA 0
+#else
+#define GNW_PP_OCTA 1
 #endif
 
 /* ONE COPY, NOT EIGHT.
