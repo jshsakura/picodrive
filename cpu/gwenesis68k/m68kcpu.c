@@ -312,7 +312,16 @@ void m68k_set_irq_delay(unsigned int int_level)
  * BSS has 520 B and this file's BSS is inside it. */
 #define GNW_M68K_NBUCK      32
 #define GNW_M68K_PAGE_SHIFT 15                  /* 32 KB pages, 1 MB window */
+/* Doom's Genesis side runs from the ROM MIRROR at 0x880000, not from 0x000000
+ * (its park block is at 0x8808a8, its vblank spin at 0x8832a2 -- both read off
+ * the device and confirmed by capstone). A window based at zero therefore
+ * reported "outside window 100%" and named nothing, which is exactly what the
+ * 2026-08-20 device profile did. Base it where the code is. */
+#ifndef GNW_M68K_WIN_BASE
+#define GNW_M68K_WIN_BASE   0x880000u
+#endif
 #define GNW_M68K_PERIOD     37                  /* prime; see the SH-2 probe */
+const unsigned int gnw_m68k_win_base = GNW_M68K_WIN_BASE;
 const unsigned int gnw_m68k_nbuck = GNW_M68K_NBUCK;
 const unsigned int gnw_m68k_page_shift = GNW_M68K_PAGE_SHIFT;
 const unsigned int gnw_m68k_block_words = GNW_M68K_NBUCK + 1;  /* +1 = other */
@@ -322,6 +331,13 @@ unsigned int gnw_m68k_run_cyc;                  /* guest cycles executed     */
 unsigned int gnw_m68k_stop_cyc;                 /* guest cycles skipped      */
 unsigned int gnw_m68k_stop_hits;                /* m68k_run calls that skipped */
 unsigned int gnw_m68k_samples;
+/* Did the idle fold actually fire? The 2026-08-20 profile could not say: it
+ * reported skip=0 and stop_calls=0, but stop_calls counts picodrive's
+ * SekSetStop and the fold deliberately sets CPU_STOPPED directly (SekSetStop's
+ * SekEndRun rebases the master clock, which is not what a spinning guest
+ * does). This counts the fold itself. Profile builds only -- the shipping
+ * build's budget for this whole feature is the eight-byte verdict cache. */
+unsigned int gnw_m68k_idle_stops;
 int gnw_m68k_armed;
 static int gnw_m68k_cnt;
 static unsigned int gnw_m68k_last;
@@ -353,7 +369,7 @@ static void __attribute__((noinline)) gnw_m68k_sample(unsigned int pc)
 	gnw_m68k_last = now;
 	gnw_m68k_samples++;
 
-	pc &= 0xffffff;
+	pc = (pc & 0xffffff) - GNW_M68K_WIN_BASE;
 	if (pc < ((unsigned int)GNW_M68K_NBUCK << GNW_M68K_PAGE_SHIFT))
 		gnw_m68k_hist_p[pc >> GNW_M68K_PAGE_SHIFT] += d;
 	else
@@ -553,6 +569,9 @@ void m68k_run(unsigned int cycles)
 #ifdef GNW_M68K_IDLE_FOLD
     if (gnw_br_pc && REG_PC < gnw_br_pc && FLAG_INT_MASK < 0x0600
         && gnw_m68k_idle_probe(REG_PC, (int)(gnw_br_pc - 2 - REG_PC))) {
+#ifdef MD32X_DEVICE_PROFILE
+      gnw_m68k_idle_stops++;
+#endif
       /* Set the stop flag and leave; do NOT go through SekSetStop, whose
        * SekEndRun rebases Pico.t.m68c_cnt. Rebasing rewinds the master clock
        * by the unspent cycles, which moves every sound sync point downstream

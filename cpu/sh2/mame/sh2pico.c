@@ -414,8 +414,13 @@ unsigned long long gnw_sh2_insn_count[2];	/* [0]=master [1]=slave */
  *   to re-find the post-fold hot set (pass 2 put all of Doom's mass in the
  *   0x030000/0x040000 64 KB pages, so 1 MB covers it with rom_hi as the
  *   escape hatch), at 4x the resolution of the pass-2 map. */
-#define GNW_PCWALL_PAGE_SHIFT 14                  /* 16=64K, 14=16K, 7=128B */
-#define GNW_PCWALL_WIN_BASE  0x00000000u          /* offset into ROM */
+/* 2026-08-20: re-aimed. At 16 KB over ROM 0..1 MB the device profile put
+ * 60.9% of msh2 in ONE page, 0x02048000, with 0x02038000 at 19.8% and
+ * 0x0204c000 at 9.8% -- every hot page inside 0x02030000..0x02050000. A
+ * window that answers "which 16 KB" when the answer is already known is a
+ * wasted run, so: 4 KB pages over the 256 KB that contains all of them. */
+#define GNW_PCWALL_PAGE_SHIFT 12                  /* 16=64K, 14=16K, 12=4K, 7=128B */
+#define GNW_PCWALL_WIN_BASE  0x00030000u          /* offset into ROM */
 #define GNW_PCWALL_NBUCK     64
 #define GNW_PCWALL_WIN_SIZE  ((unsigned int)GNW_PCWALL_NBUCK << GNW_PCWALL_PAGE_SHIFT)
 enum { GNW_PCWALL_ROM_HI = 0, GNW_PCWALL_SDRAM, GNW_PCWALL_OTHER,
