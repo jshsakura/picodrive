@@ -137,183 +137,220 @@ static void convert_pal555(int invert_prio)
 #define GNW_PP_OCTA 0
 #endif
 
-#define do_line_pp(pd, p32x, pmd, pmd_draw_code)                  \
-{                                                                 \
-  unsigned short t, t0, t1, v;                                    \
-  const u32 mdbg4 = (u32)(mdbg & 0x3f) * 0x01010101u;             \
-  int i = 320;                                                    \
-  _Static_assert(320 % 2 == 0, "line must be an even pixel count"); \
-  while (i > 0) {                                                 \
-    /* --- solid-run detection (draw_arm.S labels 5-9) --- */     \
-    if (GNW_PP_RUNDET && i >= 4) {                                \
-      unsigned char b0 = *(unsigned char *)(MEM_BE2((uintptr_t)(p32x))); \
-      if (b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1))) && \
-          b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+2))) && \
-          b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+3)))) { \
-        unsigned short sv = pal[b0];                              \
-        int run = 4, n;                                           \
-        if (sv & PXPRIO) {                                        \
-          /* prio: 32X wins everywhere. Count pure 32X, blast. */ \
-          if (!((uintptr_t)(p32x) & 1)) {                        \
-            u16 exp = (u16)(b0 | (b0 << 8));                     \
-            while (run + 1 < i && *(u16 *)(p32x + run) == exp)   \
-              run += 2;                                           \
-            if (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
-          } else                                                  \
-            while (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
-          { u32 pair = (u32)sv | ((u32)sv << 16);                \
-            /* pd can be 2 mod 4 (odd line offs / H32 stride). A fused \
-             * pair of u32 stores compiles to STRD, which faults on    \
-             * M-profile unless 4-byte aligned (same bug class as SM   \
-             * ClearBackdrop). Align first; the blast is then strd-safe. */ \
-            n = run;                                              \
-            if ((uintptr_t)pd & 3) { *pd = sv; pd++; n--; }      \
-            { u32 *p32 = (u32 *)(void *)pd;                       \
-              for (; n >= 4; n -= 4) { p32[0] = pair; p32[1] = pair; p32 += 2; pd += 4; } \
-              for (; n >= 2; n -= 2) { *p32++ = pair; pd += 2; }  \
-            }                                                     \
-            if (n) { *pd = sv; pd++; }                           \
-          }                                                       \
-          pmd += run; p32x += run; i -= run;                      \
-          continue;                                               \
-        }                                                         \
-        /* no prio: count bg+identical (u16 for aligned) */       \
-        if ((pmd[0] & 0x3f) == mdbg && (pmd[1] & 0x3f) == mdbg && \
-            (pmd[2] & 0x3f) == mdbg && (pmd[3] & 0x3f) == mdbg) { \
-          if (!((uintptr_t)(p32x) & 1)) {                        \
-            u16 exp = (u16)(b0 | (b0 << 8));                     \
-            while (run + 1 < i && *(u16 *)(p32x + run) == exp && \
-                   (pmd[run] & 0x3f) == mdbg && (pmd[run+1] & 0x3f) == mdbg) \
-              run += 2;                                           \
-            if (run < i && (pmd[run] & 0x3f) == mdbg &&          \
-                *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
-          } else                                                  \
-            while (run < i && (pmd[run] & 0x3f) == mdbg &&        \
-                   *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
-          /* blast bg+identical run */                            \
-          { u32 pair = (u32)sv | ((u32)sv << 16);                \
-            /* pd can be 2 mod 4 (odd line offs / H32 stride). A fused \
-             * pair of u32 stores compiles to STRD, which faults on    \
-             * M-profile unless 4-byte aligned (same bug class as SM   \
-             * ClearBackdrop). Align first; the blast is then strd-safe. */ \
-            n = run;                                              \
-            if ((uintptr_t)pd & 3) { *pd = sv; pd++; n--; }      \
-            { u32 *p32 = (u32 *)(void *)pd;                       \
-              for (; n >= 4; n -= 4) { p32[0] = pair; p32[1] = pair; p32 += 2; pd += 4; } \
-              for (; n >= 2; n -= 2) { *p32++ = pair; pd += 2; }  \
-            }                                                     \
-            if (n) { *pd = sv; pd++; }                           \
-          }                                                       \
-          pmd += run; p32x += run; i -= run;                      \
-          /* consume remaining solid-run pixels (non-bg portion) */ \
-          while (i > 0 && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x))) == b0) { \
-            if ((*pmd & 0x3f) == mdbg) *pd = sv;                  \
-            else pmd_draw_code;                                   \
-            pd++; pmd++; p32x++; i--;                             \
-          }                                                       \
-          continue;                                               \
-        }                                                         \
-        /* mixed-bg (not all bg): per-pixel with constant sv */   \
-        while (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++; \
-        for (n = 0; n < run; n++) {                               \
-          if ((*pmd & 0x3f) == mdbg) *pd = sv;                    \
-          else pmd_draw_code;                                     \
-          pd++; pmd++;                                            \
-        }                                                         \
-        p32x += run; i -= run;                                    \
-        continue;                                                 \
-      }                                                           \
-    }                                                             \
-    /* MD-background run: 32X pixel shown unconditionally */      \
-    for (; i > 0 && (*pmd & 0x3f) == mdbg; ) {                    \
-      /* Four at a time. Doom's 3D view leaves the MD layer at    \
-       * background for whole lines, so this is the path that     \
-       * actually runs, and the pair loop below asks the MD byte  \
-       * twice per two pixels -- two loads, two ANDs, two         \
-       * compares. One word load answers for four. Guarded on the \
-       * three pointers being aligned, which is the common case;  \
-       * anything else falls through to the pair path unchanged.  \
-       * GNW_PP_NO_QUAD prices it. */                             \
-      /* Eight at a time, same test twice over. The quad path measures     \
-       * 3.0% of the frame on the rig -- and the rig UNDER-prices wide      \
-       * stores, having no cache or write buffer (2026-08-20: it called     \
-       * removing the solid-run detector a 0.48% gain and the device        \
-       * charged 2.95%). So the octa path is deliberately built for the     \
-       * device to judge, not the rig. -DGNW_PP_NO_OCTA prices it. */       \
-      if (GNW_PP_OCTA && i >= 8                                   \
-          && !(((uintptr_t)pmd | (uintptr_t)pd) & 3)              \
-          && !((uintptr_t)(p32x) & 1)                             \
-          && (((u32 *)pmd)[0] & 0x3f3f3f3fu) == mdbg4             \
-          && (((u32 *)pmd)[1] & 0x3f3f3f3fu) == mdbg4) {          \
-        u32 q0 = ((u32 *)(p32x))[0], q1 = ((u32 *)(p32x))[1];     \
-        u16 b0 = pal[(q0 >>  8) & 0xff], b1 = pal[q0 & 0xff];     \
-        u16 b2 = pal[(q0 >> 24) & 0xff], b3 = pal[(q0 >> 16) & 0xff]; \
-        u16 b4 = pal[(q1 >>  8) & 0xff], b5 = pal[q1 & 0xff];     \
-        u16 b6 = pal[(q1 >> 24) & 0xff], b7 = pal[(q1 >> 16) & 0xff]; \
-        ((u32 *)pd)[0] = (u32)b0 | ((u32)b1 << 16);               \
-        ((u32 *)pd)[1] = (u32)b2 | ((u32)b3 << 16);               \
-        ((u32 *)pd)[2] = (u32)b4 | ((u32)b5 << 16);               \
-        ((u32 *)pd)[3] = (u32)b6 | ((u32)b7 << 16);               \
-        pd += 8; pmd += 8; p32x += 8; i -= 8;                     \
-        continue;                                                 \
-      }                                                           \
-      if (GNW_PP_QUAD && i >= 4                                   \
-          && !(((uintptr_t)pmd | (uintptr_t)pd) & 3)              \
-          && !((uintptr_t)(p32x) & 1)                             \
-          && (*(u32 *)pmd & 0x3f3f3f3fu) == mdbg4) {              \
-        u32 q = *(u32 *)(p32x);                                   \
-        u16 a0 = pal[(q >>  8) & 0xff], a1 = pal[q & 0xff];       \
-        u16 a2 = pal[(q >> 24) & 0xff], a3 = pal[(q >> 16) & 0xff]; \
-        ((u32 *)pd)[0] = (u32)a0 | ((u32)a1 << 16);               \
-        ((u32 *)pd)[1] = (u32)a2 | ((u32)a3 << 16);               \
-        pd += 4; pmd += 4; p32x += 4; i -= 4;                     \
-        continue;                                                 \
-      }                                                           \
-      if (i >= 2 && (pmd[1] & 0x3f) == mdbg) {                    \
-        if (!((uintptr_t)(p32x) & 1)) {                           \
-          v = *(u16 *)(p32x);                                     \
-          t0 = pal[(v >> 8) & 0xff];                              \
-          t1 = pal[v & 0xff];                                     \
-        } else {                                                  \
-          t0 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+0)))]; \
-          t1 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1)))]; \
-        }                                                         \
-        *(u32 *)(pd) = (u32)t0 | ((u32)t1 << 16);                 \
-        pd += 2; pmd += 2; p32x += 2; i -= 2;                     \
-      } else {                                                    \
-        t = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x++)))]; \
-        *pd++ = t; pmd++; i--;                                    \
-      }                                                           \
-    }                                                             \
-    /* non-background run: 32X pixel only if priority bit set */  \
-    for (; i > 0 && (*pmd & 0x3f) != mdbg; ) {                    \
-      if (i >= 2 && (pmd[1] & 0x3f) != mdbg) {                    \
-        if (!((uintptr_t)(p32x) & 1)) {                           \
-          v = *(u16 *)(p32x);                                     \
-          t0 = pal[(v >> 8) & 0xff];                              \
-          t1 = pal[v & 0xff];                                     \
-        } else {                                                  \
-          t0 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+0)))]; \
-          t1 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1)))]; \
-        }                                                         \
-        if ((t0 & PXPRIO) && (t1 & PXPRIO)) {                     \
-          *(u32 *)(pd) = (u32)t0 | ((u32)t1 << 16);               \
-          pd += 2; pmd += 2; p32x += 2; i -= 2;                   \
-        } else {                                                  \
-          /* per-pixel fallback: md_code needs sequential advance */ \
-          if (t0 & PXPRIO) *pd = t0; else pmd_draw_code;          \
-          pd++; pmd++; p32x++; i--;                               \
-          if (t1 & PXPRIO) *pd = t1; else pmd_draw_code;          \
-          pd++; pmd++; p32x++; i--;                               \
-        }                                                         \
-      } else {                                                    \
-        t = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x++)))]; \
-        if (t & PXPRIO) *pd = t; else pmd_draw_code;              \
-        pd++; pmd++; i--;                                         \
-      }                                                           \
-    }                                                             \
-  }                                                               \
+/* ONE COPY, NOT EIGHT.
+ *
+ * This used to be a macro, and `make_do_loop` instantiates its callers six
+ * times (bare, _md, _h32, _scan, _scan_h32, _scan_md) with FinalizeLine32xRGB555
+ * expanding it twice more. Every one of those copies landed in RAM_EMU, because
+ * the linker script pins PicoDraw32xLayer / PicoDraw32xLayerMdOnly /
+ * FinalizeLine32xRGB555 there and the do_loop_* statics inline into them. That
+ * is where the overlay's headroom went: the solid-run detector alone occupies
+ * 2,604 bytes of a region with tens of bytes free, and it is about 100 bytes of
+ * code multiplied by the instantiation count.
+ *
+ * The variants differed in exactly one thing -- what to write where the MD
+ * layer is NOT background -- and that has three forms. It is a parameter now.
+ * The cost is one compare on md_mode per non-background pixel, which for a 3D
+ * view is the cold half of the loop; the gain is spendable bytes.
+ *
+ * NOTE FOR THE LINKER SCRIPT: this function must be listed explicitly in
+ * .overlay_md32x (`build/md32x/pico__32x__draw.o (.text.gnw_line_pp)`),
+ * or it lands in XIP and the compositor runs out of external flash. */
+#define GNW_PP_MD_NONE 0
+#define GNW_PP_MD_PAL  1
+#define GNW_PP_MD_H32  2
+
+#define GNW_PP_MD_WRITE() do {                                    \
+    if (md_mode == GNW_PP_MD_PAL)      *pd = palmd[*pmd];         \
+    else if (md_mode == GNW_PP_MD_H32) *pd = pd[H32_OFFSET];      \
+  } while (0)
+
+static void gnw_line_pp(unsigned short *pd, unsigned char *p32x,
+                        unsigned char *pmd, unsigned short *pal,
+                        unsigned short *palmd, int mdbg, int md_mode)
+{
+  unsigned short t, t0, t1, v;
+  const u32 mdbg4 = (u32)(mdbg & 0x3f) * 0x01010101u;
+  int i = 320;
+  _Static_assert(320 % 2 == 0, "line must be an even pixel count");
+  while (i > 0) {
+    /* --- solid-run detection (draw_arm.S labels 5-9) --- */
+    if (GNW_PP_RUNDET && i >= 4) {
+      unsigned char b0 = *(unsigned char *)(MEM_BE2((uintptr_t)(p32x)));
+      if (b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1))) &&
+          b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+2))) &&
+          b0 == *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+3)))) {
+        unsigned short sv = pal[b0];
+        int run = 4, n;
+        if (sv & PXPRIO) {
+          /* prio: 32X wins everywhere. Count pure 32X, blast. */
+          if (!((uintptr_t)(p32x) & 1)) {
+            u16 exp = (u16)(b0 | (b0 << 8));
+            while (run + 1 < i && *(u16 *)(p32x + run) == exp)
+              run += 2;
+            if (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++;
+          } else
+            while (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++;
+          { u32 pair = (u32)sv | ((u32)sv << 16);
+            /* pd can be 2 mod 4 (odd line offs / H32 stride). A fused
+             * pair of u32 stores compiles to STRD, which faults on
+             * M-profile unless 4-byte aligned (same bug class as SM
+             * ClearBackdrop). Align first; the blast is then strd-safe. */
+            n = run;
+            if ((uintptr_t)pd & 3) { *pd = sv; pd++; n--; }
+            { u32 *p32 = (u32 *)(void *)pd;
+              for (; n >= 4; n -= 4) { p32[0] = pair; p32[1] = pair; p32 += 2; pd += 4; }
+              for (; n >= 2; n -= 2) { *p32++ = pair; pd += 2; }
+            }
+            if (n) { *pd = sv; pd++; }
+          }
+          pmd += run; p32x += run; i -= run;
+          continue;
+        }
+        /* no prio: count bg+identical (u16 for aligned) */
+        if ((pmd[0] & 0x3f) == mdbg && (pmd[1] & 0x3f) == mdbg &&
+            (pmd[2] & 0x3f) == mdbg && (pmd[3] & 0x3f) == mdbg) {
+          if (!((uintptr_t)(p32x) & 1)) {
+            u16 exp = (u16)(b0 | (b0 << 8));
+            while (run + 1 < i && *(u16 *)(p32x + run) == exp &&
+                   (pmd[run] & 0x3f) == mdbg && (pmd[run+1] & 0x3f) == mdbg)
+              run += 2;
+            if (run < i && (pmd[run] & 0x3f) == mdbg &&
+                *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++;
+          } else
+            while (run < i && (pmd[run] & 0x3f) == mdbg &&
+                   *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++;
+          /* blast bg+identical run */
+          { u32 pair = (u32)sv | ((u32)sv << 16);
+            /* pd can be 2 mod 4 (odd line offs / H32 stride). A fused
+             * pair of u32 stores compiles to STRD, which faults on
+             * M-profile unless 4-byte aligned (same bug class as SM
+             * ClearBackdrop). Align first; the blast is then strd-safe. */
+            n = run;
+            if ((uintptr_t)pd & 3) { *pd = sv; pd++; n--; }
+            { u32 *p32 = (u32 *)(void *)pd;
+              for (; n >= 4; n -= 4) { p32[0] = pair; p32[1] = pair; p32 += 2; pd += 4; }
+              for (; n >= 2; n -= 2) { *p32++ = pair; pd += 2; }
+            }
+            if (n) { *pd = sv; pd++; }
+          }
+          pmd += run; p32x += run; i -= run;
+          /* consume remaining solid-run pixels (non-bg portion) */
+          while (i > 0 && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x))) == b0) {
+            if ((*pmd & 0x3f) == mdbg) *pd = sv;
+            else GNW_PP_MD_WRITE();
+            pd++; pmd++; p32x++; i--;
+          }
+          continue;
+        }
+        /* mixed-bg (not all bg): per-pixel with constant sv */
+        while (run < i && *(unsigned char *)(MEM_BE2((uintptr_t)(p32x+run))) == b0) run++;
+        for (n = 0; n < run; n++) {
+          if ((*pmd & 0x3f) == mdbg) *pd = sv;
+          else GNW_PP_MD_WRITE();
+          pd++; pmd++;
+        }
+        p32x += run; i -= run;
+        continue;
+      }
+    }
+    /* MD-background run: 32X pixel shown unconditionally */
+    for (; i > 0 && (*pmd & 0x3f) == mdbg; ) {
+      /* Four at a time. Doom's 3D view leaves the MD layer at
+       * background for whole lines, so this is the path that
+       * actually runs, and the pair loop below asks the MD byte
+       * twice per two pixels -- two loads, two ANDs, two
+       * compares. One word load answers for four. Guarded on the
+       * three pointers being aligned, which is the common case;
+       * anything else falls through to the pair path unchanged.
+       * GNW_PP_NO_QUAD prices it. */
+      /* Eight at a time, same test twice over. The quad path measures
+       * 3.0% of the frame on the rig -- and the rig UNDER-prices wide
+       * stores, having no cache or write buffer (2026-08-20: it called
+       * removing the solid-run detector a 0.48% gain and the device
+       * charged 2.95%). So the octa path is deliberately built for the
+       * device to judge, not the rig. -DGNW_PP_NO_OCTA prices it. */
+      if (GNW_PP_OCTA && i >= 8
+          && !(((uintptr_t)pmd | (uintptr_t)pd) & 3)
+          && !((uintptr_t)(p32x) & 1)
+          && (((u32 *)pmd)[0] & 0x3f3f3f3fu) == mdbg4
+          && (((u32 *)pmd)[1] & 0x3f3f3f3fu) == mdbg4) {
+        u32 q0 = ((u32 *)(p32x))[0], q1 = ((u32 *)(p32x))[1];
+        u16 b0 = pal[(q0 >>  8) & 0xff], b1 = pal[q0 & 0xff];
+        u16 b2 = pal[(q0 >> 24) & 0xff], b3 = pal[(q0 >> 16) & 0xff];
+        u16 b4 = pal[(q1 >>  8) & 0xff], b5 = pal[q1 & 0xff];
+        u16 b6 = pal[(q1 >> 24) & 0xff], b7 = pal[(q1 >> 16) & 0xff];
+        ((u32 *)pd)[0] = (u32)b0 | ((u32)b1 << 16);
+        ((u32 *)pd)[1] = (u32)b2 | ((u32)b3 << 16);
+        ((u32 *)pd)[2] = (u32)b4 | ((u32)b5 << 16);
+        ((u32 *)pd)[3] = (u32)b6 | ((u32)b7 << 16);
+        pd += 8; pmd += 8; p32x += 8; i -= 8;
+        continue;
+      }
+      if (GNW_PP_QUAD && i >= 4
+          && !(((uintptr_t)pmd | (uintptr_t)pd) & 3)
+          && !((uintptr_t)(p32x) & 1)
+          && (*(u32 *)pmd & 0x3f3f3f3fu) == mdbg4) {
+        u32 q = *(u32 *)(p32x);
+        u16 a0 = pal[(q >>  8) & 0xff], a1 = pal[q & 0xff];
+        u16 a2 = pal[(q >> 24) & 0xff], a3 = pal[(q >> 16) & 0xff];
+        ((u32 *)pd)[0] = (u32)a0 | ((u32)a1 << 16);
+        ((u32 *)pd)[1] = (u32)a2 | ((u32)a3 << 16);
+        pd += 4; pmd += 4; p32x += 4; i -= 4;
+        continue;
+      }
+      if (i >= 2 && (pmd[1] & 0x3f) == mdbg) {
+        if (!((uintptr_t)(p32x) & 1)) {
+          v = *(u16 *)(p32x);
+          t0 = pal[(v >> 8) & 0xff];
+          t1 = pal[v & 0xff];
+        } else {
+          t0 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+0)))];
+          t1 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1)))];
+        }
+        *(u32 *)(pd) = (u32)t0 | ((u32)t1 << 16);
+        pd += 2; pmd += 2; p32x += 2; i -= 2;
+      } else {
+        t = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x++)))];
+        *pd++ = t; pmd++; i--;
+      }
+    }
+    /* non-background run: 32X pixel only if priority bit set */
+    for (; i > 0 && (*pmd & 0x3f) != mdbg; ) {
+      if (i >= 2 && (pmd[1] & 0x3f) != mdbg) {
+        if (!((uintptr_t)(p32x) & 1)) {
+          v = *(u16 *)(p32x);
+          t0 = pal[(v >> 8) & 0xff];
+          t1 = pal[v & 0xff];
+        } else {
+          t0 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+0)))];
+          t1 = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x+1)))];
+        }
+        if ((t0 & PXPRIO) && (t1 & PXPRIO)) {
+          *(u32 *)(pd) = (u32)t0 | ((u32)t1 << 16);
+          pd += 2; pmd += 2; p32x += 2; i -= 2;
+        } else {
+          /* per-pixel fallback: md_code needs sequential advance */
+          if (t0 & PXPRIO) *pd = t0; else GNW_PP_MD_WRITE();
+          pd++; pmd++; p32x++; i--;
+          if (t1 & PXPRIO) *pd = t1; else GNW_PP_MD_WRITE();
+          pd++; pmd++; p32x++; i--;
+        }
+      } else {
+        t = pal[*(unsigned char *)(MEM_BE2((uintptr_t)(p32x++)))];
+        if (t & PXPRIO) *pd = t; else GNW_PP_MD_WRITE();
+        pd++; pmd++; i--;
+      }
+    }
+  }
 }
+
+/* The macro survives as the call, and advances what the old one advanced:
+ * callers relied on pd and pmd coming back 320 pixels further on. */
+#define do_line_pp(pd_, p32x_, pmd_, md_mode_) do {               \
+    gnw_line_pp((pd_), (p32x_), (pmd_), pal, palmd, mdbg, (md_mode_)); \
+    (pd_) += 320; (pmd_) += 320;                                  \
+  } while (0)
 
 // run length mode
 #define do_line_rl(pd, p32x, pmd, pmd_draw_code)                  \
@@ -375,9 +412,9 @@ void FinalizeLine32xRGB555(int sh, int line, struct PicoEState *est)
     if (Pico32x.vdp_regs[2 / 2] & P32XV_SFT)
       p32xb++;
     if (h32) {
-      do_line_pp(dst, p32xb, pmd, MD_LAYER_CODE_H32);
+      do_line_pp(dst, p32xb, pmd, GNW_PP_MD_H32);
     } else
-      do_line_pp(dst, p32xb, pmd,);
+      do_line_pp(dst, p32xb, pmd, GNW_PP_MD_NONE);
   }
   else { // Run Length Mode
     if (h32) {
@@ -436,7 +473,7 @@ static void rig_pp_census(int l, const unsigned char *p32x,
 #define RIG_PP_CENSUS(l, p32x, pmd, mdbg) ((void)0)
 #endif
 
-#define make_do_loop(name, pre_code, post_code, md_code)        \
+#define make_do_loop(name, pre_code, post_code, md_code, pp_mode) \
 /* Direct Color Mode */                                         \
 static void do_loop_dc##name(unsigned short *dst,               \
     unsigned short *dram, unsigned lines_sft_offs, int mdbg)    \
@@ -477,7 +514,7 @@ static void do_loop_pp##name(unsigned short *dst,               \
     p32x = (void *)(dram + dram[l + (lines_sft_offs >> 24)]);   \
     p32x += (lines_sft_offs >> 8) & 1;                          \
     RIG_PP_CENSUS(l, p32x, pmd, mdbg);                          \
-    do_line_pp(dst, p32x, pmd, md_code);                        \
+    do_line_pp(dst, p32x, pmd, pp_mode);                        \
     post_code;                                                  \
     dst += DrawLineDestIncrement32x/2 - 320;                    \
   }                                                             \
@@ -507,7 +544,7 @@ static void do_loop_rl##name(unsigned short *dst,               \
 
 #ifdef _ASM_32X_DRAW
 #undef make_do_loop
-#define make_do_loop(name, pre_code, post_code, md_code) \
+#define make_do_loop(name, pre_code, post_code, md_code, pp_mode) \
 extern void do_loop_dc##name(unsigned short *dst,        \
     unsigned short *dram, unsigned lines_offs, int mdbg);\
 extern void do_loop_pp##name(unsigned short *dst,        \
@@ -516,12 +553,12 @@ extern void do_loop_rl##name(unsigned short *dst,        \
     unsigned short *dram, unsigned lines_offs, int mdbg);
 #endif
 
-make_do_loop(,,,)
-make_do_loop(_md, , , MD_LAYER_CODE)
-make_do_loop(_h32, , , MD_LAYER_CODE_H32)
-make_do_loop(_scan, PICOSCAN_PRE, PICOSCAN_POST, )
-make_do_loop(_scan_h32, PICOSCAN_PRE, PICOSCAN_POST, MD_LAYER_CODE_H32)
-make_do_loop(_scan_md, PICOSCAN_PRE, PICOSCAN_POST, MD_LAYER_CODE)
+make_do_loop(,,,,GNW_PP_MD_NONE)
+make_do_loop(_md, , , MD_LAYER_CODE, GNW_PP_MD_PAL)
+make_do_loop(_h32, , , MD_LAYER_CODE_H32, GNW_PP_MD_H32)
+make_do_loop(_scan, PICOSCAN_PRE, PICOSCAN_POST, , GNW_PP_MD_NONE)
+make_do_loop(_scan_h32, PICOSCAN_PRE, PICOSCAN_POST, MD_LAYER_CODE_H32, GNW_PP_MD_H32)
+make_do_loop(_scan_md, PICOSCAN_PRE, PICOSCAN_POST, MD_LAYER_CODE, GNW_PP_MD_PAL)
 
 typedef void (*do_loop_func)(unsigned short *dst, unsigned short *dram, unsigned lines, int mdbg);
 enum { DO_LOOP, DO_LOOP_H32, DO_LOOP_MD, DO_LOOP_SCAN, DO_LOOP_H32_SCAN, DO_LOOP_MD_SCAN };
