@@ -198,7 +198,21 @@ static void gnw_line_pp(unsigned short *pd, unsigned char *p32x,
              * ClearBackdrop). Align first; the blast is then strd-safe. */
             n = run;
             if ((uintptr_t)pd & 3) { *pd = sv; pd++; n--; }
+            /* Eight pixels a round, not four: half the loop overhead per
+             * pixel, and four adjacent word stores for the compiler to fuse.
+             * The rig measures this at ZERO (9,689,700 vs 9,690,235) because
+             * it has no write buffer and prices every store the same -- which
+             * is precisely the class of change it cannot judge, so this one
+             * was decided on the device. -DGNW_PP_NO_WIDEBLAST restores the
+             * old width. */
             { u32 *p32 = (u32 *)(void *)pd;
+#ifndef GNW_PP_NO_WIDEBLAST
+              for (; n >= 8; n -= 8) {
+                p32[0] = pair; p32[1] = pair;
+                p32[2] = pair; p32[3] = pair;
+                p32 += 4; pd += 8;
+              }
+#endif
               for (; n >= 4; n -= 4) { p32[0] = pair; p32[1] = pair; p32 += 2; pd += 4; }
               for (; n >= 2; n -= 2) { *p32++ = pair; pd += 2; }
             }
@@ -228,7 +242,21 @@ static void gnw_line_pp(unsigned short *pd, unsigned char *p32x,
              * ClearBackdrop). Align first; the blast is then strd-safe. */
             n = run;
             if ((uintptr_t)pd & 3) { *pd = sv; pd++; n--; }
+            /* Eight pixels a round, not four: half the loop overhead per
+             * pixel, and four adjacent word stores for the compiler to fuse.
+             * The rig measures this at ZERO (9,689,700 vs 9,690,235) because
+             * it has no write buffer and prices every store the same -- which
+             * is precisely the class of change it cannot judge, so this one
+             * was decided on the device. -DGNW_PP_NO_WIDEBLAST restores the
+             * old width. */
             { u32 *p32 = (u32 *)(void *)pd;
+#ifndef GNW_PP_NO_WIDEBLAST
+              for (; n >= 8; n -= 8) {
+                p32[0] = pair; p32[1] = pair;
+                p32[2] = pair; p32[3] = pair;
+                p32 += 4; pd += 8;
+              }
+#endif
               for (; n >= 4; n -= 4) { p32[0] = pair; p32[1] = pair; p32 += 2; pd += 4; }
               for (; n >= 2; n -= 2) { *p32++ = pair; pd += 2; }
             }
