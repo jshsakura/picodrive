@@ -321,7 +321,19 @@ void m68k_set_irq_delay(unsigned int int_level)
 #define GNW_M68K_WIN_BASE   0x880000u
 #endif
 #define GNW_M68K_PERIOD     37                  /* prime; see the SH-2 probe */
-const unsigned int gnw_m68k_win_base = GNW_M68K_WIN_BASE;
+/* NOT const, and that is load-bearing. A const lands in .rodata_md32x, which
+ * is XIP: linked at the 0xDEB00000 sentinel and relocated at load by
+ * PatchMd32xSentinels (main_md32x.c), a HEURISTIC scan that rewrites any word
+ * that merely looks like a sentinel address. Adding four bytes of const here
+ * shifts that section's layout, changes which words fall in the scan's range,
+ * and the 2026-08-20 profiler builds died at frame 2 for it -- precise
+ * BusFault, BFAR = 0xdeb447a8 = __rodata_md32x_start__, i.e. a read of the
+ * sentinel that never got patched. prof1 (without this symbol) ran; prof2,
+ * prof3 and prof4 (with it) all died at the same frame.
+ *
+ * Non-const puts it in the overlay's data, which the launcher relocates
+ * properly. If you need another export from this file, do the same. */
+unsigned int gnw_m68k_win_base = GNW_M68K_WIN_BASE;
 const unsigned int gnw_m68k_nbuck = GNW_M68K_NBUCK;
 const unsigned int gnw_m68k_page_shift = GNW_M68K_PAGE_SHIFT;
 const unsigned int gnw_m68k_block_words = GNW_M68K_NBUCK + 1;  /* +1 = other */
