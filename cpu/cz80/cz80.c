@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include "cz80.h"
 
 #if PICODRIVE_HACKS
@@ -229,6 +230,19 @@ static inline unsigned char picodrive_read(unsigned short a)
 /*--------------------------------------------------------
 	CPUé¿çs
 --------------------------------------------------------*/
+
+#ifdef GNW_Z80_IDLE_FOLD
+/* Side-effect sequence for the slice-level idle fold in z80if.c.
+ *
+ * It is bumped from WRITE_MEM8 and the port macros, which are INLINE in the
+ * interpreter -- three instructions, no call. An earlier version put the whole
+ * fold check on the JP/JR paths inside Cz80_Exec and cost 6.1% on the device
+ * with the fold disabled and 6.9% with it folding 70% of the driver's loop
+ * iterations: a call in the middle of a computed-goto interpreter spills its
+ * live registers and degrades the allocation across all 17.9 KB of it. Nothing
+ * that runs per instruction may live in here. */
+unsigned int gnw_z80_fx_seq;
+#endif /* GNW_Z80_IDLE_FOLD */
 
 INT32 Cz80_Exec(cz80_struc *CPU, INT32 cycles)
 {

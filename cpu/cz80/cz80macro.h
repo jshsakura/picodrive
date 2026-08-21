@@ -62,10 +62,23 @@
 #define READ_MEM16(A)		(READ_MEM8(A) | (READ_MEM8((A) + 1) << 8))
 
 #if PICODRIVE_HACKS
+#ifdef GNW_Z80_IDLE_FOLD
+/* Bumped by every side effect the idle fold must not skip over: a memory
+ * write that is not the two bytes at SP (i.e. not CALL/PUSH scratch), and
+ * any port access. gnw_z80_fold_check() folds only when this has not moved
+ * since the snapshot it compares against. */
+extern unsigned int gnw_z80_fx_seq;
+#define GNW_Z80_FX_WRITE(a) do { \
+	if ((unsigned short)((a) - zSP) > 1u) gnw_z80_fx_seq++; \
+} while (0)
+#else
+#define GNW_Z80_FX_WRITE(a) do { } while (0)
+#endif
 #define WRITE_MEM8(A, D) { \
 	unsigned short a = A; \
 	unsigned char d = D; \
 	uptr v = z80_write_map[a >> Z80_MEM_SHIFT]; \
+	GNW_Z80_FX_WRITE(a); \
 	if (map_flag_set(v)) \
 		((z80_write_f *)MAP_FUNC(v))(a, d); \
 	else \
@@ -79,8 +92,15 @@
 #define PUSH_16(A)			{ UINT32 sp; zSP -= 2; sp = zSP; WRITE_MEM16(sp, A); }
 #define POP_16(A)			{ UINT32 sp; sp = zSP; A = READ_MEM16(sp); zSP = sp + 2; }
 
+#ifdef GNW_Z80_IDLE_FOLD
+/* A port read can latch or clear status as surely as a write can, so both
+ * count as side effects. */
+#define IN(A)				(gnw_z80_fx_seq++, CPU->IN_Port(A))
+#define OUT(A, D)			do { gnw_z80_fx_seq++; CPU->OUT_Port(A, D); } while (0)
+#else
 #define IN(A)				CPU->IN_Port(A)
 #define OUT(A, D)			CPU->OUT_Port(A, D)
+#endif
 
 #define CHECK_INT							\
 	if (zIFF1)							\

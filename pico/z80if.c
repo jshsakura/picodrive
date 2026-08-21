@@ -104,6 +104,103 @@ void z80_init(void)
 #endif
 }
 
+#if defined(GNW_Z80_IDLE_FOLD) && defined(_USE_CZ80)
+/* Slice-level idle fold for the Z80.
+ *
+ * Doom 32X's sound driver spends most of its time in a ~35-instruction main
+ * loop waiting for the 68K to fill a command queue ($0036 == $0037). Folding
+ * that loop is worth up to 19.8% on the device -- disabling the Z80 outright
+ * reads 31.44 fps against a 26.25 control -- but WHERE the check goes decides
+ * whether any of it survives.
+ *
+ * It must not go inside Cz80_Exec. A first version hooked every backward JP
+ * and JR there and folded 70% of the driver's loop iterations, and the device
+ * read 24.45 against a 26.25 control. With the same hooks compiled in but
+ * never folding it read 24.64. The fold was not the cost: a call in the middle
+ * of a computed-goto interpreter spills its live registers and degrades the
+ * allocation across all 17.9 KB of it, and that interpreter runs out of OSPI
+ * flash where every extra byte is already expensive.
+ *
+ * So the check runs once per SLICE instead -- 131 times a frame, not once per
+ * jump -- and the interpreter's own code is left exactly as it was.
+ *
+ * A slice is 'pure' when it ended in the architectural state it started in and
+ * bumped no side effect (gnw_z80_fx_seq counts every write that is not CALL
+ * or PUSH scratch, and every port access). Replaying a pure slice cannot do
+ * anything either, so the next one with the same cycle count, the same state
+ * and no side effect since is skipped outright.
+ *
+ * R is not compared -- with CZ80_EMULATE_R_EXACTLY it advances on every fetch
+ * -- it is advanced by exactly the delta the pure slice measured. Status,
+ * ExtraCycles, PC and BasePC are checked explicitly: a pending interrupt or a
+ * different PC makes the slice a different program. */
+#include <stddef.h>
+extern unsigned int gnw_z80_fx_seq;
+unsigned int gnw_z80_slice_folds;   /* slices skipped                */
+unsigned int gnw_z80_slice_seen;    /* slices offered                */
+
+#define GNW_SNAP_A     ((int)offsetof(cz80_struc, R))
+#define GNW_SNAP_B_OFF ((int)offsetof(cz80_struc, IFF))
+#define GNW_SNAP_B     ((int)(offsetof(cz80_struc, Status) - offsetof(cz80_struc, IFF)))
+
+static struct {
+  unsigned char a[GNW_SNAP_A];
+  unsigned char b[GNW_SNAP_B];
+  FPTR pc, basepc;
+  unsigned int fx_seq;
+  int cnt;
+  unsigned char rdelta;
+  unsigned char pure;
+} gnw_slice;
+
+static int gnw_z80_state_eq(const unsigned char *cur)
+{
+  return CZ80.Status == 0 && CZ80.ExtraCycles == 0 &&
+         CZ80.PC == gnw_slice.pc && CZ80.BasePC == gnw_slice.basepc &&
+         memcmp(gnw_slice.a, cur, GNW_SNAP_A) == 0 &&
+         memcmp(gnw_slice.b, cur + GNW_SNAP_B_OFF, GNW_SNAP_B) == 0;
+}
+
+int gnw_z80_run(int cnt)
+{
+  const unsigned char *cur = (const unsigned char *)&CZ80;
+  unsigned char pre_a[GNW_SNAP_A], pre_b[GNW_SNAP_B];
+  FPTR pc0, base0;
+  unsigned int fx0;
+  unsigned char r0;
+  int ran;
+
+  gnw_z80_slice_seen++;
+  if (gnw_slice.pure && gnw_slice.cnt == cnt &&
+      gnw_slice.fx_seq == gnw_z80_fx_seq && gnw_z80_state_eq(cur)) {
+    CZ80.R.B.L = (unsigned char)((CZ80.R.B.L + gnw_slice.rdelta) & 0x7f);
+    gnw_z80_slice_folds++;
+    return cnt;
+  }
+
+  memcpy(pre_a, cur, GNW_SNAP_A);
+  memcpy(pre_b, cur + GNW_SNAP_B_OFF, GNW_SNAP_B);
+  pc0 = CZ80.PC; base0 = CZ80.BasePC; r0 = CZ80.R.B.L; fx0 = gnw_z80_fx_seq;
+
+  ran = Cz80_Exec(&CZ80, cnt);
+
+  gnw_slice.pure = (ran == cnt && fx0 == gnw_z80_fx_seq &&
+                    CZ80.Status == 0 && CZ80.ExtraCycles == 0 &&
+                    CZ80.PC == pc0 && CZ80.BasePC == base0 &&
+                    memcmp(pre_a, cur, GNW_SNAP_A) == 0 &&
+                    memcmp(pre_b, cur + GNW_SNAP_B_OFF, GNW_SNAP_B) == 0);
+  if (gnw_slice.pure) {
+    memcpy(gnw_slice.a, pre_a, GNW_SNAP_A);
+    memcpy(gnw_slice.b, pre_b, GNW_SNAP_B);
+    gnw_slice.pc = pc0; gnw_slice.basepc = base0;
+    gnw_slice.fx_seq = gnw_z80_fx_seq;
+    gnw_slice.cnt = cnt;
+    gnw_slice.rdelta = (unsigned char)((CZ80.R.B.L - r0) & 0x7f);
+  }
+  return ran;
+}
+#endif /* GNW_Z80_IDLE_FOLD && _USE_CZ80 */
+
 void z80_reset(void)
 {
   int is_sms = (PicoIn.AHW & (PAHW_SMS|PAHW_SG|PAHW_SC)) == PAHW_SMS;

@@ -286,8 +286,16 @@ PICO_INTERNAL void PicoSyncZ80(unsigned int m68k_cycles_done)
     Pico.t.z80c_cnt, Pico.t.z80c_cnt * 15 / 7 / 488,
     Pico.t.z80c_aim, Pico.t.z80c_aim * 15 / 7 / 488);
 
+#if defined(GNW_Z80_IDLE_FOLD) && defined(_USE_CZ80)
+  {
+    extern int gnw_z80_run(int cnt);
+    if (cnt > 0)
+      Pico.t.z80c_cnt += gnw_z80_run(cnt);
+  }
+#else
   if (cnt > 0)
     Pico.t.z80c_cnt += z80_run(cnt);
+#endif
 
   pprof_end(z80);
 }
