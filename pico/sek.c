@@ -467,10 +467,19 @@ int SekRegisterIdlePatch(unsigned int pc, int oldop, int newop, void *ctx)
     (newop&0x200)?'n':'y', is_main68k?'m':'s', idledet_count);
 
   // XXX: probably shouldn't patch RAM too
+#ifdef GNW_32X_CORE
+  /* No sub-68k in this build -- see pico/memory.c. The idle detector is only
+     ever handed the main 68K here; refuse to patch rather than index a map
+     that no longer exists. */
+  if (!is_main68k)
+    return 1; // don't patch
+  v = m68k_read16_map[pc >> M68K_MEM_SHIFT];
+#else
   if (is_main68k)
     v = m68k_read16_map[pc >> M68K_MEM_SHIFT];
   else
     v = s68k_read16_map[pc >> M68K_MEM_SHIFT];
+#endif
   if (~v & ~((uptr)-1LL >> 1)) // MSB clear?
     target = (u16 *)((v << 1) + pc);
   else {

@@ -25,14 +25,19 @@ uptr m68k_write16_map[0x1000000 >> M68K_MEM_SHIFT];
 
 #ifdef GNW_32X_CORE
 // The sub-68k (Sega CD) memory maps normally live in pico/cd/memory.c, which the
-// 32X core does not compile. The generic cpu68k_map_* helpers reference these in
-// their is_sub branches (dead code here: no CD => is_sub is always 0). Provide the
-// storage so the references resolve. 4x1KB of dead BSS, reclaimable later by
-// guarding the is_sub branches if RAM gets tight.
-uptr s68k_read8_map  [0x1000000 >> M68K_MEM_SHIFT];
-uptr s68k_read16_map [0x1000000 >> M68K_MEM_SHIFT];
-uptr s68k_write8_map [0x1000000 >> M68K_MEM_SHIFT];
-uptr s68k_write16_map[0x1000000 >> M68K_MEM_SHIFT];
+// 32X core does not compile. The generic cpu68k_map_* helpers reference them in
+// their is_sub branches, and this file used to define 4x1KB of storage just so
+// those dead references would link -- with a note that it was "reclaimable later
+// if RAM gets tight". It got tight: those four arrays landed in ITCM, which is
+// the only fast instruction memory this chip has, and 4,096 bytes of it were
+// holding maps for a CPU that does not exist in this build.
+//
+// The branches are compiled out instead (S68K_UNSUPPORTED below). is_sub is not
+// merely assumed to be 0 any more -- a caller that passes 1 is refused loudly
+// rather than silently steering the main 68K's map, which is what aliasing the
+// two would have done.
+#define S68K_UNSUPPORTED(what) \
+  do { elprintf(EL_ANOMALY, "32X build has no sub-68k: %s", what); } while (0)
 #endif
 
 static void xmap_set(uptr *map, int shift, u32 start_addr, u32 end_addr,
@@ -119,6 +124,11 @@ void cpu68k_map_read_mem(u32 start_addr, u32 end_addr, void *ptr, int is_sub)
   int shift = M68K_MEM_SHIFT;
   int i;
 
+#ifdef GNW_32X_CORE
+  if (is_sub) { S68K_UNSUPPORTED(__func__); return; }
+  r8map = m68k_read8_map;
+  r16map = m68k_read16_map;
+#else
   if (!is_sub) {
     r8map = m68k_read8_map;
     r16map = m68k_read16_map;
@@ -126,6 +136,7 @@ void cpu68k_map_read_mem(u32 start_addr, u32 end_addr, void *ptr, int is_sub)
     r8map = s68k_read8_map;
     r16map = s68k_read16_map;
   }
+#endif
 
   addr -= start_addr;
   addr >>= 1;
@@ -155,6 +166,13 @@ void cpu68k_map_all_ram(u32 start_addr, u32 end_addr, void *ptr, int is_sub)
   int shift = M68K_MEM_SHIFT;
   int i;
 
+#ifdef GNW_32X_CORE
+  if (is_sub) { S68K_UNSUPPORTED(__func__); return; }
+  r8map = m68k_read8_map;
+  r16map = m68k_read16_map;
+  w8map = m68k_write8_map;
+  w16map = m68k_write16_map;
+#else
   if (!is_sub) {
     r8map = m68k_read8_map;
     r16map = m68k_read16_map;
@@ -166,6 +184,7 @@ void cpu68k_map_all_ram(u32 start_addr, u32 end_addr, void *ptr, int is_sub)
     w8map = s68k_write8_map;
     w16map = s68k_write16_map;
   }
+#endif
 
   addr -= start_addr;
   addr >>= 1;
@@ -195,6 +214,11 @@ void cpu68k_map_read_funcs(u32 start_addr, u32 end_addr, u32 (*r8)(u32), u32 (*r
   int shift = M68K_MEM_SHIFT;
   int i;
 
+#ifdef GNW_32X_CORE
+  if (is_sub) { S68K_UNSUPPORTED(__func__); return; }
+  r8map = m68k_read8_map;
+  r16map = m68k_read16_map;
+#else
   if (!is_sub) {
     r8map = m68k_read8_map;
     r16map = m68k_read16_map;
@@ -202,6 +226,7 @@ void cpu68k_map_read_funcs(u32 start_addr, u32 end_addr, u32 (*r8)(u32), u32 (*r
     r8map = s68k_read8_map;
     r16map = s68k_read16_map;
   }
+#endif
 
   ar8 = (ar8 >> 1 ) | MAP_FLAG;
   ar16 = (ar16 >> 1 ) | MAP_FLAG;
@@ -221,6 +246,13 @@ void cpu68k_map_all_funcs(u32 start_addr, u32 end_addr, u32 (*r8)(u32), u32 (*r1
   int shift = M68K_MEM_SHIFT;
   int i;
 
+#ifdef GNW_32X_CORE
+  if (is_sub) { S68K_UNSUPPORTED(__func__); return; }
+  r8map = m68k_read8_map;
+  r16map = m68k_read16_map;
+  w8map = m68k_write8_map;
+  w16map = m68k_write16_map;
+#else
   if (!is_sub) {
     r8map = m68k_read8_map;
     r16map = m68k_read16_map;
@@ -232,6 +264,7 @@ void cpu68k_map_all_funcs(u32 start_addr, u32 end_addr, u32 (*r8)(u32), u32 (*r1
     w8map = s68k_write8_map;
     w16map = s68k_write16_map;
   }
+#endif
 
   ar8 = (ar8 >> 1 ) | MAP_FLAG;
   ar16 = (ar16 >> 1 ) | MAP_FLAG;
