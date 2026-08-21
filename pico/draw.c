@@ -102,7 +102,11 @@ u32 VdpSATCache[2*128];  // VDP sprite cache (1st 32 sprite attr bits)
 
 // sprite cache. stores results of sprite parsing for each display line:
 // [visible_sprites_count, sprl_flags, tile_count, sprites_processed, sprite_idx[sprite_count], last_width]
+#ifdef GNW_32X_CORE
+unsigned char (*HighLnSpr)[HIGHLNSPR_ROW];   /* DTCM; see pico_int.h */
+#else
 unsigned char HighLnSpr[240][4+MAX_LINE_SPRITES+1];
+#endif
 
 int rendstatus_old;
 int rendlines;
