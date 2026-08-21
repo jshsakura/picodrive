@@ -796,20 +796,7 @@ void PicoDrawSetOutBufMD(void *dest, int increment);
 extern int (*PicoScanBegin)(unsigned int num);
 extern int (*PicoScanEnd)(unsigned int num);
 #define MAX_LINE_SPRITES 27	// +1 last sprite width, +4 hdr; total 32
-#ifdef GNW_32X_CORE
-/* 7,680 B of per-line sprite list. As an array it lived in this core's .bss,
- * which the linker puts in ITCM -- the only fast INSTRUCTION memory the chip
- * has -- to hold something touched a few hundred times a frame, not a few
- * million. It is a pointer into the DTCM heap now (allocated in
- * main_md32x.c), which is zero-wait for data exactly like ITCM, so nothing
- * about its own access cost changes and ITCM gets the bytes back. */
-#define HIGHLNSPR_ROW   (4+MAX_LINE_SPRITES+1)
-#define HIGHLNSPR_ROWS  240
-#define HIGHLNSPR_BYTES (HIGHLNSPR_ROWS * HIGHLNSPR_ROW)
-extern unsigned char (*HighLnSpr)[HIGHLNSPR_ROW];
-#else
 extern unsigned char HighLnSpr[240][4+MAX_LINE_SPRITES+1];
-#endif
 extern unsigned char *HighColBase;
 extern int HighColIncrement;
 extern void *DrawLineDestBase;
