@@ -59,7 +59,15 @@ cz80_struc ALIGN_DATA CZ80;
 	ƒ[ƒJƒ‹•Ï”
 ******************************************************************************/
 
-static UINT8 ALIGN_DATA cz80_bad_address[1 << CZ80_FETCH_SFT];
+/* The page every unmapped Z80 fetch bank points at: 0xff everywhere, i.e. RST
+ * 38h, which is what open bus reads as. It is filled once and never written
+ * again -- but it was UINT8 in .bss, and on the Game & Watch port that .bss is
+ * ITCM, the only fast INSTRUCTION memory this chip has. A kilobyte of
+ * read-only 0xff has no business there and no business being fast: nothing
+ * fetches from it unless the guest has jumped into nowhere. Baked const, it
+ * lands in flash with the rest of the core's rodata. */
+static const UINT8 ALIGN_DATA cz80_bad_address[1 << CZ80_FETCH_SFT] =
+	{ [0 ... (1 << CZ80_FETCH_SFT) - 1] = 0xff };
 
 static UINT8 ALIGN_DATA SZ[256];
 static UINT8 ALIGN_DATA SZP[256];
@@ -104,11 +112,9 @@ void Cz80_Init(cz80_struc *CPU)
 
 	memset(CPU, 0, sizeof(cz80_struc));
 
-	memset(cz80_bad_address, 0xff, sizeof(cz80_bad_address));
-
 	for (i = 0; i < CZ80_FETCH_BANK; i++)
 	{
-		CPU->Fetch[i] = (FPTR)cz80_bad_address - (i << CZ80_FETCH_SFT);
+		CPU->Fetch[i] = (FPTR)(uintptr_t)cz80_bad_address - (i << CZ80_FETCH_SFT);
 #if CZ80_ENCRYPTED_ROM
 		CPU->OPFetch[i] = 0;
 #endif
