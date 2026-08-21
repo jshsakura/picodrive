@@ -519,14 +519,35 @@ static INT32 lfo_pm_table[128*8*32]; /* 128 combinations of 7 bits meaningful (o
 /* GNW_32X_CORE: the four purely-constant synthesis tables are precomputed
  * into .rodata (XIP-able from flash) instead of being generated into ~351 KB
  * of writable RAM at init.  Byte-identical to the runtime fill; proven by
- * tools/verify_ym2612_const.c.  (fn_table below stays runtime-filled: it
- * depends on clock/rate/prescaler.) */
+ * tools/verify_ym2612_const.c.  fn_table is gone too, by a different route:
+ * it depended on clock/rate/prescaler, so it could not be baked -- but every
+ * entry was i*C for one C, so it is a multiply now (see YM_FN below). */
 #include "ym2612_const_tables.h"
 #endif
 
 /* there are 2048 FNUMs that can be generated using FNUM/BLK registers
 	but LFO works with one more bit of a precision so we really need 4096 elements */
-static UINT32 fn_table[4096];	/* fnumber->increment counter */
+
+/* fn_table[] used to be exactly that: 4096 UINT32 entries, 16,384 bytes, and on
+ * the Game & Watch port those bytes sat in ITCM -- a quarter of the chip's only
+ * fast INSTRUCTION memory, spent on a table.  Every entry was
+ *
+ *     fn_table[i] = (UINT32)((double)i * C)
+ *
+ * for a single double C fixed at init (see OPNSetPres).  A table of i*C is a
+ * multiply, so this is one now: ym_fn_mul is C in Q32, and YM_FN(i) reproduces
+ * the entry with MUL+UMULL+ADD and no memory access at all.
+ *
+ * Bit-exactness is proven, not assumed: tools/ym_fn_table_proof.c walks all
+ * 4096 entries for every (clock, rate) this port can reach -- NTSC and PAL,
+ * 22050/32000/44100/48000 and both native rates -- and finds zero mismatches at
+ * Q32.  It is also the only shift that does: Q20 and below fit a 32-bit
+ * multiplier but are wrong for some rates, and Q34 overflows.  OPNSetPres
+ * re-runs the same check against the double formula at every init, so a clock
+ * or rate nobody anticipated cannot pass silently. */
+static u64 ym_fn_mul;	/* fnumber->increment counter, as C in Q32 */
+
+#define YM_FN(i)	((UINT32)(((u64)(UINT32)(i) * ym_fn_mul) >> 32))
 
 /* register number to channel number , slot offset */
 #define OPN_CHAN(N) (N&3)
@@ -1269,10 +1290,10 @@ static UINT32 update_lfo_phase(const FM_SLOT *SLOT, UINT32 block_fnum)
 		fn  = block_fnum & 0xfff;
 
 		/* phase increment counter */
-		fc = (fn_table[fn]>>(7-blk));
+		fc = (YM_FN(fn)>>(7-blk));
 
 		fdt = fc + SLOT->DT[crct.CH->kcode];
-		if (fdt < 0) fdt += fn_table[0x7ff*2] >> 2;
+		if (fdt < 0) fdt += YM_FN(0x7ff*2) >> 2;
 
 		return (fdt * SLOT->mul) >> 1;
 	} else
@@ -1362,7 +1383,7 @@ static INLINE void refresh_fc_eg_slot(FM_SLOT *SLOT, int fc, int kc)
 	fdt = fc+SLOT->DT[kc];
 	/* detect overflow */
 //	if (fdt < 0) fdt += fn_table[0x7ff*2] >> (7-blk-1);
-	if (fdt < 0) fdt += fn_table[0x7ff*2] >> 2;
+	if (fdt < 0) fdt += YM_FN(0x7ff*2) >> 2;
 	SLOT->Incr = fdt*SLOT->mul >> 1;
 
 	ksr = kc >> SLOT->KSR;
@@ -1618,12 +1639,24 @@ static void OPNSetPres(int pres)
 
 	/* there are 2048 FNUMs that can be generated using FNUM/BLK registers
         but LFO works with one more bit of a precision so we really need 4096 elements */
-	/* calculate fnumber -> increment counter table */
-	for(i = 0; i < 4096; i++)
+	/* calculate fnumber -> increment counter multiplier.  This replaces a
+	   4096-entry table; see YM_FN above.  -10 because the chip works with
+	   10.10 fixed point, while we use 16.16. */
 	{
-		/* freq table for octave 7 */
-		/* OPN phase increment counter = 20bit */
-		fn_table[i] = (UINT32)( (double)i * 32 * ym2612.OPN.ST.freqbase * (1<<(FREQ_SH-10)) ); /* -10 because chip works with 10.10 fixed point, while we use 16.16 */
+		double fn_c = 32.0 * ym2612.OPN.ST.freqbase * (double)(1<<(FREQ_SH-10));
+		ym_fn_mul = (u64)(fn_c * 4294967296.0 + 0.5);	/* C in Q32 */
+
+		/* Same cost as the fill loop it replaces, and it is the guard: if a
+		   clock/rate ever lands where Q32 is not bit-exact, say so instead of
+		   quietly detuning every channel. */
+		for(i = 0; i < 4096; i++)
+		{
+			if (YM_FN(i) != (UINT32)((double)i * fn_c)) {
+				printf("ym2612: fn_table Q32 mismatch at i=%d (clock=%d rate=%d)\n",
+				       i, (int)ym2612.OPN.ST.clock, (int)ym2612.OPN.ST.rate);
+				break;
+			}
+		}
 	}
 
 	/* LFO freq. table */
@@ -1698,7 +1731,7 @@ static int OPNWriteReg(int r, int v)
 				/* keyscale code */
 				CH->kcode = (blk<<2) | opn_fktable[fn >> 7];
 				/* phase increment counter */
-				CH->fc = fn_table[fn*2]>>(7-blk);
+				CH->fc = YM_FN(fn*2)>>(7-blk);
 
 				/* store fnum in clear form for LFO PM calculations */
 				CH->block_fnum = (blk<<11) | fn;
@@ -1718,7 +1751,7 @@ static int OPNWriteReg(int r, int v)
 				/* keyscale code */
 				ym2612.OPN.SL3.kcode[c]= (blk<<2) | opn_fktable[fn >> 7];
 				/* phase increment counter */
-				ym2612.OPN.SL3.fc[c] = fn_table[fn*2]>>(7-blk);
+				ym2612.OPN.SL3.fc[c] = YM_FN(fn*2)>>(7-blk);
 				ym2612.OPN.SL3.block_fnum[c] = (blk<<11) | fn;
 				ym2612.CH[2].SLOT[SLOT1].Incr=-1;
 			}
@@ -2385,7 +2418,7 @@ static size_t load_channel(const u8 *buf, size_t size, FM_CH *ch)
 
 	fn = ch->block_fnum & 0x7ff;
 	blk = ch->block_fnum >> 11;
-	ch->fc = fn_table[fn*2] >> (7 - blk);
+	ch->fc = YM_FN(fn*2) >> (7 - blk);
 
 	assert(ch_size >= b - slot_size - 1);
 	return slot_size + 1 + ch_size;
@@ -2462,7 +2495,7 @@ void YM2612PicoStateLoad3(const void *buf_, size_t size)
 
 		fn = ym2612.OPN.SL3.block_fnum[i] & 0x7ff;
 		blk = ym2612.OPN.SL3.block_fnum[i] >> 11;
-		ym2612.OPN.SL3.fc[i] = fn_table[fn*2] >> (7 - blk);
+		ym2612.OPN.SL3.fc[i] = YM_FN(fn*2) >> (7 - blk);
 	}
 	ym2612.OPN.pan      = load_u16(buf, &b);
 	ym2612.OPN.eg_cnt   = load_u16(buf, &b);
