@@ -136,7 +136,14 @@ static void do_timing_hacks_end(struct PicoVideo *pv)
   PicoVideoFIFOSync(CYCLES_M68K_LINE);
 
   // need rather tight Z80 sync for emulation of main bus cycle stealing
+#ifdef GNW_Z80_SYNC_SHIFT
+  /* ABLATION: sync every (1<<GNW_Z80_SYNC_SHIFT)th line instead of every odd
+   * one, to price how much of the Z80 bucket is per-sync overhead rather than
+   * Z80 execution. Changes 68K/Z80 interleaving -- measurement only. */
+  if ((Pico.m.scanline & ((1u << GNW_Z80_SYNC_SHIFT) - 1u)) == 1u)
+#else
   if (Pico.m.scanline&1)
+#endif
     if (Pico.m.z80Run && !Pico.m.z80_reset && (PicoIn.opt&POPT_EN_Z80))
       PicoSyncZ80(Pico.t.m68c_aim);
 }
