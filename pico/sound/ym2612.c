@@ -1858,12 +1858,75 @@ static int OPNWriteReg(int r, int v)
 /*      YM2612 local section                                                   */
 /*******************************************************************************/
 
+
+#ifdef RIG_YM_CENSUS
+/* Gameplay census of the FM render path. The nofm ablation priced the whole
+ * YM path at 22.4% of a DOOM frame (8.4ms); this answers where that goes:
+ * how many channels slot_mask admits, how many operators are audible
+ * (vol_out below ENV_QUIET), and how long each render call is. Rig only. */
+#include <stdio.h>
+struct ym_census_s {
+	unsigned long long renders, samples, frames, dac_frames;
+	unsigned long long len_hist[64];
+	unsigned long long ch_on[7];
+	unsigned long long slot_on[25];
+	unsigned long long op_aud[25];
+};
+struct ym_census_s ym_census;
+static void ym_census_render(int length)
+{
+	ym_census.renders++;
+	ym_census.samples += length;
+	if (length >= 0 && length < 64) ym_census.len_hist[length]++;
+}
+void ym_census_frame(void)
+{
+	int c, s, nch = 0, nslot = 0, naud = 0;
+	for (c = 0; c < 6; c++) {
+		for (s = 0; s < 4; s++)
+			if (ym2612.CH[c].SLOT[s].state != EG_OFF) {
+				nslot++;
+				if (ym2612.CH[c].SLOT[s].vol_out < ENV_QUIET) naud++;
+			}
+		if (ym2612.slot_mask & (0xf << (c*4))) nch++;
+	}
+	ym_census.ch_on[nch]++;
+	ym_census.slot_on[nslot]++;
+	ym_census.op_aud[naud]++;
+	if (ym2612.dacen) ym_census.dac_frames++;
+	ym_census.frames++;
+}
+void ym_census_report(void)
+{
+	int i;
+	unsigned long long tot = 0;
+	printf("[32x-ymcensus] frames=%llu renders=%llu samples=%llu dac_frames=%llu\n",
+		ym_census.frames, ym_census.renders, ym_census.samples,
+		ym_census.dac_frames);
+	printf("[32x-ymcensus] ch_on:");
+	for (i = 0; i < 7; i++) printf(" %llu", ym_census.ch_on[i]);
+	printf("\n[32x-ymcensus] slot_on:");
+	for (i = 0; i < 25; i++) printf(" %llu", ym_census.slot_on[i]);
+	printf("\n[32x-ymcensus] op_aud:");
+	for (i = 0; i < 25; i++) printf(" %llu", ym_census.op_aud[i]);
+	printf("\n[32x-ymcensus] len_hist:");
+	for (i = 0; i < 64; i++) tot += ym_census.len_hist[i];
+	for (i = 0; i < 64; i++)
+		if (ym_census.len_hist[i])
+			printf(" %d:%llu", i, ym_census.len_hist[i]);
+	printf(" (other=%llu)\n", ym_census.renders - tot);
+}
+#endif
+
 /* Generate samples for YM2612 */
 int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 {
 	int pan;
 	int active_chs = 0;
 	int flags = stereo ? 1:0;
+#ifdef RIG_YM_CENSUS
+	ym_census_render(length);
+#endif
 
 	// if !is_buf_empty, it means it has valid samples to mix with, else it may contain trash
 	if (is_buf_empty) memset32(buffer, 0, length<<stereo);

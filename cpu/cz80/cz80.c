@@ -250,6 +250,16 @@ static inline unsigned char picodrive_read(unsigned short a)
 unsigned int gnw_z80_fx_seq;
 #endif /* GNW_Z80_IDLE_FOLD */
 
+#ifdef RIG_Z80_HIST
+/* Full guest-PC histogram for the rig. The local PC in Cz80_Exec is a HOST
+ * pointer (guest + BasePC) and READ_OP() has already post-incremented it,
+ * so the guest address of the fetched opcode is (PC - 1 - CPU->BasePC).
+ * rig_32x.c zeroes this at a chosen frame (RIG_Z80_HIST_FROM) so the
+ * report covers the gameplay window, not the title spin. */
+unsigned long long g_z80_pc_hist[0x10000];
+unsigned long long g_z80_insns;
+#endif
+
 INT32 Cz80_Exec(cz80_struc *CPU, INT32 cycles)
 {
 #if CZ80_USE_JUMPTABLE
@@ -269,6 +279,19 @@ INT32 Cz80_Exec(cz80_struc *CPU, INT32 cycles)
 	PC = CPU->PC;
 #if CZ80_ENCRYPTED_ROM
 	OPBase = CPU->OPBase;
+#endif
+#ifdef MD32X_ABL_GUT_CZ80
+	/* Ablation: consume the whole slice without interpreting a single
+	 * guest instruction. Everything the emulator does AROUND the
+	 * interpreter -- slice dispatch in z80if.c, the 68K<->Z80 bus
+	 * interlocks, cycle accounting -- keeps running untouched; only the
+	 * decode loop dies. Returns `cycles` unchanged, which is exactly
+	 * what a slice fully spent interpreting would return, so the sync
+	 * model cannot tell the difference. Guest state freezes and the
+	 * audio goes silent: intended, this is a measurement arm. */
+	CPU->ICount = 0;
+	CPU->ExtraCycles = 0;
+	return cycles;
 #endif
 	CPU->ICount = cycles - CPU->ExtraCycles;
 	CPU->ExtraCycles = 0;
@@ -299,6 +322,10 @@ Cz80_Exec:
 Cz80_Exec_nocheck:
 		data = pzHL;
 		Opcode = READ_OP();
+#ifdef RIG_Z80_HIST
+		g_z80_pc_hist[(unsigned)(PC - 1 - CPU->BasePC) & 0xffff]++;
+		g_z80_insns++;
+#endif
 #if CZ80_EMULATE_R_EXACTLY
 		zR++;
 #endif

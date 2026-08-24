@@ -11,6 +11,18 @@
 #include <assert.h>
 #include "pico_int.h"
 #include "memory.h"
+
+#ifdef RIG_Z80_TRACE
+/* Z80 sound-driver protocol tracer (32X audio HLE recon).
+ * Logs 68K->zram command traffic, Z80->YM2612 address/data writes (DAC
+ * stream bytes are counted, not logged), Z80->PSG and bank-window writes,
+ * frame-stamped via the rig's counter (same link unit). */
+#include <stdio.h>
+extern int rig_frame_no;
+static int rig_ztc_dac_bytes;
+static int rig_ztc_dac_mode; /* addr port saw 0x2a */
+#endif
+
 #include "state.h"
 
 #include "sound/ym2612.h"
@@ -938,6 +950,15 @@ static void PicoWrite8_z80(u32 a, u32 d)
   SekCyclesBurnRun(1);
 
   if ((a & 0x4000) == 0x0000) { // z80 RAM
+#ifdef RIG_Z80_TRACE
+    {
+      u32 zo = a & 0x1fff;
+      if (zo == 0x36 || zo == 0x37 || zo == 0x3f || zo == 0x40 ||
+          (zo >= 0x1b40 && zo < 0x1b80))
+        printf("[ztc] f=%d M2Z zram[%04x]=%02x pc=%06x\n",
+               rig_frame_no, zo, d & 0xff, SekPc);
+    }
+#endif
     PicoMem.zram[a & 0x1fff] = (u8)d;
     return;
   }
@@ -1688,12 +1709,29 @@ static unsigned char z80_md_bank_read(unsigned short a)
 
 static void z80_md_ym2612_write(unsigned int a, unsigned char data)
 {
+#ifdef RIG_Z80_TRACE
+  if ((a & 3) == 0 || (a & 3) == 2) {          /* address ports */
+    rig_ztc_dac_mode = ((a & 3) == 0 && data == 0x2a);
+    printf("[ztc] f=%d Z2YM p%d a=%02x dac=%d\n",
+           rig_frame_no, a & 3, data, rig_ztc_dac_bytes);
+    rig_ztc_dac_bytes = 0;
+  } else {                                     /* data ports */
+    if (rig_ztc_dac_mode)
+      rig_ztc_dac_bytes++;                     /* DAC sample stream: count only */
+    else
+      printf("[ztc] f=%d Z2YM p%d d=%02x\n", rig_frame_no, a & 3, data);
+  }
+#endif
   if (PicoIn.opt & POPT_EN_FM)
     ym2612_write_local(a, data, 1);
 }
 
 static void z80_md_vdp_br_write(unsigned int a, unsigned char data)
 {
+#ifdef RIG_Z80_TRACE
+  if ((a & 0xfff9) == 0x7f11)
+    printf("[ztc] f=%d Z2PSG d=%02x\n", rig_frame_no, data);
+#endif
   if ((a&0xfff9) == 0x7f11) // 7f11 7f13 7f15 7f17
   {
     psg_write_z80(data);
@@ -1703,6 +1741,9 @@ static void z80_md_vdp_br_write(unsigned int a, unsigned char data)
 
   if ((a>>8) == 0x60)
   {
+#ifdef RIG_Z80_TRACE
+    printf("[ztc] f=%d BANK d=%02x\n", rig_frame_no, data);
+#endif
     Pico.m.z80_bank68k >>= 1;
     Pico.m.z80_bank68k |= data << 8;
     Pico.m.z80_bank68k &= 0x1ff; // 9 bits and filled in the new top one
