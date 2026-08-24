@@ -724,6 +724,39 @@ static INLINE void set_sl_rr(FM_SLOT *SLOT, int v)
 
 
 
+#ifdef GNW_32X_CORE
+/* tl2: op_calc's only expensive memory access is the 213 KB ym_tl_tab XIP
+ * load, executed once per operator-sample.  The compose loop in
+ * init_tables() only ever writes rows with y even; the second, aliasing
+ * writer of any (even row, any col) address would need y odd, so the sole
+ * writer of what op_calc (env&=~1) reads is (y=env, x=sin):
+ *
+ *   ym_tl_tab[sin | (env<<7)] == (((env<<2) + ym_sin_tab[sin]) >= 13*TL_RES_LEN)
+ *        ? 0 : ym_tl_tab2[((env<<2)+ym_sin_tab[sin]) & 0xff]
+ *              >> (((env<<2)+ym_sin_tab[sin]) >> 8)
+ *
+ * (ym_tl_tab2[p] = n[p & 0xff] >> (p>>8) by its own fill).  That needs
+ * ym_sin_tab and the first 256 entries of ym_tl_tab2 -- 1 KB of RAM
+ * instead of a flash load per operator-sample.  Bit-exactness is proven,
+ * not assumed: tools/ym_tl2_proof.c checks all 106,496 (even env, sin)
+ * combinations against the runtime fill AND against the exact bytes
+ * linked into the shipped image.  main_md32x.c copies both tables to DTCM
+ * at boot; until then (and in host builds that never call the setter)
+ * the pointers alias the const blobs, so every build stays correct. */
+static const UINT16 *gnw_tl2_sin = ym_sin_tab;
+static const UINT16 *gnw_tl2_n   = ym_tl_tab2;
+
+void md32x_ym2612_set_tl2_tabs(UINT16 *sin_copy, UINT16 *n_copy);
+void md32x_ym2612_set_tl2_tabs(UINT16 *sin_copy, UINT16 *n_copy)
+{
+	int i;
+	for (i = 0; i < 256; i++) sin_copy[i] = ym_sin_tab[i];
+	for (i = 0; i < 256; i++) n_copy[i]   = ym_tl_tab2[i];
+	gnw_tl2_sin = sin_copy;
+	gnw_tl2_n   = n_copy;
+}
+#endif
+
 static INLINE signed int op_calc(UINT32 phase, unsigned int env, signed int pm)
 {
 	int ret, sin = (phase>>16) + (pm>>1);
@@ -736,7 +769,15 @@ static INLINE signed int op_calc(UINT32 phase, unsigned int env, signed int pm)
 	// if (env >= ENV_QUIET) // 384
 	//	return 0;
 
+#ifdef GNW_32X_CORE
+	{
+		int p_ = ((int)env << 2) + gnw_tl2_sin[sin];
+		ret = (p_ >= 13*TL_RES_LEN) ? 0
+			: (gnw_tl2_n[p_ & 0xff] >> (p_ >> 8));
+	}
+#else
 	ret = ym_tl_tab[sin | (env<<7)];
+#endif
 
 	return neg ? -ret : ret;
 }
@@ -752,7 +793,15 @@ static INLINE signed int op_calc1(UINT32 phase, unsigned int env, signed int pm)
 	// if (env >= ENV_QUIET) // 384
 	//	return 0;
 
+#ifdef GNW_32X_CORE
+	{
+		int p_ = ((int)env << 2) + gnw_tl2_sin[sin];
+		ret = (p_ >= 13*TL_RES_LEN) ? 0
+			: (gnw_tl2_n[p_ & 0xff] >> (p_ >> 8));
+	}
+#else
 	ret = ym_tl_tab[sin | (env<<7)];
+#endif
 
 	return neg ? -ret : ret;
 }
