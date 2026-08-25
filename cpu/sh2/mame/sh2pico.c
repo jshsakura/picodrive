@@ -1523,6 +1523,68 @@ unsigned int rig_ophist_lo0[2][256];   /* low byte of the 0x00xx group */
 #define RIG_OPHIST_TICK(sh2, op) ((void)0)
 #endif
 
+/* RIG_OPCOST / RIG_SH2_SKELETON (2026-08-24 rebuild): the picodrive side of
+ * the opcode-cost census whose report block (rig_32x.c, -DRIG_OPCOST) was
+ * committed in ad236375 while these hooks were not -- the numbers quoted in
+ * that message came from a local patch that is gone. Rig-only, off => no code.
+ *
+ * RIG_OPCOST samples 1 dispatched instruction in 64 and times the span from
+ * the top of the dispatch loop to the loop tail -- fetch, PC update, delay
+ * handling, dispatch, handler, icount--, IRQ poll. CMSDK tick quantisation
+ * cancels in the mean over ~1e5 samples per group; the empty-span calibration
+ * every 4096 samples prices the two timer reads themselves.
+ *
+ * RIG_SH2_SKELETON empties the sixteen handler bodies and keeps everything
+ * else, so the whole-loop cost per dispatched instruction becomes the fixed
+ * cost the census is hunting. The per-case counters are volatile so gcc
+ * cannot collapse the jump table back into nothing; their load+store is the
+ * one known bias (~3 host insns), noted in the report. */
+#ifdef RIG_OPCOST
+extern uint32_t rig_timer_now(void);
+unsigned long long rig_opcost[2][16];
+unsigned long long rig_opcnt[2][16];
+unsigned long long rig_opnow_cost, rig_opnow_n;
+static uint32_t rig_op_t0_;
+static unsigned rig_op_ctr, rig_op_armed_, rig_op_smp_;
+#define RIG_OPCOST_T0(sh2) do {                                              \
+	rig_op_armed_ = 0;                                                   \
+	if (!((rig_op_ctr++) & 63)) {                                        \
+		rig_op_t0_ = rig_timer_now();                                \
+		rig_op_armed_ = 1;                                           \
+	}                                                                    \
+} while (0)
+#define RIG_OPCOST_T1(sh2, op) do {                                          \
+	if (rig_op_armed_) {                                                 \
+		int c_ = (sh2)->is_slave & 1;                                \
+		rig_opcost[c_][((op) >> 12) & 0xf] +=                          \
+			(unsigned)rig_timer_now() - rig_op_t0_;               \
+		rig_opcnt[c_][((op) >> 12) & 0xf]++;                          \
+		if (!(rig_op_smp_++ & 63)) {                                   \
+			uint32_t a_ = rig_timer_now(), b_ = rig_timer_now();  \
+			rig_opnow_cost += b_ - a_;                            \
+			rig_opnow_n++;                                        \
+		}                                                            \
+	}                                                                    \
+} while (0)
+#else
+#define RIG_OPCOST_T0(sh2) ((void)0)
+#define RIG_OPCOST_T1(sh2, op) ((void)0)
+#endif
+
+#ifdef RIG_GBR_CENSUS
+/* 0xC5 = MOV.W @(d,GBR),R0 is 83.84%% of the msh2 0xC group (OPHIST,
+ * 2026-08-24) while the group costs 4.6 ticks against the 1.6-1.9
+ * baseline.  GBR's value decides whether that is a lever (points into
+ * ROM/SDRAM -> read fast path missed every time) or real work (points
+ * into the 32X register file -> side-effecting I/O reads).  One bucket
+ * per GBR top byte, split master/slave. */
+unsigned long long rig_gbr_hist[2][256];
+#endif
+
+#ifdef RIG_SH2_SKELETON
+static volatile unsigned rig_skel_hit[16];
+#endif
+
 int sh2_execute_interpreter(SH2 *sh2, int cycles)
 {
 	UINT32 opcode;
@@ -1545,6 +1607,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 
 	do
 	{
+		RIG_OPCOST_T0(sh2);
 		if (sh2->delay)
 		{
 			sh2->ppc = sh2->delay;
@@ -1660,6 +1723,30 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		 * left for a default to catch: gcc drops the `cmp #14 / bhi`
 		 * bounds check in front of the tbh. opcode comes from a ldrh
 		 * (or the literal 9), so the mask is a hint, never a change. */
+#ifdef RIG_SH2_SKELETON
+		/* Ablation: dispatch and everything around it runs, the
+		 * handler bodies do not. What remains per dispatched
+		 * instruction IS the fixed cost being isolated. */
+		switch ((opcode >> 12) & 0xf)
+		{
+		case 0x0: rig_skel_hit[0x0]++; break;
+		case 0x1: rig_skel_hit[0x1]++; break;
+		case 0x2: rig_skel_hit[0x2]++; break;
+		case 0x3: rig_skel_hit[0x3]++; break;
+		case 0x4: rig_skel_hit[0x4]++; break;
+		case 0x5: rig_skel_hit[0x5]++; break;
+		case 0x6: rig_skel_hit[0x6]++; break;
+		case 0x7: rig_skel_hit[0x7]++; break;
+		case 0x8: rig_skel_hit[0x8]++; break;
+		case 0x9: rig_skel_hit[0x9]++; break;
+		case 0xA: rig_skel_hit[0xA]++; break;
+		case 0xB: rig_skel_hit[0xB]++; break;
+		case 0xC: rig_skel_hit[0xC]++; break;
+		case 0xD: rig_skel_hit[0xD]++; break;
+		case 0xE: rig_skel_hit[0xE]++; break;
+		case 0xF: rig_skel_hit[0xF]++; break;
+		}
+#else
 		switch ((opcode >> 12) & 0xf)
 		{
 		case 0x0: op0000(sh2, opcode); break;
@@ -1676,11 +1763,17 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		case 0xA: GNW_FASTLOOP_GATE_A(sh2, opcode, gnw_direct);
 		          op1010(sh2, opcode); break;
 		case 0xB: op1011(sh2, opcode); break;
-		case 0xC: op1100(sh2, opcode); break;
+		case 0xC:
+#ifdef RIG_GBR_CENSUS
+			if ((opcode >> 8) == 0xc5)
+				rig_gbr_hist[(sh2)->is_slave & 1][((sh2)->gbr >> 24) & 0xff]++;
+#endif
+			op1100(sh2, opcode); break;
 		case 0xD: op1101(sh2, opcode); break;
 		case 0xE: op1110(sh2, opcode); break;
 		case 0xF: op1111(sh2, opcode); break;
 		}
+#endif
 
 		sh2->icount--;
 
@@ -1723,6 +1816,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 			}
 			sh2->test_irq = 0;
 		}
+		RIG_OPCOST_T1(sh2, opcode);
 	}
 	while (sh2->icount > 0 || sh2->delay);	/* can't interrupt before delay */
 
