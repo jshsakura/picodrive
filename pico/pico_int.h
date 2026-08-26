@@ -270,7 +270,7 @@ extern struct DrZ80 drZ80;
 
 #include <cpu/sh2/sh2.h>
 
-extern SH2 sh2s[2];
+extern SH2 *sh2s;
 #define msh2 sh2s[0]
 #define ssh2 sh2s[1]
 

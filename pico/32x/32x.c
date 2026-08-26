@@ -18,7 +18,9 @@
 #endif
 
 struct Pico32x Pico32x;
-SH2 sh2s[2];
+SH2 *sh2s;  /* DTCM on device (main_md32x.c wiring), static storage in the
+            * rig (rig_32x.c). Was SH2 sh2s[2] in .bss -- the hot register
+            * file was losing the 16 KB D-cache to guest SDRAM streaming. */
 
 #define SH2_IDLE_STATES (SH2_STATE_CPOLL|SH2_STATE_VPOLL|SH2_STATE_RPOLL|SH2_STATE_SLEEP)
 
