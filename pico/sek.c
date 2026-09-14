@@ -97,6 +97,13 @@ static int SekUnrecognizedOpcode()
 #endif
 
 
+#if defined(EMU_M68K) || defined(EMU_G68K)
+static int SekTasCallback(void)
+{
+  return 0; // main Genesis 68K has no TAS memory writeback
+}
+#endif
+
 #ifdef EMU_M68K
 static int SekIntAckM68K(int level)
 {
@@ -104,10 +111,6 @@ static int SekIntAckM68K(int level)
   return M68K_INT_ACK_AUTOVECTOR;
 }
 
-static int SekTasCallback(void)
-{
-  return 0; // no writeback
-}
 #endif
 
 
@@ -163,6 +166,7 @@ PICO_INTERNAL void SekInit(void)
   g68k_bus_init();          // safe memory_map defaults until pico maps arrive
   m68k_init();
   m68k_set_int_ack_callback(SekIntAckG68K);
+  m68k_set_tas_instr_callback(SekTasCallback);
 #endif
 }
 
@@ -269,8 +273,19 @@ PICO_INTERNAL void SekPackCpu(unsigned char *cpu, int is_sub)
     cpu[0x4c] = m68k.int_level >> 8;
     cpu[0x4d] = m68k.stopped;
   }
-  else
-    memset(cpu, 0, 0x4e); // no sub-68k in this backend
+#ifdef GNW_MCD_CORE
+  else {
+    m68ki_cpu_core *context = g68k_s68k_active ? &m68k : &PicoCpuGS68k;
+    memcpy(cpu, context->dar, 0x40);
+    *(u32 *)(cpu+0x40) = context->pc;
+    *(u32 *)(cpu+0x44) = SekSrS68k;
+    *(u32 *)(cpu+0x48) = context->sp[context->s_flag ^ 4];
+    cpu[0x4c] = context->int_level >> 8;
+    cpu[0x4d] = context->stopped;
+  }
+#else
+  else memset(cpu, 0, 0x4e);
+#endif
 #endif
 
   if (is_sub) {
@@ -331,6 +346,16 @@ PICO_INTERNAL void SekUnpackCpu(const unsigned char *cpu, int is_sub)
     m68k.int_level = cpu[0x4c] << 8;
     m68k.stopped = cpu[0x4d];
   }
+#ifdef GNW_MCD_CORE
+  else {
+    m68ki_cpu_core *context = &PicoCpuGS68k;
+    memcpy(context->dar, cpu, 0x40);
+    context->pc = *(u32 *)(cpu+0x40);
+    context->sp[context->s_flag ^ 4] = *(u32 *)(cpu+0x48);
+    context->int_level = cpu[0x4c] << 8;
+    context->stopped = cpu[0x4d];
+  }
+#endif
 #endif
   if (is_sub) {
 #ifndef GNW_32X_CORE   // no sub-68k without CD (see SekPackCpu)

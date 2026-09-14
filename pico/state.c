@@ -215,6 +215,31 @@ static int write_chunk(unsigned char name, int len, void *data, void *file)
   return (bwritten == len + 4 + 1);
 }
 
+#ifdef GNW_MCD_SPLIT
+static int write_chunk_mcd_prg(unsigned char name, void *file)
+{
+  int len = 0x80000;
+  size_t written = 0;
+  int i;
+  written += areaWrite(&name, 1, 1, file);
+  written += areaWrite(&len, 1, 4, file);
+  for (i = 0; i < 8; i++)
+    written += areaWrite(Pico_mcd->prg_ram_b[i], 1, 0x10000, file);
+  return written == (size_t)len + 5;
+}
+
+static int write_chunk_mcd_pcm(unsigned char name, void *file)
+{
+  int len = 0x10000;
+  size_t written = 0;
+  written += areaWrite(&name, 1, 1, file);
+  written += areaWrite(&len, 1, 4, file);
+  written += areaWrite(Pico_mcd->pcm_ram, 1, 0x8000, file);
+  written += areaWrite(Pico_mcd->pcm_ram_hi, 1, 0x8000, file);
+  return written == (size_t)len + 5;
+}
+#endif
+
 #ifdef GNW_32X_CORE
 // No CD, no SMS: the only variable-size chunks routed through the temp buffer
 // are IOPORTSv2 / FMv3 / FM_TIMERS, all well under 4K (sound.c's own FMv3
@@ -223,6 +248,20 @@ static int write_chunk(unsigned char name, int len, void *data, void *file)
 #define CHUNK_LIMIT_W 4096
 #else
 #define CHUNK_LIMIT_W 18772 // sizeof(cdc)
+#endif
+
+#ifdef GNW_MCD_SPLIT
+/* The embedded frontend supplies a fixed scratch block outside the DTCM
+ * heap. Host tools that enable the split layout use these weak defaults. */
+__attribute__((weak)) void *gnw_mcd_state_alloc(size_t size)
+{
+  return malloc(size);
+}
+
+__attribute__((weak)) void gnw_mcd_state_free(void *ptr)
+{
+  free(ptr);
+}
 #endif
 
 #define CHECKED_WRITE(name,len,data) { \
@@ -256,7 +295,11 @@ static int state_save(void *file)
   int retval = -1;
   int len;
 
+#ifdef GNW_MCD_SPLIT
+  buf2 = gnw_mcd_state_alloc(CHUNK_LIMIT_W);
+#else
   buf2 = malloc(CHUNK_LIMIT_W);
+#endif
   if (buf2 == NULL)
     return -1;
 
@@ -300,7 +343,7 @@ static int state_save(void *file)
       SekInitIdleDet();
   }
   else {
-#ifndef GNW_32X_CORE   // GNW: PAHW_SMS is never set (no SMS/ym2413 in the build)
+#if !defined(GNW_32X_CORE) && !defined(NO_SMS) // GNW: no SMS/ym2413 in these builds
     CHECKED_WRITE_BUFF(CHUNK_SMS, Pico.ms);
     // only store the FM unit state if it was really used
     if (Pico.m.hardware & PMS_HW_FMUSED) {
@@ -336,10 +379,20 @@ static int state_save(void *file)
       sizeof(Pico_mcd->m.hint_vector));
 
     CHECKED_WRITE_BUFF(CHUNK_S68K,     buff);
+#ifdef GNW_MCD_SPLIT
+    if (!write_chunk_mcd_prg(CHUNK_PRG_RAM, file)) goto out;
+    CHECKED_WRITE(CHUNK_WORD_RAM, 0x40000, Pico_mcd->word_ram2M); // in 2M format
+    if (!write_chunk_mcd_pcm(CHUNK_PCM_RAM, file)) goto out;
+#else
     CHECKED_WRITE_BUFF(CHUNK_PRG_RAM,  Pico_mcd->prg_ram);
     CHECKED_WRITE_BUFF(CHUNK_WORD_RAM, Pico_mcd->word_ram2M); // in 2M format
     CHECKED_WRITE_BUFF(CHUNK_PCM_RAM,  Pico_mcd->pcm_ram);
+#endif
+#ifdef GNW_MCD_SPLIT
+    CHECKED_WRITE(CHUNK_BRAM, 0x2000, Pico_mcd->bram);
+#else
     CHECKED_WRITE_BUFF(CHUNK_BRAM,     Pico_mcd->bram);
+#endif
     CHECKED_WRITE_BUFF(CHUNK_GA_REGS,  Pico_mcd->s68k_regs); // GA regs, not CPU regs
     CHECKED_WRITE_BUFF(CHUNK_PCM,      Pico_mcd->pcm);
     CHECKED_WRITE_BUFF(CHUNK_MISC_CD,  Pico_mcd->m);
@@ -405,8 +458,13 @@ static int state_save(void *file)
   retval = 0;
 
 out:
-  if (buf2 != NULL)
+  if (buf2 != NULL) {
+#ifdef GNW_MCD_SPLIT
+    gnw_mcd_state_free(buf2);
+#else
     free(buf2);
+#endif
+  }
   return retval;
 }
 
@@ -438,8 +496,8 @@ static int g_read_offs = 0;
 
 #define CHECKED_READ_BUFF(buff) CHECKED_READ2(sizeof(buff), &buff);
 
-#ifdef GNW_32X_CORE
-#define CHUNK_LIMIT_R CHUNK_LIMIT_W // temp buffer shrunk with the CD chunks gone
+#if defined(GNW_32X_CORE) || defined(GNW_MCD_SPLIT)
+#define CHUNK_LIMIT_R CHUNK_LIMIT_W // only states created by this embedded port
 #else
 #define CHUNK_LIMIT_R 0x10960 // sizeof(old_cdc)
 #endif
@@ -453,7 +511,7 @@ static int g_read_offs = 0;
 // variable-size chunk into the temp buffer: GNW bounds it (the buffer is only
 // CHUNK_LIMIT sized and NDEBUG strips the packers' asserts), upstream keeps
 // its historical unbounded read for compatibility with old oversized states.
-#ifdef GNW_32X_CORE
+#if defined(GNW_32X_CORE) || defined(GNW_MCD_SPLIT)
 #define CHECKED_READ_VAR(data) CHECKED_READ_LIM(data)
 #else
 #define CHECKED_READ_VAR(data) CHECKED_READ(len, data)
@@ -478,7 +536,11 @@ static int state_load(void *file)
   memset(buff_s68k, 0, sizeof(buff_s68k));
   memset(buff_z80, 0, sizeof(buff_z80));
 
+#ifdef GNW_MCD_SPLIT
+  buf = gnw_mcd_state_alloc(CHUNK_LIMIT_R);
+#else
   buf = malloc(CHUNK_LIMIT_R);
+#endif
   if (buf == NULL)
     return -1;
 
@@ -491,7 +553,9 @@ static int state_load(void *file)
 #ifndef GNW_32X_CORE
   memset(pcd_event_times, 0, sizeof(pcd_event_times));
 #endif
+#ifndef NO_32X
   memset(p32x_event_times, 0, sizeof(p32x_event_times));
+#endif
 
   while (!areaEof(file))
   {
@@ -528,7 +592,7 @@ static int state_load(void *file)
 
       case CHUNK_IOPORTS: CHECKED_READ_BUFF(PicoMem.ioports); break;
       case CHUNK_PSG:     CHECKED_READ2(28*4, sn76496_regs); break;
-#ifndef GNW_32X_CORE   // GNW: no ym2413 in the build; an unknown chunk is skipped
+#if !defined(GNW_32X_CORE) && !defined(NO_SMS) // GNW: no ym2413; skip unknown chunk
       case CHUNK_YM2413:
         CHECKED_READ(len, buf);
         ym2413_unpack_state(buf, len);
@@ -565,10 +629,27 @@ static int state_load(void *file)
         CHECKED_READ_BUFF(buff_s68k);
         break;
 
+#ifdef GNW_MCD_SPLIT
+      case CHUNK_PRG_RAM:
+        if (len != 0x80000) R_ERROR_RETURN("bad split PRG RAM size");
+        for (int i = 0; i < 8; i++) CHECKED_READ(0x10000, Pico_mcd->prg_ram_b[i]);
+        break;
+      case CHUNK_WORD_RAM: CHECKED_READ2(0x40000, Pico_mcd->word_ram2M); break;
+      case CHUNK_PCM_RAM:
+        if (len != 0x10000) R_ERROR_RETURN("bad split PCM RAM size");
+        CHECKED_READ(0x8000, Pico_mcd->pcm_ram);
+        CHECKED_READ(0x8000, Pico_mcd->pcm_ram_hi);
+        break;
+#else
       case CHUNK_PRG_RAM:  CHECKED_READ_BUFF(Pico_mcd->prg_ram); break;
       case CHUNK_WORD_RAM: CHECKED_READ_BUFF(Pico_mcd->word_ram2M); break;
       case CHUNK_PCM_RAM:  CHECKED_READ_BUFF(Pico_mcd->pcm_ram); break;
+#endif
+#ifdef GNW_MCD_SPLIT
+      case CHUNK_BRAM:     CHECKED_READ2(0x2000, Pico_mcd->bram); break;
+#else
       case CHUNK_BRAM:     CHECKED_READ_BUFF(Pico_mcd->bram); break;
+#endif
       case CHUNK_GA_REGS:  CHECKED_READ_BUFF(Pico_mcd->s68k_regs); break;
       case CHUNK_PCM:      CHECKED_READ_BUFF(Pico_mcd->pcm); break;
       case CHUNK_MISC_CD:  CHECKED_READ_BUFF(Pico_mcd->m); break;
@@ -695,8 +776,10 @@ readend:
     PicoStateLoadedMS();
 #endif
 
+#ifndef NO_32X
   if (PicoIn.AHW & PAHW_32X)
     Pico32xStateLoaded(1);
+#endif
 
   if (PicoLoadStateHook != NULL)
     PicoLoadStateHook();
@@ -711,8 +794,10 @@ readend:
 
   z80_unpack(buff_z80);
 
+#ifndef NO_32X
   if (PicoIn.AHW & PAHW_32X)
     Pico32xStateLoaded(0);
+#endif
 #ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_MCD)
     pcd_state_loaded();
@@ -727,7 +812,11 @@ readend:
   retval = 0;
 
 out:
+#ifdef GNW_MCD_SPLIT
+  gnw_mcd_state_free(buf);
+#else
   free(buf);
+#endif
   return retval;
 }
 

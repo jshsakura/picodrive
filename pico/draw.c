@@ -2093,6 +2093,7 @@ void PicoDrawSetCallbacks(int (*begin)(unsigned int num), int (*end)(unsigned in
 {
   PicoScanBegin = NULL;
   PicoScanEnd = NULL;
+#ifndef NO_32X
   PicoScan32xBegin = NULL;
   PicoScan32xEnd = NULL;
 
@@ -2101,9 +2102,12 @@ void PicoDrawSetCallbacks(int (*begin)(unsigned int num), int (*end)(unsigned in
     PicoScan32xEnd = end;
   }
   else {
+#endif
     PicoScanBegin = begin;
     PicoScanEnd = end;
+#ifndef NO_32X
   }
+#endif
 }
 
 void PicoDrawInit(void)

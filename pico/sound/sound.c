@@ -11,7 +11,7 @@
 #include <string.h>
 #include "../pico_int.h"
 #include "ym2612.h"
-#ifndef GNW_32X_CORE
+#if !defined(GNW_32X_CORE) && !defined(NO_SMS)
 #include "ym2413.h"
 #endif
 #include "sn76496.h"
@@ -50,7 +50,7 @@ static int (*PsndFMUpdate)(s32 *buffer, int length, int stereo, int is_buf_empty
 
 PICO_INTERNAL void PsndInit(void)
 {
-#ifndef GNW_32X_CORE
+#if !defined(GNW_32X_CORE) && !defined(NO_SMS)
   opll = OPLL_new(OSC_NTSC/15, OSC_NTSC/15/72);
   OPLL_setChipType(opll,0);
   OPLL_reset(opll);
@@ -59,7 +59,7 @@ PICO_INTERNAL void PsndInit(void)
 
 PICO_INTERNAL void PsndExit(void)
 {
-#ifndef GNW_32X_CORE
+#if !defined(GNW_32X_CORE) && !defined(NO_SMS)
   OPLL_delete(opll);
   opll = NULL;
 #endif
@@ -90,7 +90,7 @@ static int YM2612UpdateFIR(s32 *buffer, int length, int stereo, int is_buf_empty
   return ymchans;
 }
 
-#ifndef GNW_32X_CORE
+#if !defined(GNW_32X_CORE) && !defined(NO_SMS)
 // resample SMS FM from its native 49716Hz/49262Hz with polyphase FIR filter
 static void YM2413Update(s32 *buffer, int length, int stereo)
 {
@@ -151,7 +151,7 @@ void PsndRerate(int preserve_state)
   void *state = NULL;
   int target_fps = Pico.m.pal ? 50 : 60;
   int target_lines = Pico.m.pal ? 313 : 262;
-#ifndef GNW_32X_CORE
+#if !defined(GNW_32X_CORE) && !defined(NO_SMS)
   int sms_clock = Pico.m.pal ? OSC_PAL/15 : OSC_NTSC/15;
   int ym2413_rate = (sms_clock + 36) / 72;
 #endif
@@ -173,7 +173,7 @@ void PsndRerate(int preserve_state)
       state_size = YM2612PicoStateSave3(state, state_size);
   }
 
-#ifndef GNW_32X_CORE
+#if !defined(GNW_32X_CORE) && !defined(NO_SMS)
   if (PicoIn.AHW & PAHW_SMS) {
     OPLL_setRate(opll, ym2413_rate);
     if (!preserve_state)

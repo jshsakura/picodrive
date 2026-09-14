@@ -843,7 +843,7 @@ int PicoCartInsert(unsigned char *rom, unsigned int romsize, const char *carthw_
   // notaz: add a 68k "jump one op back" opcode to the end of ROM.
   // This will hang the emu, but will prevent nasty crashes.
   // note: 4 bytes are padded to every ROM
-#ifndef GNW_32X_CORE
+#if !defined(GNW_32X_CORE) && !defined(GNW_MCD_SPLIT)
   if (rom != NULL)
     *(u32 *)(rom+romsize) = CPU_BE2(0x6000FFFE);
 #endif
@@ -877,7 +877,7 @@ int PicoCartInsert(unsigned char *rom, unsigned int romsize, const char *carthw_
   PicoLoadStateHook = NULL;
   carthw_chunks = NULL;
 
-  if (!(PicoIn.AHW & (PAHW_SMS|PAHW_PICO)))
+  if (!(PicoIn.AHW & (PAHW_SMS|PAHW_PICO|PAHW_MCD)))
     PicoCartDetect(carthw_cfg);
 #ifndef GNW_32X_CORE
   if (PicoIn.AHW & PAHW_SMS)

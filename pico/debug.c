@@ -351,7 +351,18 @@ void PDebugDumpMem(void)
 
   if (PicoIn.AHW & PAHW_MCD)
   {
+#ifdef GNW_MCD_SPLIT
+    dump_ram(Pico_mcd->prg_ram_b[0], "dumps/prg_ram_0.bin");
+    dump_ram(Pico_mcd->prg_ram_b[1], "dumps/prg_ram_1.bin");
+    dump_ram(Pico_mcd->prg_ram_b[2], "dumps/prg_ram_2.bin");
+    dump_ram(Pico_mcd->prg_ram_b[3], "dumps/prg_ram_3.bin");
+    dump_ram(Pico_mcd->prg_ram_b[4], "dumps/prg_ram_4.bin");
+    dump_ram(Pico_mcd->prg_ram_b[5], "dumps/prg_ram_5.bin");
+    dump_ram(Pico_mcd->prg_ram_b[6], "dumps/prg_ram_6.bin");
+    dump_ram(Pico_mcd->prg_ram_b[7], "dumps/prg_ram_7.bin");
+#else
     dump_ram(Pico_mcd->prg_ram, "dumps/prg_ram.bin");
+#endif
     if (Pico_mcd->s68k_regs[3]&4) // 1M mode?
       wram_1M_to_2M(Pico_mcd->word_ram2M);
     dump_ram(Pico_mcd->word_ram2M, "dumps/word_ram_2M.bin");

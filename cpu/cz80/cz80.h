@@ -68,7 +68,7 @@ extern "C" {
 #define PICODRIVE_HACKS			1
 #define CZ80_LITTLE_ENDIAN		CPU_IS_LE
 #define CZ80_USE_JUMPTABLE		1
-#ifdef GNW_32X_CORE
+#if defined(GNW_32X_CORE) || defined(GNW_CONST_TABLES)
 // Game & Watch 32X core: RAM is the binding constraint (724KB overlay).
 // The big flags array (SZHVC_add/SZHVC_sub) costs 256KB of .bss; computing the
 // flags inline instead is spike-verified byte-identical for this core.

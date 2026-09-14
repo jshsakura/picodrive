@@ -265,6 +265,9 @@ static void do_dma(enum dma_type type, int bytes_in)
   int dst_limit = 0;
   uint8 *dst;
   int len;
+#ifdef GNW_MCD_SPLIT
+  int prg_split = 0;
+#endif
 
   elprintf(EL_CD, "dma %d %04x->%04x %x",
     type, cdc.dac, dst_addr, bytes_in);
@@ -277,7 +280,7 @@ static void do_dma(enum dma_type type, int bytes_in)
         elprintf(EL_ANOMALY, "pcm dma oflow: %x %x", dst_addr, words);
         bytes = 0x1000 - dst_addr;
       }
-      dst = Pico_mcd->pcm_ram_b[Pico_mcd->pcm.bank];
+      dst = mcd_pcm_ptr(Pico_mcd, Pico_mcd->pcm.bank << 12);
       dst = dst + dst_addr;
       while (bytes > 0)
       {
@@ -296,7 +299,12 @@ static void do_dma(enum dma_type type, int bytes_in)
 
     case prg_ram_dma_w:
       dst_addr <<= 3;
+#ifdef GNW_MCD_SPLIT
+      dst = NULL;
+      prg_split = 1;
+#else
       dst = Pico_mcd->prg_ram + dst_addr;
+#endif
       dst_limit = 0x80000;
       break;
 
@@ -329,6 +337,20 @@ static void do_dma(enum dma_type type, int bytes_in)
   }
   while (words > 0)
   {
+#ifdef GNW_MCD_SPLIT
+    if (prg_split) {
+      int bank_left = 0x10000 - (dst_addr & 0xffff);
+      len = words * 2;
+      if (len > bank_left) len = bank_left;
+      if (len > 0x4000 - src_addr) len = 0x4000 - src_addr;
+      dst = Pico_mcd->prg_ram_b[(dst_addr >> 16) & 7] + (dst_addr & 0xffff);
+      memcpy16bswap((void *)dst, cdc.ram + src_addr, len / 2);
+      dst_addr += len;
+      src_addr = (src_addr + len) & 0x3fff;
+      words -= len / 2;
+      continue;
+    }
+#endif
     if (src_addr + words * 2 > 0x4000) {
       len = 0x4000 - src_addr;
       memcpy16bswap((void *)dst, cdc.ram + src_addr, len / 2);

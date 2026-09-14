@@ -517,7 +517,11 @@
 // global variable
 ///////////////////
 
+#ifdef FAMEC_CONST_JUMPTABLE
+static u32 initialised = 1;
+#else
 static u32 initialised = 0;
+#endif
 
 #ifdef PICODRIVE_HACK
 extern M68K_CONTEXT PicoCpuFS68k;
@@ -526,7 +530,18 @@ extern M68K_CONTEXT PicoCpuFS68k;
 /* Custom function handler */
 typedef void (*opcode_func)(M68K_CONTEXT *ctx);
 
+#ifdef FAMEC_CONST_JUMPTABLE
+#define FAMEC_OP(name) static void OP_##name(M68K_CONTEXT *ctx);
+#include "famec_jumptable_decl.h"
+#undef FAMEC_OP
+static opcode_func const JumpTable[0x10000] = {
+#define FAMEC_OP(name) (opcode_func)&OP_##name,
+#include "famec_jumptable_const.h"
+#undef FAMEC_OP
+};
+#else
 static opcode_func JumpTable[0x10000];
+#endif
 
 // exception cycle table (taken from musashi core)
 static const s32 exception_cycle_table[256] =
@@ -954,9 +969,17 @@ famec_End:
 init_jump_table:
 #else
 }
+#ifdef FAMEC_CONST_JUMPTABLE
+static int init_jump_table(void) { return 0; }
+#ifdef PICODRIVE_HACK
+int fm68k_idle_install(void) { return 0; }
+int fm68k_idle_remove(void) { return 0; }
+#endif
+#else
 
 static int init_jump_table(void)
 #endif
+#ifndef FAMEC_CONST_JUMPTABLE
 {
 	u32 i, j;
 
@@ -5026,6 +5049,7 @@ int fm68k_idle_remove(void)
 	return 0;
 }
 #endif // PICODRIVE_HACK
+#endif /* !FAMEC_CONST_JUMPTABLE */
 
 #ifndef FAMEC_NO_GOTOS
 }
@@ -5047,3 +5071,4 @@ int fm68k_idle_remove(void)
 }
 #endif
 #endif // FAMEC_NO_GOTOS
+#endif /* FAMEC_CONST_JUMPTABLE */

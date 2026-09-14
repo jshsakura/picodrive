@@ -94,13 +94,13 @@ void pcd_pcm_sync(unsigned int to)
 
     for (s = 0; s < steps; s++)
     {
-      smp = Pico_mcd->pcm_ram[addr >> PCM_STEP_SHIFT];
+      smp = *mcd_pcm_ptr(Pico_mcd, addr >> PCM_STEP_SHIFT);
 
       // test for loop signal
       if (smp == 0xff)
       {
         addr = ch->regs[4] + (ch->regs[5]<<8); // loop_addr
-        smp = Pico_mcd->pcm_ram[addr];
+        smp = *mcd_pcm_ptr(Pico_mcd, addr);
         addr <<= PCM_STEP_SHIFT;
         if (smp == 0xff)
           break;

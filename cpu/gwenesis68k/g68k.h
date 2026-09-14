@@ -11,9 +11,10 @@
  * This header is what picodrive-side code (pico_int.h, sek.c, memory.c,
  * pico_cmn.c) includes; g68k_bus.c implements the map bridge.
  *
- * Constraints:
- *  - single context => no Sega CD sub-68k. pico_int.h stubs the S68k macros
- *    so full (non-GNW) builds still compile, but MCD must not be run.
+ * GNW_MCD_CORE adds a second saved context for the Sega CD sub-68k.  The
+ * interpreter itself remains single-global, so mcd.c swaps the complete
+ * context around each sub-CPU slice.  Both contexts retain their own memory
+ * maps and callbacks.
  *  - m68k.cycles is rebased to 0 at every timeslice (SekExecM68k), so the
  *    uint32 up-counter can never overflow and m68k_run() can never see an
  *    "already ahead" target.
@@ -41,6 +42,12 @@ extern int g68k_not_polling;
  * [0] fake cycles-left lvalue, [1] fake not_polling lvalue */
 extern int g68k_s68k_stub[2];
 
+#ifdef GNW_MCD_CORE
+extern m68ki_cpu_core PicoCpuGS68k;
+extern int g68k_s68k_active;
+unsigned int g68k_get_s68k_sr(void);
+#endif
+
 /* one-time init: point every memory_map page at safe defaults (generic
  * picodrive dispatchers + a harmless fetch base) */
 void g68k_bus_init(void);
@@ -51,5 +58,9 @@ void g68k_bus_init(void);
  * DRAM swap, ...) stay in sync. */
 void g68k_map_sync_range(unsigned int start_addr, unsigned int end_addr);
 void g68k_map_sync_all(void);
+#ifdef GNW_MCD_CORE
+void g68k_map_sync_s68k_range(unsigned int start_addr, unsigned int end_addr);
+void g68k_bus_init_s68k(void);
+#endif
 
 #endif /* G68K_BRIDGE_H */

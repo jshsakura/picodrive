@@ -70,7 +70,7 @@ static void xmap_set(uptr *map, int shift, u32 start_addr, u32 end_addr,
     return;
   }
 
-#ifdef GNW_32X_CORE
+#if defined(GNW_32X_CORE) || defined(GNW_MCD_SPLIT)
   // Thumb function pointers carry bit0 set; strip it before the alignment
   // check or EVERY function mapping is rejected here (and the map keeps its
   // stale entry). Call sites re-OR the Thumb bit via MAP_FUNC. No-op on
@@ -125,6 +125,11 @@ void cpu68k_map_set(uptr *map, u32 start_addr, u32 end_addr,
   if (map == m68k_read8_map || map == m68k_read16_map ||
       map == m68k_write8_map || map == m68k_write16_map)
     g68k_map_sync_range(start_addr, end_addr);
+#ifdef GNW_MCD_SPLIT
+  else if (map == s68k_read8_map || map == s68k_read16_map ||
+           map == s68k_write8_map || map == s68k_write16_map)
+    g68k_map_sync_s68k_range(start_addr, end_addr);
+#endif
 #endif
 }
 

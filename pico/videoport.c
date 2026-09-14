@@ -535,6 +535,10 @@ static void DmaSlow(int len, u32 source)
   u16 *r, *base = NULL;
   u32 mask = 0x1ffff;
   int lc = SekCyclesDone()-Pico.t.m68c_line_start;
+#ifdef GNW_MCD_SPLIT
+  int prg_split = 0;
+  u32 prg_base = 0;
+#endif
 
   elprintf(EL_VDPDMA, "DmaSlow[%i] %06x->%04x len %i inc=%i blank %i [%u] @ %06x",
     pvid->type, source, a, len, inc, (pvid->status&SR_VB)||!(pvid->reg[1]&0x40),
@@ -571,7 +575,13 @@ static void DmaSlow(int len, u32 source)
       }
       source -= 2;
     } else if ((source & 0xfe0000) == pcd_base_address+0x020000) { // Prg Ram
+#ifdef GNW_MCD_SPLIT
+      prg_split = 1;
+      prg_base = (r3 >> 6) * 0x20000;
+      base = (u16 *)Pico_mcd->prg_ram_b[0]; /* validity sentinel; reads below use pages */
+#else
       base = (u16 *)Pico_mcd->prg_ram_b[r3 >> 6];
+#endif
       source -= 2; // XXX: test
     } else // Rom
       base = m68k_dma_source(source);
@@ -600,7 +610,11 @@ static void DmaSlow(int len, u32 source)
     case 1: // vram
       e = a + len*2-1;
       r = PicoMem.vram;
-      if (inc == 2 && !(a & 1) && !((a ^ e) >> 16) &&
+      if (
+#ifdef GNW_MCD_SPLIT
+          !prg_split &&
+#endif
+          inc == 2 && !(a & 1) && !((a ^ e) >> 16) &&
           ((a >= SATaddr + 0x280) | (e < SATaddr)) &&
           !((source ^ (source + len-1)) & ~mask))
       {
@@ -611,7 +625,14 @@ static void DmaSlow(int len, u32 source)
       }
       for(; len; len--)
       {
-        u16 d = base[source++ & mask];
+        u16 d;
+#ifdef GNW_MCD_SPLIT
+        if (prg_split) {
+          u32 pa = prg_base + ((source++ & mask) << 1);
+          d = *(u16 *)(Pico_mcd->prg_ram_b[(pa >> 16) & 7] + (pa & 0xffff));
+        } else
+#endif
+          d = base[source++ & mask];
         if(a & 1) d=(d<<8)|(d>>8);
         VideoWriteVRAM(a, d);
         // AutoIncrement
@@ -622,7 +643,11 @@ static void DmaSlow(int len, u32 source)
     case 3: // cram
       Pico.m.dirtyPal = 1;
       r = PicoMem.cram;
-      if (inc == 0 && !(pvid->reg[1] & 0x40) &&
+      if (
+#ifdef GNW_MCD_SPLIT
+          !prg_split &&
+#endif
+          inc == 0 && !(pvid->reg[1] & 0x40) &&
             (pvid->reg[7] & 0x3f) == ((a/2) & 0x3f)) { // bg color DMA
         PicoVideoSync(1);
         int sl = VdpFIFO.fifo_hcounts[lc/clkdiv];
@@ -638,7 +663,15 @@ static void DmaSlow(int len, u32 source)
       }
       for (; len; len--)
       {
-        r[(a / 2) & 0x3f] = base[source++ & mask] & 0xeee;
+        u16 d;
+#ifdef GNW_MCD_SPLIT
+        if (prg_split) {
+          u32 pa = prg_base + ((source++ & mask) << 1);
+          d = *(u16 *)(Pico_mcd->prg_ram_b[(pa >> 16) & 7] + (pa & 0xffff));
+        } else
+#endif
+          d = base[source++ & mask];
+        r[(a / 2) & 0x3f] = d & 0xeee;
         // AutoIncrement
         a = (a+inc) & ~0x20000;
       }
@@ -648,7 +681,15 @@ static void DmaSlow(int len, u32 source)
       r = PicoMem.vsram;
       for (; len; len--)
       {
-        r[(a / 2) & 0x3f] = base[source++ & mask] & 0x7ff;
+        u16 d;
+#ifdef GNW_MCD_SPLIT
+        if (prg_split) {
+          u32 pa = prg_base + ((source++ & mask) << 1);
+          d = *(u16 *)(Pico_mcd->prg_ram_b[(pa >> 16) & 7] + (pa & 0xffff));
+        } else
+#endif
+          d = base[source++ & mask];
+        r[(a / 2) & 0x3f] = d & 0x7ff;
         // AutoIncrement
         a = (a+inc) & ~0x20000;
       }
@@ -657,7 +698,14 @@ static void DmaSlow(int len, u32 source)
     case 0x81: // vram 128k
       for(; len; len--)
       {
-        u16 d = base[source++ & mask];
+        u16 d;
+#ifdef GNW_MCD_SPLIT
+        if (prg_split) {
+          u32 pa = prg_base + ((source++ & mask) << 1);
+          d = *(u16 *)(Pico_mcd->prg_ram_b[(pa >> 16) & 7] + (pa & 0xffff));
+        } else
+#endif
+          d = base[source++ & mask];
         VideoWriteVRAM128(a, d);
         // AutoIncrement
         a = (a+inc) & ~0x20000;

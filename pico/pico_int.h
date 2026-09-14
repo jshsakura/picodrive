@@ -151,9 +151,21 @@ extern m68ki_cpu_core PicoCpuMM68k, PicoCpuMS68k;
 #define SekInterrupt(irq) m68k.int_level = (irq) << 8
 #define SekIrqLevel       (m68k.int_level >> 8)
 
-// Sega CD sub-68k is NOT supported by this backend (the core has a single
-// global context). These stubs only keep pico/cd compiling in full builds;
-// PAHW_MCD must not be used at runtime with EMU_G68K.
+#ifdef GNW_MCD_CORE
+#define SekCyclesLeftS68k ((int)(((g68k_s68k_active ? m68k.cycle_end : PicoCpuGS68k.cycle_end) - \
+                                  (g68k_s68k_active ? m68k.cycles : PicoCpuGS68k.cycles)) / 7))
+#define SekPcS68k ((g68k_s68k_active ? m68k.pc : PicoCpuGS68k.pc) & 0x00ffffff)
+#define SekDarS68k(x) ((g68k_s68k_active ? m68k.dar[x] : PicoCpuGS68k.dar[x]))
+#define SekSrS68k g68k_get_s68k_sr()
+#define SekSetStopS68k(x) do { \
+  m68ki_cpu_core *g_ = g68k_s68k_active ? &m68k : &PicoCpuGS68k; \
+  if (x) { g_->stopped = G68K_STOP_LEVEL_STOP; SekEndRunS68k(0); } \
+  else g_->stopped = 0; \
+} while (0)
+#define SekIsStoppedS68k() ((g68k_s68k_active ? m68k.stopped : PicoCpuGS68k.stopped) == G68K_STOP_LEVEL_STOP)
+#define SekNotPollingS68k g68k_s68k_stub[1]
+#else
+// Non-MCD gwenesis builds keep the historical compile-only stubs.
 #define SekCyclesLeftS68k g68k_s68k_stub[0]
 #define SekPcS68k 0
 #define SekDarS68k(x) 0
@@ -161,6 +173,7 @@ extern m68ki_cpu_core PicoCpuMM68k, PicoCpuMS68k;
 #define SekSetStopS68k(x) do { (void)(x); } while (0)
 #define SekIsStoppedS68k() 1
 #define SekNotPollingS68k g68k_s68k_stub[1]
+#endif
 
 #endif // EMU_G68K
 
@@ -195,12 +208,23 @@ extern m68ki_cpu_core PicoCpuMM68k, PicoCpuMS68k;
 extern unsigned int SekCycleCntS68k;
 extern unsigned int SekCycleAimS68k;
 
+#ifdef GNW_MCD_CORE
+#define SekEndRunS68k(after) do { \
+  int g68k_left_ = SekCyclesLeftS68k; \
+  if (g68k_left_ > (after)) { \
+    SekCycleCntS68k -= g68k_left_ - (after); \
+    if (g68k_s68k_active) m68k.cycle_end = m68k.cycles + (after) * 7; \
+    else PicoCpuGS68k.cycle_end = PicoCpuGS68k.cycles + (after) * 7; \
+  } \
+} while (0)
+#else
 #define SekEndRunS68k(after) { \
   if (SekCyclesLeftS68k > (after)) { \
     SekCycleCntS68k -= SekCyclesLeftS68k - (after); \
     SekCyclesLeftS68k = after; \
   } \
 }
+#endif
 
 #define SekCyclesDoneS68k()  (SekCycleCntS68k - SekCyclesLeftS68k)
 
@@ -606,6 +630,28 @@ struct mcd_misc
 
 typedef struct
 {
+#ifdef GNW_MCD_SPLIT
+  /* Keep the four large CD memories outside this control/state object.  The
+   * Game & Watch port places them in separate SRAM regions; the host test
+   * build allocates one backing block in PicoCreateMCD(). */
+  unsigned char *bios;
+  /* Eight 64K pages let the MCU place PRG RAM across AXI, DTCM and the LCD
+   * bonus pool while preserving the 68K memory-map page size. */
+  unsigned char *prg_ram_b[8];
+  union {
+    unsigned char *word_ram2M;
+    unsigned char (*word_ram1M)[0x20000];
+  };
+  union {
+    unsigned char *pcm_ram;
+    unsigned char (*pcm_ram_b)[0x1000];
+  };
+  unsigned char *pcm_ram_hi;
+#ifdef GNW_MCD_BIOS_XIP
+  const unsigned char *bios_upper;
+#endif
+  unsigned char *bram;
+#else
   unsigned char bios[0x20000];			// 000000: 128K
   union {					// 020000: 512K
     unsigned char prg_ram[0x80000];
@@ -625,8 +671,11 @@ typedef struct
     unsigned char pcm_ram[0x10000];
     unsigned char pcm_ram_b[0x10][0x1000];
   };
+#endif
   unsigned char s68k_regs[0x200];		// 110000: GA, not CPU regs
+#ifndef GNW_MCD_SPLIT
   unsigned char bram[0x2000];			// 110200: 8K
+#endif
   struct mcd_misc m;				// 112200: misc
   struct mcd_pcm pcm;				// 112240:
   void *cdda_stream;
@@ -637,6 +686,16 @@ typedef struct
   char pcm_mixbuf_dirty;
   char pcm_regs_dirty;
 } mcd_state;
+
+static inline unsigned char *mcd_pcm_ptr(mcd_state *state, unsigned int a)
+{
+  a &= 0xffff;
+#ifdef GNW_MCD_SPLIT
+  return a < 0x8000 ? state->pcm_ram + a : state->pcm_ram_hi + (a - 0x8000);
+#else
+  return state->pcm_ram + a;
+#endif
+}
 
 // 32X
 #define P32XS_FM    (1<<15)
@@ -892,6 +951,10 @@ PICO_INTERNAL void PicoSyncZ80(unsigned int m68k_cycles_done);
 #define PCDS_IEN6     (1<<6)
 
 extern mcd_state *Pico_mcd;
+#ifdef GNW_MCD_BIOS_XIP
+extern const unsigned char *gnw_mcd_bios_xip;
+extern unsigned int gnw_mcd_bios_xip_size;
+#endif
 
 PICO_INTERNAL void PicoCreateMCD(unsigned char *bios_data, int bios_size);
 PICO_INTERNAL void PicoInitMCD(void);
@@ -1203,9 +1266,18 @@ void REGPARM(3) sh2_peripheral_write32(u32 a, u32 d, SH2 *sh2);
 #define Pico32xInit()
 #define PicoPower32x()
 #define PicoReset32x()
+#define Pico32xStartup()
+#define Pico32xShutdown()
+#define Pico32xPrepare()
 #define PicoFrame32x()
 #define PicoUnload32x()
-#define Pico32xStateLoaded()
+#define Pico32xStateLoaded(...)
+#define PicoRead8_32x(a) 0
+#define PicoRead16_32x(a) 0
+#define PicoWrite8_32x(a, d) ((void)0)
+#define PicoWrite16_32x(a, d) ((void)0)
+#define PicoDrawSetOutFormat32x(...) ((void)0)
+#define PicoDrawSetOutBuf32X(...) ((void)0)
 #define FinalizeLine32xRGB555 NULL
 #define p32x_pwm_update(...)
 #define p32x_timers_recalc()

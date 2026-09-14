@@ -64,7 +64,7 @@ void m68k_map_unmap(u32 start_addr, u32 end_addr);
 // reconstruction; xmap_set strips it before its alignment check so Thumb
 // handlers register at all. Data pointers are unaffected. When GNW_32X_CORE
 // is unset this expands to exactly the upstream (v << 1).
-#if defined(GNW_32X_CORE) && defined(__thumb__)
+#if (defined(GNW_32X_CORE) || defined(GNW_MCD_SPLIT)) && defined(__thumb__)
 #define MAP_FUNC(v) ((((uptr)(v)) << 1) | 1)
 #else
 #define MAP_FUNC(v) (((uptr)(v)) << 1)

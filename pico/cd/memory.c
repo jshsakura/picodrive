@@ -827,14 +827,24 @@ static void s68k_unmapped_write16(u32 a, u32 d)
 // XXX verify: ff00 or 1fe00 max?
 static void PicoWriteS68k8_prgwp(u32 a, u32 d)
 {
-  if (a >= (Pico_mcd->s68k_regs[2] << 9))
+  if (a >= (Pico_mcd->s68k_regs[2] << 9)) {
+#ifdef GNW_MCD_SPLIT
+    Pico_mcd->prg_ram_b[(a >> 16) & 7][MEM_BE2(a) & 0xffff] = d;
+#else
     Pico_mcd->prg_ram[MEM_BE2(a)] = d;
+#endif
+  }
 }
 
 static void PicoWriteS68k16_prgwp(u32 a, u32 d)
 {
-  if (a >= (Pico_mcd->s68k_regs[2] << 9))
+  if (a >= (Pico_mcd->s68k_regs[2] << 9)) {
+#ifdef GNW_MCD_SPLIT
+    *(u16 *)(Pico_mcd->prg_ram_b[(a >> 16) & 7] + (a & 0xffff)) = d;
+#else
     *(u16 *)(Pico_mcd->prg_ram + a) = d;
+#endif
+  }
 }
 
 #ifndef _ASM_CD_MEMORY_C
@@ -1003,7 +1013,8 @@ regs_done:
   if ((a & 0x8000) == 0x0000) {
     a &= 0x7fff;
     if (a >= 0x2000)
-      d = Pico_mcd->pcm_ram_b[Pico_mcd->pcm.bank][(a >> 1) & 0xfff];
+      d = *mcd_pcm_ptr(Pico_mcd,
+                       (Pico_mcd->pcm.bank << 12) | ((a >> 1) & 0xfff));
     else if (a >= 0x20)
       d = pcd_pcm_read(a >> 1);
 
@@ -1031,7 +1042,8 @@ static u32 PicoReadS68k16_pr(u32 a)
   if ((a & 0x8000) == 0x0000) {
     a &= 0x7fff;
     if (a >= 0x2000)
-      d = Pico_mcd->pcm_ram_b[Pico_mcd->pcm.bank][(a >> 1) & 0xfff];
+      d = *mcd_pcm_ptr(Pico_mcd,
+                       (Pico_mcd->pcm.bank << 12) | ((a >> 1) & 0xfff));
     else if (a >= 0x20)
       d = pcd_pcm_read(a >> 1);
 
@@ -1058,7 +1070,8 @@ static void PicoWriteS68k8_pr(u32 a, u32 d)
   if ((a & 0x8000) == 0x0000) {
     a &= 0x7fff;
     if (a >= 0x2000)
-      Pico_mcd->pcm_ram_b[Pico_mcd->pcm.bank][(a>>1)&0xfff] = d;
+      *mcd_pcm_ptr(Pico_mcd,
+                   (Pico_mcd->pcm.bank << 12) | ((a >> 1) & 0xfff)) = d;
     else if (a < 0x12)
       pcd_pcm_write(a>>1, d);
     return;
@@ -1081,7 +1094,8 @@ static void PicoWriteS68k16_pr(u32 a, u32 d)
   if ((a & 0x8000) == 0x0000) {
     a &= 0x7fff;
     if (a >= 0x2000)
-      Pico_mcd->pcm_ram_b[Pico_mcd->pcm.bank][(a>>1)&0xfff] = d;
+      *mcd_pcm_ptr(Pico_mcd,
+                   (Pico_mcd->pcm.bank << 12) | ((a >> 1) & 0xfff)) = d;
     else if (a < 0x12)
       pcd_pcm_write(a>>1, d & 0xff);
     return;
@@ -1116,8 +1130,14 @@ static void remap_prg_window(u32 r1, u32 r3)
 {
   // PRG RAM, mapped to main CPU if sub is not running
   if ((r1 & 3) != 1) {
+#ifdef GNW_MCD_SPLIT
+    int page = ((r3 >> 6) & 3) * 2;
+    cpu68k_map_all_ram(BASE+0x020000, BASE+0x02ffff, Pico_mcd->prg_ram_b[page], 0);
+    cpu68k_map_all_ram(BASE+0x030000, BASE+0x03ffff, Pico_mcd->prg_ram_b[page+1], 0);
+#else
     void *bank = Pico_mcd->prg_ram_b[(r3 >> 6) & 3];
     cpu68k_map_all_ram(BASE+0x020000, BASE+0x03ffff, bank, 0);
+#endif
   } else {
     m68k_map_unmap(BASE+0x020000, BASE+0x03ffff);
   }
@@ -1229,8 +1249,15 @@ PICO_INTERNAL void PicoMemSetupCD(void)
   PicoMemSetup();
 
   // main68k map (BIOS or MSU mapped by PicoMemSetup()):
+#ifdef GNW_MCD_BIOS_XIP
+  cpu68k_map_set(m68k_read8_map,   BASE, BASE+0x00ffff, Pico_mcd->bios, 0);
+  cpu68k_map_set(m68k_read16_map,  BASE, BASE+0x00ffff, Pico_mcd->bios, 0);
+  cpu68k_map_set(m68k_read8_map,   BASE+0x010000, BASE+0x01ffff, Pico_mcd->bios_upper, 0);
+  cpu68k_map_set(m68k_read16_map,  BASE+0x010000, BASE+0x01ffff, Pico_mcd->bios_upper, 0);
+#else
   cpu68k_map_set(m68k_read8_map,   BASE, BASE+0x01ffff, Pico_mcd->bios, 0);
   cpu68k_map_set(m68k_read16_map,  BASE, BASE+0x01ffff, Pico_mcd->bios, 0);
+#endif
   if (pcd_base_address != 0) { // cartridge (for MSU/MD+)
     // MD+ on MEGASD plus mirror
     u32 base = 0x040000-(1<<M68K_MEM_SHIFT);
@@ -1260,10 +1287,20 @@ PICO_INTERNAL void PicoMemSetupCD(void)
   cpu68k_map_set(s68k_write16_map, 0x000000, 0xffffff, s68k_unmapped_write16, 3);
 
   // PRG RAM
+#ifdef GNW_MCD_SPLIT
+  for (int i = 0; i < 8; i++) {
+    u32 start = i * 0x10000;
+    cpu68k_map_set(s68k_read8_map,   start, start + 0xffff, Pico_mcd->prg_ram_b[i], 2);
+    cpu68k_map_set(s68k_read16_map,  start, start + 0xffff, Pico_mcd->prg_ram_b[i], 2);
+    cpu68k_map_set(s68k_write8_map,  start, start + 0xffff, Pico_mcd->prg_ram_b[i], 2);
+    cpu68k_map_set(s68k_write16_map, start, start + 0xffff, Pico_mcd->prg_ram_b[i], 2);
+  }
+#else
   cpu68k_map_set(s68k_read8_map,   0x000000, 0x07ffff, Pico_mcd->prg_ram, 2);
   cpu68k_map_set(s68k_read16_map,  0x000000, 0x07ffff, Pico_mcd->prg_ram, 2);
   cpu68k_map_set(s68k_write8_map,  0x000000, 0x07ffff, Pico_mcd->prg_ram, 2);
   cpu68k_map_set(s68k_write16_map, 0x000000, 0x07ffff, Pico_mcd->prg_ram, 2);
+#endif
   cpu68k_map_set(s68k_write8_map,  0x000000, 0x01ffff, PicoWriteS68k8_prgwp, 3);
   cpu68k_map_set(s68k_write16_map, 0x000000, 0x01ffff, PicoWriteS68k16_prgwp, 3);
 

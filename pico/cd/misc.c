@@ -32,6 +32,28 @@ unsigned char formatted_bram[4*0x10] =
 #ifndef _ASM_MISC_C
 PICO_INTERNAL_ASM void wram_2M_to_1M(unsigned char *m)
 {
+#ifdef GNW_MCD_SPLIT
+	/* Deinterleave 16-bit words in place:
+	 *   a0,b0,a1,b1,... -> a0,a1,...,b0,b1,...
+	 * The stock routine uses an extra 128K overlap area. */
+	unsigned short *p = (unsigned short *)m;
+	unsigned int pairs, half, block, i;
+
+	for (block = 2; block <= 0x20000; block <<= 1) {
+		pairs = block >> 1;
+		half = pairs >> 1;
+		if (half == 0)
+			continue;
+		for (i = 0; i < 0x20000; i += block) {
+			unsigned int j;
+			for (j = 0; j < half; j++) {
+				unsigned short t = p[i + half + j];
+				p[i + half + j] = p[i + pairs + j];
+				p[i + pairs + j] = t;
+			}
+		}
+	}
+#else
 	unsigned short *m1M_b0, *m1M_b1;
 	unsigned int i, tmp, *m2M;
 
@@ -45,10 +67,31 @@ PICO_INTERNAL_ASM void wram_2M_to_1M(unsigned char *m)
 		*(--m1M_b0) = tmp;
 		*(--m1M_b1) = tmp >> 16;
 	}
+#endif
 }
 
 PICO_INTERNAL_ASM void wram_1M_to_2M(unsigned char *m)
 {
+#ifdef GNW_MCD_SPLIT
+	/* Reverse the stages above to interleave the two contiguous 128K banks. */
+	unsigned short *p = (unsigned short *)m;
+	unsigned int block, pairs, half, i;
+
+	for (block = 0x20000; block >= 2; block >>= 1) {
+		pairs = block >> 1;
+		half = pairs >> 1;
+		if (half == 0)
+			continue;
+		for (i = 0; i < 0x20000; i += block) {
+			unsigned int j;
+			for (j = 0; j < half; j++) {
+				unsigned short t = p[i + half + j];
+				p[i + half + j] = p[i + pairs + j];
+				p[i + pairs + j] = t;
+			}
+		}
+	}
+#else
 	unsigned short *m1M_b0, *m1M_b1;
 	unsigned int i, tmp, *m2M;
 
@@ -61,6 +104,6 @@ PICO_INTERNAL_ASM void wram_1M_to_2M(unsigned char *m)
 		tmp = *m1M_b0++ | (*m1M_b1++ << 16);
 		*m2M++ = tmp;
 	}
+#endif
 }
 #endif
-

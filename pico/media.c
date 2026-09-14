@@ -306,7 +306,19 @@ enum media_type_e PicoLoadMedia(const char *filename,
       rom_fname = NULL;
       if (get_bios_filename != NULL)
         rom_fname = get_bios_filename(&cd_region, filename);
+#ifdef GNW_MCD_BIOS_XIP
+      if (gnw_mcd_bios_xip != NULL && gnw_mcd_bios_xip_size >= 0x20000) {
+        PicoCreateMCD((unsigned char *)gnw_mcd_bios_xip, 0x20000);
+        /* The normal path leaves the loaded BIOS allocation in rom_data with
+         * rom_size zero. PicoDetectRegion still reads its header during
+         * PicoPower, so preserve that contract with the XIP image. */
+        rom_data = (unsigned char *)gnw_mcd_bios_xip;
+      }
+      else
+        rom_file = pm_open(rom_fname);
+#else
       rom_file = pm_open(rom_fname);
+#endif
 
       // ask frontend if there's an MSU/MD+ rom
       rom_fname = NULL;
@@ -314,7 +326,7 @@ enum media_type_e PicoLoadMedia(const char *filename,
         rom_fname = get_msu_filename(filename);
 
       // BIOS is required for CD games, but MSU/MD+ usually doesn't need it
-      if (rom_file == NULL && rom_fname == NULL) {
+      if (rom_file == NULL && rom_fname == NULL && Pico_mcd == NULL) {
         lprintf("opening BIOS failed\n");
         media_type = PM_BAD_CD_NO_BIOS;
         goto out;

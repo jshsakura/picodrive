@@ -1356,12 +1356,26 @@ static void set_memory_maps(void)
       const size_t SCD_BIT = 1ULL << 31ULL;
       const uint64_t mem = RETRO_MEMDESC_SYSTEM_RAM;
       struct retro_memory_map mmaps;
+#ifdef GNW_MCD_SPLIT
+      struct retro_memory_descriptor descs[] = {
+         { mem, PicoMem.ram,          0,           0xFF0000, 0, 0, 0x10000, "68KRAM" },
+         { mem, Pico_mcd->prg_ram_b[0], 0, SCD_BIT | 0x020000, 0, 0, 0x10000, "PRGRAM0" },
+         { mem, Pico_mcd->prg_ram_b[1], 0, SCD_BIT | 0x030000, 0, 0, 0x10000, "PRGRAM1" },
+         { mem, Pico_mcd->prg_ram_b[2], 0, SCD_BIT | 0x040000, 0, 0, 0x10000, "PRGRAM2" },
+         { mem, Pico_mcd->prg_ram_b[3], 0, SCD_BIT | 0x050000, 0, 0, 0x10000, "PRGRAM3" },
+         { mem, Pico_mcd->prg_ram_b[4], 0, SCD_BIT | 0x060000, 0, 0, 0x10000, "PRGRAM4" },
+         { mem, Pico_mcd->prg_ram_b[5], 0, SCD_BIT | 0x070000, 0, 0, 0x10000, "PRGRAM5" },
+         { mem, Pico_mcd->prg_ram_b[6], 0, SCD_BIT | 0x080000, 0, 0, 0x10000, "PRGRAM6" },
+         { mem, Pico_mcd->prg_ram_b[7], 0, SCD_BIT | 0x090000, 0, 0, 0x10000, "PRGRAM7" },
+      };
+#else
       struct retro_memory_descriptor descs[] = {
          { mem, PicoMem.ram,        0,           0xFF0000, 0, 0, 0x10000, "68KRAM" },
          /* virtual address using SCD_BIT so all 512M of prg_ram can be accessed */
          /* at address $80020000 */
          { mem, Pico_mcd->prg_ram,  0, SCD_BIT | 0x020000, 0, 0, 0x80000, "PRGRAM" },
       };
+#endif
 
       mmaps.descriptors = descs;
       mmaps.num_descriptors = sizeof(descs) / sizeof(descs[0]);

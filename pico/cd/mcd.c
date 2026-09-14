@@ -19,22 +19,124 @@ static unsigned int mcd_m68k_cycle_base;
 static unsigned int mcd_s68k_cycle_base;
 
 mcd_state *Pico_mcd;
+#ifdef GNW_MCD_BIOS_XIP
+const unsigned char *gnw_mcd_bios_xip;
+unsigned int gnw_mcd_bios_xip_size;
+#endif
+
+#ifdef GNW_MCD_SPLIT
+#define MCD_BIOS_SIZE     0x20000
+#define MCD_PRG_RAM_SIZE  0x80000
+#define MCD_WORD_RAM_SIZE 0x40000
+#define MCD_PCM_RAM_SIZE  0x10000
+#define MCD_BRAM_SIZE     0x2000
+static int mcd_alloc_split_ram(mcd_state *state)
+{
+  int i;
+#ifdef GNW_MCD_BIOS_XIP
+  state->bios = plat_mmap(0x05100000, 0x10000, 0, 0);
+  state->bios_upper = gnw_mcd_bios_xip + 0x10000;
+#else
+  state->bios = plat_mmap(0x05100000, MCD_BIOS_SIZE, 0, 0);
+#endif
+  for (i = 0; i < 8; i++) {
+    size_t size = 0x10000;
+    state->prg_ram_b[i] = plat_mmap(0x05200000 + i * 0x10000,
+                                    size, 0, 0);
+  }
+  state->word_ram2M = plat_mmap(0x05300000, MCD_WORD_RAM_SIZE, 0, 0);
+  state->pcm_ram = plat_mmap(0x05400000, 0x8000, 0, 0);
+  state->pcm_ram_hi = plat_mmap(0x05408000, 0x8000, 0, 0);
+  state->bram = plat_mmap(0x05500000, MCD_BRAM_SIZE, 0, 0);
+  if (state->bios == NULL || state->word_ram2M == NULL ||
+      state->pcm_ram == NULL || state->pcm_ram_hi == NULL || state->bram == NULL)
+    return -1;
+  for (i = 0; i < 8; i++)
+    if (state->prg_ram_b[i] == NULL)
+      return -1;
+  return 0;
+}
+
+static void mcd_free_split_ram(mcd_state *state)
+{
+  int i;
+#ifndef GNW_MCD_BIOS_XIP
+  if (state->bios) plat_munmap(state->bios, MCD_BIOS_SIZE);
+#else
+  if (state->bios) plat_munmap(state->bios, 0x10000);
+#endif
+  for (i = 0; i < 8; i++)
+    if (state->prg_ram_b[i]) plat_munmap(state->prg_ram_b[i], 0x10000);
+  if (state->word_ram2M) plat_munmap(state->word_ram2M, MCD_WORD_RAM_SIZE);
+  if (state->pcm_ram) plat_munmap(state->pcm_ram, 0x8000);
+  if (state->pcm_ram_hi) plat_munmap(state->pcm_ram_hi, 0x8000);
+  if (state->bram) plat_munmap(state->bram, MCD_BRAM_SIZE);
+}
+#endif
 
 PICO_INTERNAL void PicoCreateMCD(unsigned char *bios_data, int bios_size)
 {
+#ifdef GNW_MCD_SPLIT
+  unsigned char *bios = NULL, *prg[8] = { NULL }, *word = NULL;
+  unsigned char *pcm = NULL, *pcm_hi = NULL, *bram = NULL;
+  int i;
+#endif
   if (!Pico_mcd) {
     Pico_mcd = plat_mmap(0x05000000, sizeof(mcd_state), 0, 0);
     if (Pico_mcd == NULL) {
       elprintf(EL_STATUS, "OOM");
       return;
     }
+#ifdef GNW_MCD_SPLIT
+    if (mcd_alloc_split_ram(Pico_mcd) != 0) {
+      mcd_free_split_ram(Pico_mcd);
+      plat_munmap(Pico_mcd, sizeof(mcd_state));
+      Pico_mcd = NULL;
+      elprintf(EL_STATUS, "OOM (MCD RAM)");
+      return;
+    }
+#endif
   }
+#ifdef GNW_MCD_SPLIT
+  bios = Pico_mcd->bios;
+  for (i = 0; i < 8; i++) prg[i] = Pico_mcd->prg_ram_b[i];
+  word = Pico_mcd->word_ram2M;
+  pcm = Pico_mcd->pcm_ram;
+  pcm_hi = Pico_mcd->pcm_ram_hi;
+  bram = Pico_mcd->bram;
+#endif
   memset(Pico_mcd, 0, sizeof(mcd_state));
+#ifdef GNW_MCD_SPLIT
+  Pico_mcd->bios = bios;
+  for (i = 0; i < 8; i++) Pico_mcd->prg_ram_b[i] = prg[i];
+  Pico_mcd->word_ram2M = word;
+  Pico_mcd->pcm_ram = pcm;
+  Pico_mcd->pcm_ram_hi = pcm_hi;
+  Pico_mcd->bram = bram;
+#ifndef GNW_MCD_BIOS_XIP
+  memset(Pico_mcd->bios, 0, MCD_BIOS_SIZE);
+#else
+  memset(Pico_mcd->bios, 0, 0x10000);
+#endif
+  for (i = 0; i < 8; i++) {
+    memset(Pico_mcd->prg_ram_b[i], 0, 0x10000);
+  }
+  memset(Pico_mcd->word_ram2M, 0, MCD_WORD_RAM_SIZE);
+  memset(Pico_mcd->pcm_ram, 0, 0x8000);
+  memset(Pico_mcd->pcm_ram_hi, 0, 0x8000);
+#endif
 
   if (bios_data && bios_size > 0) {
-    if (bios_size > sizeof(Pico_mcd->bios))
-      bios_size = sizeof(Pico_mcd->bios);
+    if (bios_size > 0x20000)
+      bios_size = 0x20000;
+#ifdef GNW_MCD_BIOS_XIP
+    if (bios_data != gnw_mcd_bios_xip)
+      elprintf(EL_STATUS, "MCD XIP BIOS pointer mismatch");
+    memcpy(Pico_mcd->bios, bios_data, 0x10000);
+    Pico_mcd->bios_upper = bios_data + 0x10000;
+#else
     memcpy(Pico_mcd->bios, bios_data, bios_size);
+#endif
   }
 }
 
@@ -47,6 +149,9 @@ PICO_INTERNAL void PicoExitMCD(void)
 {
   cdd_unload();
   if (Pico_mcd) {
+#ifdef GNW_MCD_SPLIT
+    mcd_free_split_ram(Pico_mcd);
+#endif
     plat_munmap(Pico_mcd, sizeof(mcd_state));
     Pico_mcd = NULL;
   }
@@ -60,11 +165,17 @@ PICO_INTERNAL void PicoPowerMCD(void)
   SekCycleCntS68k = SekCycleAimS68k = 0;
 
   fmt_size = sizeof(formatted_bram);
-  memset(Pico_mcd->prg_ram,    0, sizeof(Pico_mcd->prg_ram));
-  memset(Pico_mcd->word_ram2M, 0, sizeof(Pico_mcd->word_ram2M));
-  memset(Pico_mcd->pcm_ram,    0, sizeof(Pico_mcd->pcm_ram));
-  memset(Pico_mcd->bram, 0, sizeof(Pico_mcd->bram));
-  memcpy(Pico_mcd->bram + sizeof(Pico_mcd->bram) - fmt_size,
+#ifdef GNW_MCD_SPLIT
+  for (int i = 0; i < 8; i++)
+    memset(Pico_mcd->prg_ram_b[i], 0, 0x10000);
+#else
+  memset(Pico_mcd->prg_ram,    0, 0x80000);
+#endif
+  memset(Pico_mcd->word_ram2M, 0, 0x40000);
+  memset(Pico_mcd->pcm_ram,    0, 0x8000);
+  memset(Pico_mcd->pcm_ram_hi, 0, 0x8000);
+  memset(Pico_mcd->bram, 0, MCD_BRAM_SIZE);
+  memcpy(Pico_mcd->bram + MCD_BRAM_SIZE - fmt_size,
     formatted_bram, fmt_size);
   memset(Pico_mcd->s68k_regs, 0, sizeof(Pico_mcd->s68k_regs));
   memset(&Pico_mcd->pcm, 0, sizeof(Pico_mcd->pcm));
@@ -77,8 +188,9 @@ PICO_INTERNAL void PicoPowerMCD(void)
   Pico_mcd->m.state_flags = PCD_ST_S68K_RST;
   Pico_mcd->m.busreq = 2;     // busreq on, s68k in reset
   Pico_mcd->s68k_regs[3] = 1; // 2M word RAM mode, m68k access
-  if (Pico.romsize == 0) // no HINT vector from gate array for MSU
+  if (Pico.romsize == 0) { // no HINT vector from gate array for MSU
     memset(Pico_mcd->bios + 0x70, 0xff, 4);
+  }
   pcd_event_schedule_s68k(PCD_EVENT_CDC, 12500000/75);
 
   cdc_reset();
@@ -144,8 +256,26 @@ static void SekRunS68k(unsigned int to)
   m68k_set_context(&PicoCpuMM68k);
 #elif defined(EMU_F68K)
   SekCycleCntS68k += fm68k_emulate(&PicoCpuFS68k, cyc_do, 0) - cyc_do;
+#elif defined(EMU_G68K) && defined(GNW_MCD_CORE)
+  {
+    m68ki_cpu_core main_context = m68k;
+    int done;
+    m68k = PicoCpuGS68k;
+    g68k_s68k_active = 1;
+    m68k.cycles = 0;
+    m68k.cycle_end = (unsigned int)cyc_do * 7;
+    m68k_run(m68k.cycle_end);
+    done = cyc_do - (int)(m68k.cycle_end - m68k.cycles) / 7;
+    SekCycleCntS68k += done - cyc_do;
+    m68k.cycle_end = m68k.cycles;
+    PicoCpuGS68k = m68k;
+    m68k = main_context;
+    g68k_s68k_active = 0;
+  }
 #endif
+#if !defined(EMU_G68K)
   SekCyclesLeftS68k = 0;
+#endif
   pprof_end(s68k);
 }
 

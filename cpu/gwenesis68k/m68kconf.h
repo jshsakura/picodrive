@@ -39,7 +39,7 @@
 /* If ON, CPU will call the callback when it encounters a tas
  * instruction.
  */
-#define M68K_TAS_HAS_CALLBACK       OPT_OFF
+#define M68K_TAS_HAS_CALLBACK       OPT_ON
 #define M68K_TAS_CALLBACK()         your_tas_handler_function()
 
 /* If ON, CPU will call the set fc callback on every memory access to

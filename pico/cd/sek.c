@@ -41,6 +41,20 @@ static int new_irq_level(int level)
   return level_new;
 }
 
+#if defined(EMU_G68K) && defined(GNW_MCD_CORE)
+static int SekIntAckGS68k(int level)
+{
+  int level_new = new_irq_level(level);
+  m68k.int_level = level_new << 8;
+  return M68K_INT_ACK_AUTOVECTOR;
+}
+
+static int SekTasCallbackGS68k(void)
+{
+  return 1; // Sega CD sub-68K has working TAS memory writeback
+}
+#endif
+
 #ifdef EMU_C68K
 // interrupt acknowledgement
 static int SekIntAckS68k(int level)
@@ -99,6 +113,11 @@ static void SekIntAckFS68k(unsigned level)
 
 PICO_INTERNAL void SekInitS68k(void)
 {
+#if defined(EMU_G68K) && defined(GNW_MCD_CORE)
+  g68k_bus_init_s68k();
+  PicoCpuGS68k.int_ack_callback = SekIntAckGS68k;
+  PicoCpuGS68k.tas_instr_callback = SekTasCallbackGS68k;
+#endif
 #ifdef EMU_C68K
 //  CycloneInit();
   memset(&PicoCpuCS68k,0,sizeof(PicoCpuCS68k));
@@ -129,6 +148,21 @@ PICO_INTERNAL void SekInitS68k(void)
 // Reset the 68000:
 PICO_INTERNAL int SekResetS68k(void)
 {
+#if defined(EMU_G68K) && defined(GNW_MCD_CORE)
+  {
+    m68ki_cpu_core main_context = m68k;
+    m68k = PicoCpuGS68k;
+    g68k_s68k_active = 1;
+    m68k.sp[0] = 0;
+    m68k_set_irq(0);
+    m68k.cycles = 0;
+    m68k_pulse_reset();
+    m68k.cycle_end = m68k.cycles;
+    PicoCpuGS68k = m68k;
+    m68k = main_context;
+    g68k_s68k_active = 0;
+  }
+#endif
 #ifdef EMU_C68K
   CycloneReset(&PicoCpuCS68k);
 #endif
@@ -174,6 +208,12 @@ PICO_INTERNAL int SekInterruptS68k(int irq)
 #ifdef EMU_F68K
   PicoCpuFS68k.interrupts[0]=real_irq;
 #endif
+#if defined(EMU_G68K) && defined(GNW_MCD_CORE)
+  if (g68k_s68k_active)
+    m68k.int_level = real_irq << 8;
+  else
+    PicoCpuGS68k.int_level = real_irq << 8;
+#endif
   return 0;
 }
 
@@ -189,5 +229,11 @@ void SekInterruptClearS68k(int irq)
 #endif
 #ifdef EMU_F68K
   PicoCpuFS68k.interrupts[0] = level_new;
+#endif
+#if defined(EMU_G68K) && defined(GNW_MCD_CORE)
+  if (g68k_s68k_active)
+    m68k.int_level = level_new << 8;
+  else
+    PicoCpuGS68k.int_level = level_new << 8;
 #endif
 }

@@ -28,6 +28,19 @@
 
 int g68k_not_polling;
 int g68k_s68k_stub[2];
+#ifdef GNW_MCD_CORE
+m68ki_cpu_core PicoCpuGS68k;
+int g68k_s68k_active;
+
+unsigned int g68k_get_s68k_sr(void)
+{
+  m68ki_cpu_core *c = g68k_s68k_active ? &m68k : &PicoCpuGS68k;
+  return c->t1_flag | (c->s_flag << 11) | c->int_mask |
+    ((c->x_flag & 0x100) >> 4) | ((c->n_flag & 0x100) >> 4) |
+    ((!c->not_z_flag) << 2) | ((c->v_flag & 0x100) >> 6) |
+    ((c->c_flag & 0x100) >> 8);
+}
+#endif
 
 /* picodrive's generic dispatchers use u8/u16 data params; gwenesis handler
  * pointers are (unsigned int, unsigned int) - wrap instead of casting. */
@@ -40,6 +53,18 @@ static void g68k_disp_write16(unsigned int a, unsigned int d)
 {
   m68k_write16(a, (u16)d);
 }
+
+#ifdef GNW_MCD_CORE
+static void g68k_sdisp_write8(unsigned int a, unsigned int d)
+{
+  s68k_write8(a, (u8)d);
+}
+
+static void g68k_sdisp_write16(unsigned int a, unsigned int d)
+{
+  s68k_write16(a, (u16)d);
+}
+#endif
 
 static unsigned char *g68k_page_base(uptr v, unsigned int page)
 {
@@ -122,6 +147,62 @@ void g68k_map_sync_all(void)
 {
   g68k_map_sync_range(0x000000, 0xffffff);
 }
+
+#ifdef GNW_MCD_CORE
+void g68k_map_sync_s68k_range(unsigned int start_addr, unsigned int end_addr)
+{
+  unsigned int page = (start_addr & 0xffffff) >> M68K_MEM_SHIFT;
+  unsigned int last = (end_addr & 0xffffff) >> M68K_MEM_SHIFT;
+
+  for (; page <= last; page++)
+  {
+    cpu_memory_map *mm = &PicoCpuGS68k.memory_map[page];
+    uptr r8 = s68k_read8_map[page];
+    uptr r16 = s68k_read16_map[page];
+    uptr w8 = s68k_write8_map[page];
+    uptr w16 = s68k_write16_map[page];
+    unsigned char *base = NULL;
+    int r16_mem = !map_flag_set(r16) && r16 != 0;
+    int r8_mem = !map_flag_set(r8) && r8 != 0;
+
+    if (r16_mem)
+      base = g68k_page_base(r16, page);
+    else if (r8_mem)
+      base = g68k_page_base(r8, page);
+    if (base)
+      mm->base = base;
+    else if (map_flag_set(r16))
+      mm->base = NULL;
+
+    mm->read16 = map_flag_set(r16) ?
+      (unsigned int (*)(unsigned int))MAP_FUNC(r16) :
+      (r16_mem ? NULL : s68k_read16);
+    mm->read8 = map_flag_set(r8) ?
+      (unsigned int (*)(unsigned int))MAP_FUNC(r8) :
+      (r8_mem && base && g68k_page_base(r8, page) == base ? NULL : s68k_read8);
+    mm->write16 = map_flag_set(w16) ?
+      (void (*)(unsigned int, unsigned int))MAP_FUNC(w16) :
+      (base && g68k_page_base(w16, page) == base ? NULL : g68k_sdisp_write16);
+    mm->write8 = map_flag_set(w8) ?
+      (void (*)(unsigned int, unsigned int))MAP_FUNC(w8) :
+      (base && g68k_page_base(w8, page) == base ? NULL : g68k_sdisp_write8);
+  }
+}
+
+void g68k_bus_init_s68k(void)
+{
+  int page;
+  memset(&PicoCpuGS68k, 0, sizeof(PicoCpuGS68k));
+  for (page = 0; page < 256; page++) {
+    cpu_memory_map *mm = &PicoCpuGS68k.memory_map[page];
+    mm->base = PicoMem.ram;
+    mm->read8 = s68k_read8;
+    mm->read16 = s68k_read16;
+    mm->write8 = g68k_sdisp_write8;
+    mm->write16 = g68k_sdisp_write16;
+  }
+}
+#endif
 
 void g68k_bus_init(void)
 {

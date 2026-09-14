@@ -145,6 +145,9 @@ ifeq "$(use_fame)" "1"
 DEFINES += EMU_F68K
 SRCS_COMMON += $(R)cpu/fame/famec.c
 endif
+ifeq "$(fame_const)" "1"
+DEFINES += FAMEC_CONST_JUMPTABLE
+endif
 ifeq "$(use_g68k)" "1"
 # gwenesis const-table Musashi fork (GNW 32X): jump/cycle tables in .rodata
 # instead of FAME's 256 KB RAM JumpTable. LSB_FIRST: byte-swapped ROM/RAM
@@ -154,6 +157,16 @@ ifeq "$(use_g68k)" "1"
 # NOTE: single-context core - no Sega CD sub-68k (see pico_int.h stubs).
 DEFINES += EMU_G68K LSB_FIRST TABLES_FULL
 SRCS_COMMON += $(R)cpu/gwenesis68k/m68kcpu.c $(R)cpu/gwenesis68k/g68k_bus.c
+endif
+ifeq "$(gnw_mcd)" "1"
+DEFINES += GNW_MCD_CORE
+endif
+ifeq "$(mcd_split)" "1"
+DEFINES += GNW_MCD_SPLIT
+asm_misc = 0
+endif
+ifeq "$(mcd_bios_xip)" "1"
+DEFINES += GNW_MCD_BIOS_XIP
 endif
 
 # --- Z80 ---

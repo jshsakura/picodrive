@@ -40319,9 +40319,13 @@ OPCODE(idle_detector_bcc8)
 	{
 		case 0: PC[-1] = newop; break;
 		case 1: break;
-		case 2: JumpTable[Opcode] = (Opcode & 0x0f00) ?
+		case 2:
+#ifndef FAMEC_CONST_JUMPTABLE
+			JumpTable[Opcode] = (Opcode & 0x0f00) ?
 				((Opcode & 0x0100) ? CAST_OP(0x6701) : CAST_OP(0x6601)) :
-				CAST_OP(0x6001); break;
+				CAST_OP(0x6001);
+#endif
+			break;
 	}
 
 end:
