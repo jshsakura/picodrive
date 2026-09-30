@@ -1314,6 +1314,11 @@ void PicoVideoLoad(void *buf, int len)
       memcpy(&VdpFIFO, buf, offsetof(struct VdpFIFO, fifo_slot));
     for (i = 0; i < 80; i++)
       memcpy(VdpSATCache+2*i, buf + offsetof(struct VdpFIFO, fifo_slot) + 4*i, sizeof(u32));
+    // GNW: the renderer's parsed-sprite list is derived from the SAT cache and
+    // is only rebuilt when this flag is set. Restoring the cache without it
+    // left the pre-load list in place, so any sprite the game never moves
+    // again (a title logo) stayed missing after a load.
+    Pico.est.rendstatus |= PDRAW_DIRTY_SPRITES;
     return;
   }
 
