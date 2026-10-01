@@ -497,6 +497,35 @@ unsigned long long rig_m68k_evict;
 #define RIG_M68K_TICK(pc) ((void)0)
 #endif
 
+/* GNW_M68K_DECODE_CACHE: opcode -> (handler, cycles), memoised in DTCM.
+ *
+ * Both dispatch tables are compile-time const and therefore live in
+ * .rodata_md32x, i.e. out of OSPI: m68ki_instruction_jump_table is 256 KB and
+ * m68ki_cycles 64 KB, and every 68K instruction reads one word from each. The
+ * 68K runs in short slices between the SH-2s, whose data traffic flushes the
+ * 16 KB D-cache, so those two reads are two line refills (~224 core cycles
+ * each) for nearly every instruction. Device PC sampling (2026-10-01, After
+ * Burner) put 8.6% of the frame in m68k_run, whose own loop sits in ITCM:
+ * that is the time it spends stalled on these two loads.
+ *
+ * A direct-mapped cache of 256 slots, 8 bytes each, in the DTCM heap (zero
+ * wait state, never evicted): a hit is one LDRD. The tables are const, so a
+ * slot is a pure memo and the instruction stream, cycle count and every side
+ * effect are unchanged. If the allocation fails the old two-table path runs.
+ * Tag word: bit 24 = valid, bits 8-23 = opcode, bits 0-7 = cycles. */
+#if defined(GNW_32X_CORE) && !defined(GNW_M68K_NO_DECODE_CACHE)
+#define GNW_M68K_DECODE_CACHE 1
+#endif
+#ifdef GNW_M68K_DECODE_CACHE
+#include <stdlib.h>
+#define GNW_DC_SLOTS 256
+struct gnw_dc_slot { void (*fn)(void); unsigned int tag; };
+/* NULL = not yet asked; GNW_DC_NONE = the heap said no, use the tables.
+ * One word, because the md32x overlay BSS has 12 bytes left. */
+static struct gnw_dc_slot *gnw_dc;
+#define GNW_DC_NONE ((struct gnw_dc_slot *)1)
+#endif
+
 void m68k_run(unsigned int cycles)
 {
     //  printf("m68K_run current_cycles=%d add=%d STOP=%x\n",m68k.cycles,cycles,CPU_STOPPED);
@@ -525,6 +554,13 @@ void m68k_run(unsigned int cycles)
 
   /* Save end cycles count for when CPU is stopped */
   m68k.cycle_end = cycles;
+#ifdef GNW_M68K_DECODE_CACHE
+  if (gnw_dc == NULL) {
+    gnw_dc = calloc(GNW_DC_SLOTS, sizeof *gnw_dc);
+    if (gnw_dc == NULL)
+      gnw_dc = GNW_DC_NONE;
+  }
+#endif
 #ifdef MD32X_DEVICE_PROFILE
   if (gnw_m68k_armed)
     gnw_m68k_run_cyc += cycles - m68k.cycles;
@@ -575,8 +611,26 @@ void m68k_run(unsigned int cycles)
     /* Execute instruction */
     GNW_M68K_TICK(REG_PC);
     RIG_M68K_TICK(REG_PC);
+#ifdef GNW_M68K_DECODE_CACHE
+    if (gnw_dc != GNW_DC_NONE) {
+      unsigned int ir = REG_IR;
+      struct gnw_dc_slot *e = &gnw_dc[(ir ^ (ir >> 7)) & (GNW_DC_SLOTS - 1)];
+      unsigned int tag = e->tag;
+      if ((tag >> 8) != (0x10000u | ir)) {
+        tag = 0x1000000u | (ir << 8) | CYC_INSTRUCTION[ir];
+        e->fn = m68ki_instruction_jump_table[ir];
+        e->tag = tag;
+      }
+      e->fn();
+      /* the handler may load a new IR (exceptions); charge what it left, as
+       * the table path did */
+      USE_CYCLES(REG_IR == ir ? (tag & 0xffu) : CYC_INSTRUCTION[REG_IR]);
+    } else
+#endif
+    {
     m68ki_instruction_jump_table[REG_IR]();
     USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+    }
 
 #ifdef GNW_M68K_IDLE_FOLD
     if (gnw_br_pc && REG_PC < gnw_br_pc && FLAG_INT_MASK < 0x0600
