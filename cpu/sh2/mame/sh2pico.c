@@ -1586,6 +1586,7 @@ static volatile unsigned rig_skel_hit[16];
 #endif
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #ifndef GNW_SH2_FASTLOOPS
@@ -3277,4 +3278,3 @@ void sh2_dump_stats(void)
 	memset(op_refs, 0, sizeof(op_refs));
 }
 #endif
-
