@@ -717,7 +717,8 @@ INLINE void DIV1(sh2_state *sh2, UINT32 m, UINT32 n)
 }
 
 /*  DMULS.L Rm,Rn */
-INLINE void DMULS(sh2_state *sh2, UINT32 m, UINT32 n)
+#ifdef NATIVE_MATH_PROOF
+INLINE void legacy_DMULS(sh2_state *sh2, UINT32 m, UINT32 n)
 {
 	UINT32 RnL, RnH, RmL, RmH, Res0, Res1, Res2;
 	UINT32 temp0, temp1, temp2, temp3;
@@ -764,9 +765,16 @@ INLINE void DMULS(sh2_state *sh2, UINT32 m, UINT32 n)
 	sh2->macl = Res0;
 	sh2->icount--;
 }
+#endif
+INLINE void DMULS(sh2_state *sh2, UINT32 m, UINT32 n)
+{
+  unsigned long long z=(unsigned long long)((long long)(INT32)sh2->r[n]*(INT32)sh2->r[m]);
+  sh2->macl=(UINT32)z;sh2->mach=(UINT32)(z>>32);sh2->icount--;
+}
 
 /*  DMULU.L Rm,Rn */
-INLINE void DMULU(sh2_state *sh2, UINT32 m, UINT32 n)
+#ifdef NATIVE_MATH_PROOF
+INLINE void legacy_DMULU(sh2_state *sh2, UINT32 m, UINT32 n)
 {
 	UINT32 RnL, RnH, RmL, RmH, Res0, Res1, Res2;
 	UINT32 temp0, temp1, temp2, temp3;
@@ -791,6 +799,12 @@ INLINE void DMULU(sh2_state *sh2, UINT32 m, UINT32 n)
 	sh2->mach = Res2;
 	sh2->macl = Res0;
 	sh2->icount--;
+}
+#endif
+INLINE void DMULU(sh2_state *sh2, UINT32 m, UINT32 n)
+{
+  unsigned long long z=(unsigned long long)sh2->r[n]*sh2->r[m];
+  sh2->macl=(UINT32)z;sh2->mach=(UINT32)(z>>32);sh2->icount--;
 }
 
 /*  DT      Rn */
@@ -971,7 +985,8 @@ INLINE void LDSMPR(sh2_state *sh2, UINT32 m)
 }
 
 /*  MAC.L   @Rm+,@Rn+ */
-INLINE void MAC_L(sh2_state *sh2, UINT32 m, UINT32 n)
+#ifdef NATIVE_MATH_PROOF
+INLINE void legacy_MAC_L(sh2_state *sh2, UINT32 m, UINT32 n)
 {
 	UINT32 RnL, RnH, RmL, RmH, Res0, Res1, Res2;
 	UINT32 temp0, temp1, temp2, temp3;
@@ -1016,6 +1031,44 @@ INLINE void MAC_L(sh2_state *sh2, UINT32 m, UINT32 n)
 		else
 			Res0 = (~Res0) + 1;
 	}
+	if (sh2->sr & S)
+	{
+		Res0 = sh2->macl + Res0;
+		if (sh2->macl > Res0)
+			Res2++;
+		Res2 += (sh2->mach & 0x0000ffff);
+		if (((INT32) Res2 < 0) && (Res2 < 0xffff8000))
+		{
+			Res2 = 0x00008000;
+			Res0 = 0x00000000;
+		}
+		else if (((INT32) Res2 > 0) && (Res2 > 0x00007fff))
+		{
+			Res2 = 0x00007fff;
+			Res0 = 0xffffffff;
+		}
+		sh2->mach = Res2;
+		sh2->macl = Res0;
+	}
+	else
+	{
+		Res0 = sh2->macl + Res0;
+		if (sh2->macl > Res0)
+			Res2++;
+		Res2 += sh2->mach;
+		sh2->mach = Res2;
+		sh2->macl = Res0;
+	}
+	sh2->icount -= 2;
+}
+#endif
+INLINE void MAC_L(sh2_state *sh2, UINT32 m, UINT32 n)
+{
+  UINT32 Res0,Res2;
+  INT32 tempn=(INT32)RL(sh2,sh2->r[n]);sh2->r[n]+=4;
+  INT32 tempm=(INT32)RL(sh2,sh2->r[m]);sh2->r[m]+=4;
+  unsigned long long z=(unsigned long long)((long long)tempn*tempm);
+  Res0=(UINT32)z;Res2=(UINT32)(z>>32);
 	if (sh2->sr & S)
 	{
 		Res0 = sh2->macl + Res0;

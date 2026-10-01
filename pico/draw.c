@@ -334,6 +334,41 @@ TileFlipMakerAS(TileFlipSH_AS_and, pix_sh_as_and)
   }									\
 }
 
+/* Consume a whole contiguous run of a tile already found blank. Check
+ * eight, four, then two entries per step, with one row-boundary calculation
+ * for the whole run. The enclosing loop advances the final tile itself.
+ * Shadow/highlight priority tiles, clipping, forced drawing and column
+ * vscroll keep their original handling. No state survives a VRAM write. */
+#if defined(GNW_32X_CORE) && !defined(GNW_MD_NO_BLANK_RUN)
+#define GNW_SKIP_BLANK_RUN(cache) { \
+  if ((cache) && code == blank && !(sh && (code & 0x8000)) && cells >= 2) { \
+    unsigned col = tilex & ts->xmask; \
+    if (!((ts->nametab + col) & 1)) { \
+      const u32 *row = (const u32 *)(PicoMem.vram + ts->nametab + col); \
+      u32 repeated = code | (code << 16); \
+      unsigned limit = ts->xmask + 1 - col; \
+      unsigned run = 0; \
+      if (limit > (unsigned)cells) limit = cells; \
+      while (run + 8 <= limit && \
+             !((row[0] ^ repeated) | (row[1] ^ repeated) | \
+               (row[2] ^ repeated) | (row[3] ^ repeated))) { \
+        row += 4; run += 8; \
+      } \
+      if (run + 4 <= limit && !((row[0] ^ repeated) | (row[1] ^ repeated))) { \
+        row += 2; run += 4; \
+      } \
+      if (run + 2 <= limit && row[0] == repeated) run += 2; \
+      if (run) { \
+        dx += (run - 1) * 8; tilex += run - 1; cells -= run - 1; \
+        continue; \
+      } \
+    } \
+  } \
+}
+#else
+#define GNW_SKIP_BLANK_RUN(cache)
+#endif
+
 #define DrawStripMaker(funcname,yshift,ymask,hpcode,drawtile,cache)	\
 void funcname(struct TileStrip *ts, int lflags, int cellskip)		\
 {									\
@@ -369,6 +404,7 @@ void funcname(struct TileStrip *ts, int lflags, int cellskip)		\
     code = PicoMem.vram[ts->nametab + (tilex & ts->xmask)];		\
 /*    code &= ~force; *//* forced always draw everything */		\
 									\
+    GNW_SKIP_BLANK_RUN(cache);					\
     if (code != blank || ((code & 0x8000) && sh))			\
       drawtile(~0,yshift,ymask,hpcode | (ty<<26),cache);		\
   }									\

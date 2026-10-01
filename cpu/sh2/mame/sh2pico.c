@@ -1585,6 +1585,1171 @@ unsigned long long rig_gbr_hist[2][256];
 static volatile unsigned rig_skel_hit[16];
 #endif
 
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#ifndef GNW_SH2_FASTLOOPS
+#error Native kernels require existing GNW fastloop direct-fetch tracking
+#endif
+#define PIXEL_NATIVE_TAIL 1
+#define NATIVE_INACTIVE_FOLD 1
+/* Experimental generic SDRAM flag/countdown fold. Offline proof only. */
+static unsigned long long countdown_iterations;
+static unsigned countdown_calls;
+static unsigned countdown_fold(SH2 *s) {
+  if(s->delay || s->test_irq || s->icount<15 || !s->p_sdram) return 0;
+  uint32_t pc=s->pc;
+  if((pc&0xdf000000u)!=0x06000000u || (pc&0x3ffffu)>0x3fff6u || (pc&1))return 0;
+  const uint16_t *code=(const uint16_t *)((const uint8_t *)s->p_sdram+(pc&0x3fffeu));
+  uint16_t load=code[0],dt=code[3];
+  if((load&0xff00)!=0x8400 || code[1]!=0x2008 ||
+     (code[2]&0xff80)!=0x8b00 || (dt&0xf0ff)!=0x4010 || code[4]!=0x8bfa)return 0;
+  unsigned base=(load>>4)&15,counter=(dt>>8)&15;
+  if(!base || !counter || counter==base)return 0;
+  uint32_t a=s->r[base]+(load&15),n=s->r[counter];
+  if((a&0xdf000000u)!=0x06000000u || n<2)return 0;
+  if(((const uint8_t *)s->p_sdram)[(a&0x3ffffu)^1])return 0;
+  unsigned k=(s->icount-1)/7;
+  if(k>=n)k=n-1;
+  if(!k)return 0;
+  s->r[0]=0;s->r[counter]=n-k;s->t_flag=0;
+  s->pc=pc;s->ppc=pc+8;s->ea=pc;
+  s->no_polling=SH2_NO_POLLING;s->icount-=7*k;
+  countdown_iterations+=k;countdown_calls++;
+  return k;
+}
+
+/* Offline generic opcode-pattern native kernel; no title or PC binding. */
+static unsigned pixel_calls, pixel_proofs, pixel_declines, pixel_groups;
+static int pixel_proof_active;
+static void pixel_store(SH2 *s, unsigned a, unsigned d) {
+  unsigned short *p=(unsigned short *)s->p_dram+((a&0x1ffffu)>>1);
+  if(a&0x20000u){unsigned v=*p;if(!(d&255))d|=v&255;if(!(d&0xff00))d|=v&0xff00;}
+  *p=d;
+}
+/* Called after the first opcode fetch, before it executes. */
+static unsigned pixel_native_impl(SH2 *s, unsigned pc) {
+  if(pixel_proof_active || s->delay || s->test_irq || s->icount<8 || !s->p_sdram || !s->p_dram)return 0;
+  if((pc&0xdf000000u)!=0x06000000u || (pc&0x3ffffu)>0x3fff0u || (pc&1))return 0;
+  const unsigned short *p=(const unsigned short *)((const unsigned char *)s->p_sdram+(pc&0x3ffffu));
+  unsigned n=0, r0=s->r[0],r6=s->r[6],r4=s->r[4],r8=s->r[8],r2=s->r[2],r1=0,t=s->t_flag,c=0;
+  unsigned data[4], tail=0;
+  while(n<4 && s->icount>=(int)(8*(n+1)) && (pc&0x3ffffu)+16*(n+1)<=0x40000u){
+    const unsigned short *q=p+8*n;
+    unsigned dt=0;
+#ifdef PIXEL_NATIVE_TAIL
+    dt=q[7]==0x4710;
+#endif
+    if(q[0]!=0x612c || q[1]!=0x4218 || q[2]!=0x212b || q[3]!=0x2015 || q[4]!=0x38de || q[5]!=0x6240 || q[6]!=0x34ee || (q[7]!=0x2615 && !dt))break;
+    unsigned a=r0-2,b=r6-2;
+    if((a&0xdf000000u)!=0x04000000u || (b&0xdf000000u)!=0x04000000u || ((a|b)&1) || (r4&0xdf000000u)!=0x06000000u)break;
+    r1=(r2&255)|(r2<<8);data[n]=r1&65535;
+    unsigned old=r8,tmp=old+s->r[13];r8=tmp+t;t=(old>tmp)||(tmp>r8);
+    c=r4;r2=(unsigned)(int)(signed char)((unsigned char *)s->p_sdram)[(c&0x3ffffu)^1];
+    old=c;tmp=old+s->r[14];r4=tmp+t;t=(old>tmp)||(tmp>r4);
+    r0=a;if(!dt)r6=b;n++;
+    if(dt){tail=1;break;}
+  }
+  if(!n)return 0;
+#ifdef PIXEL_SHADOW_PROOF
+  static int guards_checked;
+  if(!guards_checked){
+    guards_checked=1;
+    for(unsigned i=0;i<12;i++){
+      SH2 q=*s, saved;
+      unsigned qpc=pc;
+      switch(i){
+      case 0:q.delay=pc;break;
+      case 1:q.test_irq=1;break;
+      case 2:q.icount=7;break;
+      case 3:q.p_sdram=0;break;
+      case 4:q.p_dram=0;break;
+      case 5:q.r[0]=0x20004002;break;
+      case 6:q.r[6]=0x20004002;break;
+      case 7:q.r[4]=0x20004000;break;
+      case 8:q.r[0]|=1;break;
+      case 9:q.r[6]|=1;break;
+      case 10:qpc=0x0603fff2;break;
+      case 11:qpc=0x02000000;break;
+      }
+      saved=q;
+      if(pixel_native(&q,qpc) || memcmp(&q,&saved,sizeof(q))){printf("PIXEL_GUARD_FAIL %u\n",i);exit(2);}
+      pixel_declines++;
+    }
+  }
+  SH2 before,reference;
+  unsigned short *slots[8],values[8],expected[8];
+  if(pixel_proofs<2048){
+    for(unsigned i=0;i<n;i++){
+      slots[2*i]=(unsigned short *)s->p_dram+(((s->r[0]-2*(i+1))&0x1ffffu)>>1);
+      slots[2*i+1]=(unsigned short *)s->p_dram+(((s->r[6]-2*(i+1))&0x1ffffu)>>1);
+    }
+    for(unsigned i=0;i<2*n;i++)values[i]=*slots[i];
+    before=*s;reference=*s;reference.pc=pc;reference.icount=8*n;
+    pixel_proof_active=1;
+    sh2_execute_interpreter(&reference,8*n);
+    pixel_proof_active=0;
+    for(unsigned i=0;i<2*n;i++)expected[i]=*slots[i];
+    for(unsigned i=0;i<2*n;i++)*slots[i]=values[i];
+    reference.icount=before.icount-8*n;
+  }
+#endif
+  for(unsigned i=0;i<n;i++){
+    pixel_store(s,s->r[0]-2*(i+1),data[i]);
+    if(!tail || i+1<n)pixel_store(s,s->r[6]-2*(i+1),data[i]);
+  }
+  s->r[0]=r0;s->r[1]=r1;s->r[2]=r2;s->r[4]=r4;s->r[6]=r6;s->r[8]=r8;s->t_flag=t;
+  if(tail){s->r[7]--;s->t_flag=s->r[7]==0;s->no_polling=SH2_NO_POLLING;}
+  s->ea=c;s->pc=pc+16*n;s->ppc=s->pc-2;s->icount-=8*n;
+#ifdef PIXEL_SHADOW_PROOF
+  if(pixel_proofs<2048){
+    unsigned bad=0;for(unsigned i=0;i<2*n;i++)bad|=*slots[i]!=expected[i];
+    if(memcmp(s,&reference,sizeof(*s)) || bad){
+      printf("PIXEL_PROOF_FAIL pc=%08x context=%d memory=%d\n",pc,memcmp(s,&reference,sizeof(*s)),bad);
+      exit(2);
+    }
+    pixel_proofs++;
+  }
+#endif
+  pixel_calls++;pixel_groups+=n;return 8*n;
+}
+
+/* Guarded native arithmetic/control patterns, independent of title and PC. */
+#include <string.h>
+#include <stdlib.h>
+static unsigned control_calls[3],control_proofs[3],control_taken[3];
+static int control_proof_active;
+static int control_ram(unsigned a){return (a&0xdf000000u)==0x06000000u;}
+static int control_memory(SH2 *s,unsigned a,unsigned width){
+  if(control_ram(a))return s->p_sdram!=0;
+  return (a&0xdf000000u)==gnw_fw_rom.region && gnw_fw_rom.base && gnw_sh2_rom_fetch_mask && (width!=4 || !(a&3));
+}
+static unsigned control_rd32(SH2 *s,unsigned a){
+  const unsigned char *base;unsigned off;
+  if(control_ram(a)){base=s->p_sdram;off=a&0x3fffcu;}
+  else{base=gnw_fw_rom.base;off=a&gnw_fw_rom.mask;}
+  unsigned v=*(const unsigned *)(base+off);return (v<<16)|(v>>16);
+}
+static unsigned control_rd8(SH2 *s,unsigned a){
+  const unsigned char *base;unsigned off;
+  if(control_ram(a)){base=s->p_sdram;off=a&0x3ffffu;}
+  else{base=gnw_fw_rom.base;off=a&gnw_fw_rom.mask;}
+  return (unsigned)(int)(signed char)base[off^1];
+}
+static unsigned control_native(SH2 *s,unsigned pc,unsigned kind){
+  if(control_proof_active || s->delay || s->test_irq || !s->p_sdram || !control_ram(pc) || (pc&1))return 0;
+  const unsigned short *p=(const unsigned short *)((const unsigned char *)s->p_sdram+(pc&0x3ffffu));
+  unsigned cycles,branch=0,r0=s->r[0],r1=s->r[1],r2=s->r[2],r3=s->r[3],r8=s->r[8],r13=s->r[13],macl=s->macl,mach=s->mach;
+  if(kind==0){
+    if(s->icount<11 || (pc&0x3ffffu)>0x3ffecu)return 0;
+    static const unsigned short ops[]={0x201f,0x4129,0x021a,0x201f,0x3c2c,0x021a,0x3b2c,0x4710,0x8fd7,0x7e20};
+    for(unsigned i=0;i<10;i++)if(p[i]!=ops[i])return 0;
+    r2=(unsigned)((int)(short)r0*(short)r1);r1>>=16;
+    macl=(unsigned)((int)(short)r0*(short)r1);
+    branch=s->r[7]!=1;cycles=10+branch;
+  } else {
+    if(s->icount<(kind==1?23:15) || (pc&0x3ffffu)>(kind==1?0x3ffd6u:0x3ffe4u))return 0;
+    static const unsigned short ops[]={0x3d88,0x3d1d,0x3d8c,0x51e4,0x001a,0x3012,0x890d,0x52e1,0x680d,0x4029,0x302c,0x6304,0x4819,0x6004,0x3038,0x208f,0x51e0,0x001a,0x4019,0xa004,0x303c};
+    unsigned skip=kind==1?0:7;
+    for(unsigned i=0;i<21-skip;i++)if(p[i]!=ops[i+skip])return 0;
+    if(kind==1){
+      unsigned a=s->r[14]+16;
+      if(!control_memory(s,a,4))return 0;
+      r13-=r8;
+      unsigned long long product=(unsigned long long)((long long)(int)r13*(int)r1);
+      mach=(unsigned)(product>>32);macl=(unsigned)product;r13+=r8;
+      r1=control_rd32(s,a);r0=macl;branch=r0>=r1;
+    }
+    if(branch)cycles=10;
+    else {
+      if(!control_memory(s,s->r[14]+4,4) || !control_memory(s,s->r[14],4))return 0;
+      r2=control_rd32(s,s->r[14]+4);r8=r0&65535;r0=(r0>>16)+r2;
+      if(!control_memory(s,r0,1) || !control_memory(s,r0+1,1))return 0;
+      r3=control_rd8(s,r0);
+      r0=control_rd8(s,r0+1);
+      r8>>=8;r0-=r3;macl=(unsigned)((int)(short)r0*(short)r8);
+      r1=control_rd32(s,s->r[14]);r0=(macl>>8)+r3;cycles=kind==1?23:15;
+    }
+  }
+#ifdef CONTROL_SHADOW_PROOF
+  SH2 reference;
+  if(control_proofs[kind]<2048){
+    reference=*s;reference.pc=pc;
+    control_proof_active=1;sh2_execute_interpreter(&reference,cycles);control_proof_active=0;
+    reference.icount=s->icount-cycles;
+  }
+#endif
+  if(kind==0){
+    s->r[1]=r1;s->r[12]+=r2;s->r[2]=macl;s->r[11]+=macl;s->macl=macl;
+    s->r[7]--;s->t_flag=!branch;s->no_polling=SH2_NO_POLLING;
+    s->r[14]+=32;s->pc=branch?pc-62:pc+20;s->ppc=pc+18;
+    if(branch)s->ea=s->pc;
+  }else{
+    s->r[13]=r13;s->mach=mach;s->macl=macl;s->r[1]=r1;s->r[0]=r0;if(kind==1)s->t_flag=branch;
+    if(branch){s->pc=pc+42;s->ppc=pc+12;}
+    else{s->r[2]=r2;s->r[3]=r3;s->r[8]=r8;s->pc=pc+(kind==1?50:36);s->ppc=pc+(kind==1?40:26);}
+    s->ea=s->pc;
+  }
+  s->icount-=cycles;
+#ifdef CONTROL_SHADOW_PROOF
+  if(control_proofs[kind]<2048){
+    if(memcmp(s,&reference,sizeof(*s))){
+      printf("CONTROL_FAIL kind=%u pc=%08x cycles=%u\n",kind,pc,cycles);
+      const unsigned *a=(const unsigned *)s,*b=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof(*s)/4;i++)if(a[i]!=b[i])printf("DIFF word=%u actual=%08x reference=%08x\n",i,a[i],b[i]);
+      exit(2);
+    }
+    control_proofs[kind]++;
+  }
+#endif
+  control_calls[kind]++;control_taken[kind]+=branch;return cycles;
+}
+#ifdef CONTROL_SHADOW_PROOF
+/* Synthetic inputs use the real core and bus; live game proofs run afterwards. */
+void control_synthetic_proof(SH2 *base){
+  static unsigned short ram[0x20000];
+  static const unsigned short mul[]={0x201f,0x4129,0x021a,0x201f,0x3c2c,0x021a,0x3b2c,0x4710,0x8fd7,0x7e20};
+  static const unsigned short coord[]={0x3d88,0x3d1d,0x3d8c,0x51e4,0x001a,0x3012,0x890d,0x52e1,0x680d,0x4029,0x302c,0x6304,0x4819,0x6004,0x3038,0x208f,0x51e0,0x001a,0x4019,0xa004,0x303c};
+  static const unsigned edge[]={0,1,2,0x7fff,0x8000,0xffff,0x10000,0x7fffffff,0x80000000,0xffffffff};
+  unsigned seed=0x32c04,checks=0,declines=0,branches[3][2]={{0}};
+  for(unsigned i=0;i<0x20000;i++)ram[i]=(i*73u)^0x80ffu;
+  for(unsigned kind=0;kind<3;kind++){
+    memcpy(ram+0x100,kind==0?mul:kind==1?coord:coord+7,kind==0?sizeof(mul):kind==1?sizeof(coord):sizeof(coord)-14);
+    for(unsigned i=0;i<4096;i++){
+      SH2 a=*base,b,original;unsigned pc=0x06000200u;
+      a.p_sdram=ram;a.delay=0;a.test_irq=0;a.pc=pc+2;a.ppc=pc;a.icount=i%32;
+      for(unsigned j=0;j<16;j++){seed=seed*1664525u+1013904223u;a.r[j]=i<100?edge[(i+j)%10]:seed;}
+      a.t_flag=i&1;a.r[14]=0x06001000u;a.r[7]=i%4==0?1:i%4==1?0:seed;
+      unsigned *table=(unsigned *)(ram+0x800);
+      table[0]=seed;table[1]=0x00000601; /* CPU_BE2 -> SDRAM 06010000 */
+      table[4]=i&1?0xffffffffu:0;
+      if(i%16>=1 && i%16<=6)a.icount=64;
+      switch(i%16){
+      case 1:a.test_irq=1;break;
+      case 2:a.delay=pc;break;
+      case 3:a.p_sdram=0;break;
+      case 4:if(kind)a.r[14]=0x20004000;else pc|=1;break;
+      case 5:pc=0x0603fff8u;break;
+      case 6:pc=0x02000200u;break;
+      }
+      original=a;b=a;
+      unsigned consumed=control_native(&a,pc,kind);
+      if(!consumed){
+        if(memcmp(&a,&original,sizeof(a))){printf("CONTROL_DECLINE_FAIL kind=%u case=%u\n",kind,i);exit(2);}
+        declines++;continue;
+      }
+      b.pc=pc;control_proof_active=1;sh2_execute_interpreter(&b,consumed);control_proof_active=0;
+      b.icount=original.icount-consumed;
+      if(memcmp(&a,&b,sizeof(a))){printf("CONTROL_SYNTH_FAIL kind=%u case=%u\n",kind,i);exit(2);}
+      branches[kind][a.t_flag!=0]++;checks++;
+    }
+  }
+  printf("CONTROL_SYNTH checks=%u declines=%u mul_t0=%u mul_t1=%u coord_t0=%u coord_t1=%u interp_t0=%u interp_t1=%u\n",checks,declines,branches[0][0],branches[0][1],branches[1][0],branches[1][1],branches[2][0],branches[2][1]);
+  memset(control_calls,0,sizeof(control_calls));memset(control_proofs,0,sizeof(control_proofs));memset(control_taken,0,sizeof(control_taken));
+}
+#endif
+
+/* Native repeated SDRAM word lookup / framebuffer span. No fixed PC. */
+#include <string.h>
+#include <stdlib.h>
+static unsigned lookup_calls,lookup_groups,lookup_proofs;
+static int lookup_proof_active;
+static unsigned lookup_native_impl(SH2 *s,unsigned pc){
+  if(lookup_proof_active || s->delay || s->test_irq || s->icount<3 || !s->p_sdram || !s->p_dram || (pc&0xdf000000u)!=0x06000000u || (pc&1))return 0;
+  unsigned n=0,r0=s->r[0],r1=s->r[1],r6=s->r[6],r8=s->r[8],t=s->t_flag,ea=s->ea;
+  unsigned data[8],ops=0;
+  const unsigned short *p=(const unsigned short *)((const unsigned char *)s->p_sdram+(pc&0x3ffffu));
+  while(n<8){
+    unsigned count=n?4:3;
+    if(s->icount<(int)(ops+count) || (pc&0x3ffffu)+2*(ops+count)>0x40000u)break;
+    const unsigned short *q=p+ops;
+    if(n){if(q[0]!=0x38de)break;q++;}
+    if(q[0]!=0x010d || q[1]!=0x30ee || q[2]!=0x2615)break;
+    unsigned a=r0+r0,b=r6-2;
+    if((a&0xdf000000u)!=0x06000000u || (b&0xdf000000u)!=0x04000000u || (b&1))break;
+    unsigned old,tmp;
+    if(n){old=r8;tmp=old+s->r[13];r8=tmp+t;t=(old>tmp)||(tmp>r8);}
+    r1=(unsigned)(int)(short)*(const unsigned short *)((const unsigned char *)s->p_sdram+(a&0x3fffeu));
+    old=r0;tmp=old+s->r[14];r0=tmp+t;t=(old>tmp)||(tmp>r0);
+    data[n]=r1&65535;r6=b;ea=a;n++;ops+=count;
+  }
+  if(!n)return 0;
+#ifdef LOOKUP_SHADOW_PROOF
+  SH2 reference;unsigned short *slots[8],values[8],expected[8];
+  if(lookup_proofs<2048){
+    for(unsigned i=0;i<n;i++){slots[i]=(unsigned short *)s->p_dram+(((s->r[6]-2*(i+1))&0x1ffffu)>>1);values[i]=*slots[i];}
+    reference=*s;reference.pc=pc;
+    lookup_proof_active=1;sh2_execute_interpreter(&reference,ops);lookup_proof_active=0;
+    reference.icount=s->icount-ops;
+    for(unsigned i=0;i<n;i++)expected[i]=*slots[i];
+    for(unsigned i=0;i<n;i++)*slots[i]=values[i];
+  }
+#endif
+  for(unsigned i=0;i<n;i++){
+    unsigned a=s->r[6]-2*(i+1),d=data[i];
+    unsigned short *pd=(unsigned short *)s->p_dram+((a&0x1ffffu)>>1);
+    if(a&0x20000u){unsigned old=*pd;if(!(d&255))d|=old&255;if(!(d&0xff00))d|=old&0xff00;}
+    *pd=d;
+  }
+  s->r[0]=r0;s->r[1]=r1;s->r[6]=r6;s->r[8]=r8;s->t_flag=t;s->ea=ea;s->pc=pc+2*ops;s->ppc=s->pc-2;s->icount-=ops;
+#ifdef LOOKUP_SHADOW_PROOF
+  if(lookup_proofs<2048){
+    unsigned bad=0;for(unsigned i=0;i<n;i++)bad|=*slots[i]!=expected[i];
+    if(memcmp(s,&reference,sizeof(*s)) || bad){printf("LOOKUP_FAIL pc=%08x context=%d memory=%u\n",pc,memcmp(s,&reference,sizeof(*s)),bad);exit(2);}
+    lookup_proofs++;
+  }
+#endif
+  lookup_calls++;lookup_groups+=n;return ops;
+}
+
+/* Bounded native chains: parameter loads, computed jump, coordinate, loop tail. */
+#include <string.h>
+#include <stdlib.h>
+static unsigned chain_calls,chain_parts,chain_proofs,inactive_calls,inactive_iterations;
+static unsigned inactive_native(SH2 *s,unsigned pc,unsigned first_callback);
+static int chain_proof_active;
+static unsigned chain_entry(SH2 *s,unsigned pc){
+  if(s->delay || s->test_irq || s->icount<5 || !s->p_sdram || !control_ram(pc) || (pc&1) || (pc&0x3ffffu)>0x3fff8u)return 0;
+  const unsigned short *p=(const unsigned short *)((const unsigned char *)s->p_sdram+(pc&0x3ffffu));
+  if(p[0]!=0x50e6 || p[1]!=0x51e3 || p[2]!=0x402b || p[3]!=0x58e2)return 0;
+  unsigned a=s->r[14];
+  if(!control_memory(s,a+24,4) || !control_memory(s,a+12,4) || !control_memory(s,a+8,4))return 0;
+  unsigned callback=control_rd32(s,a+24);
+#ifdef NATIVE_INACTIVE_FOLD
+  unsigned folded=inactive_native(s,pc,callback);if(folded)return folded;
+#endif
+  s->r[0]=callback;s->r[1]=control_rd32(s,a+12);s->r[8]=control_rd32(s,a+8);
+  s->pc=s->r[0];s->ppc=pc+6;s->ea=a+8;s->icount-=5;return 5;
+}
+static unsigned inactive_native(SH2 *s,unsigned pc,unsigned first_callback){
+  if(s->icount<17)return 0;
+  static const unsigned short idle[]={0xe100,0xe000,0x201f,0x4129,0x021a,0x201f,0x3c2c,0x021a,0x3b2c,0x4710,0x8fd7,0x7e20};
+  unsigned n=0,used=0,a=s->r[14],counter=s->r[7],callback=0,last_a=0;
+  while(n<48){
+    unsigned cost=counter==1?17:18;
+    if(s->icount<(int)(used+cost) || !control_memory(s,a+24,4) || !control_memory(s,a+12,4) || !control_memory(s,a+8,4))break;
+    unsigned cb=n?control_rd32(s,a+24):first_callback;
+    if(!control_ram(cb) || (cb&1) || (cb&0x3ffffu)>0x3ffe8u || cb-58!=pc)break;
+    const unsigned short *q=(const unsigned short *)((const unsigned char *)s->p_sdram+(cb&0x3ffffu));
+    if(cb!=callback){unsigned j;for(j=0;j<12;j++)if(q[j]!=idle[j])break;if(j!=12)break;}
+    callback=cb;last_a=a;a+=32;counter--;used+=cost;n++;
+    if(counter==0)break;
+  }
+  if(!n)return 0;
+  s->r[0]=s->r[1]=s->r[2]=s->macl=0;s->r[8]=control_rd32(s,last_a+8);
+  s->r[7]=counter;s->r[14]=a;s->t_flag=counter==0;s->no_polling=SH2_NO_POLLING;
+  s->pc=counter?pc:callback+24;s->ppc=callback+22;s->ea=counter?pc:last_a+8;s->icount-=used;
+  inactive_calls++;inactive_iterations+=n;return used;
+}
+/* Pattern match on guest code: halfword compare, out at the first mismatch.
+ * newlib's memcmp is byte-wise and, on the device, lives in internal flash. */
+static inline __attribute__((always_inline)) int hw_eq(const void *a,const unsigned short *b,unsigned n){
+  const unsigned short *x=(const unsigned short *)a;
+  for(unsigned i=0;i<n;i++)if(x[i]!=b[i])return 0;
+  return 1;
+}
+static unsigned mix_native_impl(SH2 *s,unsigned pc);
+static unsigned blitb_native_impl(SH2 *s,unsigned pc);
+static unsigned blitc_native_impl(SH2 *s,unsigned pc);
+static unsigned blita_native_impl(SH2 *s,unsigned pc);
+static unsigned idle_native_impl(SH2 *s,unsigned pc);
+static unsigned fill_native_impl(SH2 *s,unsigned pc);
+static unsigned chain_native_impl(SH2 *s,unsigned pc);
+static unsigned pixel_native_impl(SH2 *s,unsigned pc);
+static unsigned lookup_native_impl(SH2 *s,unsigned pc);
+static unsigned pcm_tail_native_impl(SH2 *s,unsigned pc);
+
+#ifdef RIG_NATIVE_COST
+#include <stdint.h>
+extern uint32_t rig_timer_now(void);
+unsigned long long native_cost[16],native_ncall[16];
+#define NC_WRAP(i,n) static unsigned n(SH2 *s,unsigned pc){unsigned long long t0=rig_timer_now();unsigned r=n##_impl(s,pc);native_cost[i]+=rig_timer_now()-t0;native_ncall[i]++;return r;}
+#else
+#define NC_WRAP(i,n) static inline unsigned n(SH2 *s,unsigned pc){return n##_impl(s,pc);}
+#endif
+NC_WRAP(0,mix_native)
+NC_WRAP(1,blitb_native)
+NC_WRAP(2,blitc_native)
+NC_WRAP(3,blita_native)
+NC_WRAP(4,idle_native)
+NC_WRAP(5,fill_native)
+NC_WRAP(6,chain_native)
+NC_WRAP(7,pixel_native)
+NC_WRAP(8,lookup_native)
+NC_WRAP(9,pcm_tail_native)
+static unsigned chain_native_impl(SH2 *s,unsigned pc){
+  if(chain_proof_active)return 0;
+  { unsigned m=mix_native(s,pc); if(m)return m; }
+#ifdef CHAIN_SHADOW_PROOF
+  SH2 before,reference;
+  if(chain_proofs<2048)before=*s;
+#endif
+  unsigned used=chain_entry(s,pc),parts=1;
+  if(!used)return 0;
+  while(parts<48 && s->icount>=5 && !s->delay && !s->test_irq && s->p_sdram && control_ram(s->pc) && !(s->pc&1)){
+    unsigned oldpc=s->pc,oldppc=s->ppc;
+    unsigned short op=*(unsigned short *)((unsigned char *)s->p_sdram+(oldpc&0x3ffffu));
+    if(op!=0x50e6 && op!=0x3d88 && op!=0x201f && op!=0x52e1)break;
+    s->ppc=oldpc;s->pc=oldpc+2;
+    unsigned c;
+    if(op==0x50e6)c=chain_entry(s,oldpc);
+    else c=control_native(s,oldpc,op==0x3d88?1:op==0x52e1?2:0);
+    if(!c){s->pc=oldpc;s->ppc=oldppc;break;}
+    used+=c;parts++;
+  }
+#ifdef CHAIN_SHADOW_PROOF
+  if(chain_proofs<2048){
+    reference=before;reference.pc=pc;
+    chain_proof_active=1;control_proof_active=1;
+    sh2_execute_interpreter(&reference,used);
+    chain_proof_active=0;control_proof_active=0;
+    reference.icount=before.icount-used;
+    if(memcmp(s,&reference,sizeof(*s))){
+      printf("CHAIN_FAIL pc=%08x cycles=%u parts=%u\n",pc,used,parts);
+      const unsigned *a=(const unsigned *)s,*b=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof(*s)/4;i++)if(a[i]!=b[i])printf("DIFF word=%u actual=%08x reference=%08x\n",i,a[i],b[i]);
+      exit(2);
+    }
+    chain_proofs++;
+  }
+#endif
+  chain_calls++;chain_parts+=parts;return used;
+}
+#ifdef CHAIN_SHADOW_PROOF
+void chain_synthetic_proof(SH2 *base){
+  static unsigned short ram[0x20000];
+  static const unsigned short entry[]={0x50e6,0x51e3,0x402b,0x58e2};
+  static const unsigned short idle[]={0xe100,0xe000,0x201f,0x4129,0x021a,0x201f,0x3c2c,0x021a,0x3b2c,0x4710,0x8fd7,0x7e20};
+  static const unsigned counters[]={0,1,2,16,0xffffffffu};
+  unsigned checks=0,declines=0,seed=0x32f01;
+  memcpy(ram+0x100,entry,sizeof(entry));memcpy(ram+0x11d,idle,sizeof(idle));
+  for(unsigned i=0;i<64;i++){
+    unsigned *p=(unsigned *)(ram+0x800+16*i);
+    p[2]=i*0x9876543u;p[3]=~i;p[6]=0x023a0600u;
+  }
+  for(unsigned i=0;i<1024;i++){
+    SH2 a=*base,b,original;unsigned pc=0x06000200u;
+    a.p_sdram=ram;a.pc=pc+2;a.ppc=pc;a.delay=a.test_irq=0;a.icount=i%513;
+    for(unsigned j=0;j<16;j++){seed=seed*1664525u+1013904223u;a.r[j]=seed;}
+    a.r[14]=0x06001000u;a.r[7]=counters[i%5];a.t_flag=i&1;
+    switch(i%32){case 1:a.delay=pc;break;case 2:a.test_irq=1;break;case 3:a.p_sdram=0;break;case 4:a.r[14]=0x20004000u;break;case 5:pc|=1;break;}
+    original=a;b=a;
+    unsigned used=chain_native(&a,pc);
+    if(!used){if(memcmp(&a,&original,sizeof(a))){printf("CHAIN_DECLINE_FAIL case=%u\n",i);exit(2);}declines++;continue;}
+    b.pc=pc;chain_proof_active=1;control_proof_active=1;sh2_execute_interpreter(&b,used);chain_proof_active=0;control_proof_active=0;b.icount=original.icount-used;
+    if(memcmp(&a,&b,sizeof(a))){printf("CHAIN_SYNTH_FAIL case=%u budget=%d cycles=%u\n",i,original.icount,used);exit(2);}
+    checks++;
+  }
+  printf("CHAIN_SYNTH checks=%u declines=%u\n",checks,declines);
+  chain_calls=chain_parts=chain_proofs=inactive_calls=inactive_iterations=0;
+}
+#endif
+
+/* Pure arithmetic/sample limiting tail; leaves ring-buffer/MMIO writes alone. */
+#include <string.h>
+#include <stdlib.h>
+static unsigned pcm_tail_calls,pcm_tail_proofs;
+static int pcm_tail_proof_active;
+static unsigned pcm_tail_word(SH2 *s,unsigned a){
+  const unsigned char *base;unsigned off;
+  if(control_ram(a)){base=s->p_sdram;off=a&0x3fffeu;}
+  else{base=gnw_fw_rom.base;off=a&gnw_fw_rom.mask;}
+  return (unsigned)(int)(short)*(const unsigned short *)(base+off);
+}
+static unsigned pcm_tail_native_impl(SH2 *s,unsigned pc){
+  if(pcm_tail_proof_active || s->delay || s->test_irq || s->icount<25 || !s->p_sdram || !control_ram(pc) || (pc&1) || (pc&0x3ffffu)>0x3ffd6u)return 0;
+  static const unsigned short ops[]={0xd21c,0x951c,0x3b2d,0x911e,0x0b0a,0x3b5c,0x3c2d,0x4b15,0x8901,0x31b3,0xeb01,0x8900,0x6b13,0x0c0a,0x3c5c,0x4c15,0x8901,0x31c3,0xec01,0x8900,0x6c13};
+  const unsigned short *p=(const unsigned short *)((const unsigned char *)s->p_sdram+(pc&0x3ffffu));
+  for(unsigned i=0;i<21;i++)if(p[i]!=ops[i])return 0;
+  unsigned a2=((pc+4)&~3u)+0x70,a5=pc+0x3e,a1=pc+0x46;
+  if(!control_memory(s,a2,4) || !control_memory(s,a5,2) || !control_memory(s,a1,2))return 0;
+  unsigned r2=control_rd32(s,a2),r5=pcm_tail_word(s,a5),r1=pcm_tail_word(s,a1),ea=a1,cycles=10;
+  unsigned long long left=(unsigned long long)((long long)(int)s->r[11]*(int)r2),right=(unsigned long long)((long long)(int)s->r[12]*(int)r2);
+  unsigned r11=(unsigned)(left>>32)+r5,r12=(unsigned)(right>>32)+r5,t=(int)r11>0;
+  if(t){cycles+=3;ea=pc+22;}else{cycles+=3;t=(int)r1>=(int)r11;r11=1;}
+  if(t){cycles+=3;ea=pc+26;}else{cycles+=2;r11=r1;}
+  cycles+=3;t=(int)r12>0;
+  if(t){cycles+=3;ea=pc+38;}else{cycles+=3;t=(int)r1>=(int)r12;r12=1;}
+  unsigned ppc;
+  if(t){cycles+=3;ea=pc+42;ppc=pc+38;}else{cycles+=2;r12=r1;ppc=pc+40;}
+#ifdef PCM_TAIL_SHADOW_PROOF
+  SH2 reference;
+  if(pcm_tail_proofs<2048){reference=*s;reference.pc=pc;pcm_tail_proof_active=1;sh2_execute_interpreter(&reference,cycles);pcm_tail_proof_active=0;reference.icount=s->icount-cycles;}
+#endif
+  s->r[1]=r1;s->r[2]=r2;s->r[5]=r5;s->r[11]=r11;s->r[12]=r12;s->macl=(unsigned)right;s->mach=(unsigned)(right>>32);s->t_flag=t;s->ea=ea;s->pc=pc+42;s->ppc=ppc;s->icount-=cycles;
+#ifdef PCM_TAIL_SHADOW_PROOF
+  if(pcm_tail_proofs<2048){if(memcmp(s,&reference,sizeof(*s))){printf("PCM_TAIL_FAIL pc=%08x cycles=%u\n",pc,cycles);exit(2);}pcm_tail_proofs++;}
+#endif
+  pcm_tail_calls++;return cycles;
+}
+#ifdef PCM_TAIL_SHADOW_PROOF
+void pcm_tail_synthetic_proof(SH2 *base){
+  static unsigned short ram[0x1000];
+  static const unsigned short ops[]={0xd21c,0x951c,0x3b2d,0x911e,0x0b0a,0x3b5c,0x3c2d,0x4b15,0x8901,0x31b3,0xeb01,0x8900,0x6b13,0x0c0a,0x3c5c,0x4c15,0x8901,0x31c3,0xec01,0x8900,0x6c13};
+  static const unsigned edge[]={0,1,2,0x7fff,0x8000,0xffff,0x10000,0x7fffffff,0x80000000,0xffffffff};
+  unsigned seed=0x32b15,checks=0,declines=0;
+  memcpy(ram+0x100,ops,sizeof(ops));
+  for(unsigned i=0;i<4096;i++){
+    SH2 a=*base,b,original;unsigned pc=0x06000200u;
+    a.p_sdram=ram;a.pc=pc+2;a.ppc=pc;a.delay=a.test_irq=0;a.icount=i%32;a.t_flag=i&1;
+    seed=seed*1664525u+1013904223u;a.r[11]=i<100?edge[i/10]:seed;
+    seed=seed*1664525u+1013904223u;a.r[12]=i<100?edge[i%10]:seed;
+    unsigned gain=i<100?edge[(i/10+i%10)%10]:seed;
+    *(unsigned *)(ram+0x13a)=(gain<<16)|(gain>>16);
+    ram[0x11f]=(unsigned short)(seed>>8);ram[0x123]=(unsigned short)seed;
+    unsigned g=i%16;
+    if(g>=1 && g<=5)a.icount=64;
+    switch(g){case 1:a.delay=pc;break;case 2:a.test_irq=1;break;case 3:a.p_sdram=0;break;case 4:pc|=1;break;case 5:pc=0x02000200u;break;}
+    original=a;b=a;unsigned used=pcm_tail_native(&a,pc);
+    if(!used){if(memcmp(&a,&original,sizeof(a))){printf("PCM_TAIL_DECLINE_FAIL case=%u\n",i);exit(2);}declines++;continue;}
+    b.pc=pc;pcm_tail_proof_active=1;sh2_execute_interpreter(&b,used);pcm_tail_proof_active=0;b.icount=original.icount-used;
+    if(memcmp(&a,&b,sizeof(a))){printf("PCM_TAIL_SYNTH_FAIL case=%u cycles=%u\n",i,used);exit(2);}checks++;
+  }
+  printf("PCM_TAIL_SYNTH checks=%u declines=%u\n",checks,declines);
+  pcm_tail_calls=pcm_tail_proofs=0;
+}
+#endif
+
+/* Whole-sample PCM mixer (After Burner class sound driver, opcode-pattern
+ * recognised, no title/PC whitelist): chain entry -> r7 voice callbacks
+ * (active interpolator or retired zero) -> scale/limit tail -> ring store.
+ * One native call per output sample instead of ~28 interpreter re-entries.
+ * Everything is computed into locals first; any guard failure declines with
+ * the guest state untouched. Cycle charges mirror the interpreter's per-op
+ * costs (1/op, +1 BRA/BFS-taken/DMULS/MULS, +2 BT/BF-taken, JMP 2). */
+static unsigned mix_calls,mix_proofs,mix_voice_total,mix_decl[8];
+#ifdef RIG_SH2_COUNT
+unsigned long long mix_slave_bucket[8],mix_budget_hist[8],mix_master_bucket[8],mix_pcbin[2][2048];
+#endif
+static int mix_proof_active;
+static unsigned __attribute__((noinline)) mix_native_impl(SH2 *s,unsigned pc){
+  if(mix_proof_active || s->delay || s->test_irq || !s->p_sdram || !control_ram(pc) || (pc&1))return 0;
+  unsigned n=s->r[7];
+  if(n==0 || n>48){mix_decl[0]++;return 0;}
+#ifdef RIG_MIX_DIAG
+  { extern unsigned long long mix_budget_hist[8]; int b=s->icount; mix_budget_hist[b<45?0:b<100?1:b<200?2:b<400?3:b<700?4:5]++; if(n==16)mix_budget_hist[6]++; }
+#endif
+  if(s->icount<=0){mix_decl[1]++;return 0;}
+  if((pc&0x3ffffu)>0x3ffffu-0xa0)return 0;
+  const unsigned short *p=(const unsigned short *)((const unsigned char *)s->p_sdram+(pc&0x3ffffu));
+  static const unsigned short entry[]={0x50e6,0x51e3,0x402b,0x58e2};
+  static const unsigned short active[]={0x3d88,0x3d1d,0x3d8c,0x51e4,0x001a,0x3012,0x890d,0x52e1,0x680d,0x4029,0x302c,0x6304,0x4819,0x6004,0x3038,0x208f,0x51e0,0x001a,0x4019,0xa004,0x303c};
+  static const unsigned short retire[]={0xd01a,0x1e06,0xe100,0xe000};
+  static const unsigned short tail[]={0x201f,0x4129,0x021a,0x201f,0x3c2c,0x021a,0x3b2c,0x4710,0x8fd7,0x7e20};
+  static const unsigned short limit[]={0xd21c,0x951c,0x3b2d,0x911e,0x0b0a,0x3b5c,0x3c2d,0x4b15,0x8901,0x31b3,0xeb01,0x8900,0x6b13,0x0c0a,0x3c5c,0x4c15,0x8901,0x31c3,0xec01,0x8900,0x6c13};
+  static const unsigned short ring[]={0xd80e,0xd906,0x6081,0x09b5,0x7002,0x09c5,0x7002,0x600c,0xa1d7,0x2801};
+  if(!hw_eq(p,entry,sizeof entry/2)||!hw_eq(p+6,active,sizeof active/2)||!hw_eq(p+27,retire,sizeof retire/2)
+     ||!hw_eq(p+31,tail,sizeof tail/2)||!hw_eq(p+41,limit,sizeof limit/2)||!hw_eq(p+62,ring,sizeof ring/2))return 0;
+  unsigned cb_active=pc+12,cb_retired=pc+0x3a,tp=pc+0x52,rp=pc+0x7c;
+  unsigned lit_retire=((pc+0x36+4)&~3u)+0x1a*4,lit8=((rp+4)&~3u)+0x0e*4,lit9=((rp+2+4)&~3u)+0x06*4;
+  unsigned ta2=((tp+4)&~3u)+0x70,ta5=tp+0x3e,ta1=tp+0x46;
+  if(!control_memory(s,lit_retire,4)||!control_memory(s,lit8,4)||!control_memory(s,lit9,4)
+     ||!control_memory(s,ta2,4)||!control_memory(s,ta5,2)||!control_memory(s,ta1,2))return 0;
+  if(control_rd32(s,lit_retire)!=cb_retired)return 0;
+  /* Voices are folded while the budget holds a worst-case voice (39); the
+   * tail needs a further 39 (28 + ring 11). A partial fold stops on the loop
+   * boundary exactly as the interpreter's bf/s would. */
+  unsigned a=s->r[14],r13=s->r[13],r11=s->r[11],r12=s->r[12],r3=s->r[3],mach=s->mach,cycles=0,k=0;
+  unsigned r0=s->r[0],r1=s->r[1],r2=s->r[2],r8=s->r[8],macl=s->macl,last_ea=s->ea;
+  unsigned long long retired=0;
+  int budget=s->icount;
+  /* Interpreter rule: an instruction runs whenever icount > 0 and may push it
+   * negative; the overrun is settled by the next slice. Folding a whole voice
+   * when its first instruction would run overruns by at most one voice (38). */
+  for(;k<n && (int)cycles<budget;k++,a+=32){
+    /* voice record: 32 aligned bytes of SDRAM, checked once, read directly */
+    if((a&0xdf000003u)!=0x06000000u||(a&0x3ffffu)>0x40000u-32)break;
+    const unsigned *vr=(const unsigned *)((const unsigned char *)s->p_sdram+(a&0x3ffffu));
+#define MIX_RD(i) ((vr[i]<<16)|(vr[i]>>16))
+    unsigned cb=MIX_RD(6);
+    unsigned v1=MIX_RD(3),v8=MIX_RD(2),v0,vmacl;
+    if(cb==cb_active){
+      unsigned long long prod=(unsigned long long)((long long)(int)(r13-v8)*(int)v1);
+      unsigned vmach=(unsigned)(prod>>32);vmacl=(unsigned)prod;
+      unsigned e=MIX_RD(4);v0=vmacl;
+      if(v0>=e){
+        retired|=1ull<<k;v1=0;v0=0;mach=vmach;cycles+=5+10+4;last_ea=a+24;
+      }else{
+        unsigned v2=MIX_RD(1);v8=v0&65535;v0=(v0>>16)+v2;
+        if(!control_memory(s,v0,1)||!control_memory(s,v0+1,1))break;
+        r3=control_rd8(s,v0);v0=control_rd8(s,v0+1);v8>>=8;v0-=r3;
+        vmacl=(unsigned)((int)(short)v0*(short)v8);v1=MIX_RD(0);v0=(vmacl>>8)+r3;mach=vmach;cycles+=5+23;last_ea=pc+0x3e;
+      }
+    }else if(cb==cb_retired){v1=0;v0=0;cycles+=5+2;last_ea=a+8;}
+    else {mix_decl[2]++;break;}
+    r2=(unsigned)((int)(short)v0*(short)v1);v1>>=16;macl=(unsigned)((int)(short)v0*(short)v1);
+    r12+=r2;r11+=macl;r2=macl;r0=v0;r1=v1;r8=v8;cycles+=10+(k!=n-1);
+#undef MIX_RD
+  }
+  if(!k){mix_decl[1]++;return 0;}
+  unsigned full=(k==n && (int)cycles<budget);
+  unsigned r5=0,r9=0,t=0,tr8=0;
+  if(full){
+    r2=control_rd32(s,ta2);r5=pcm_tail_word(s,ta5);r1=pcm_tail_word(s,ta1);
+    unsigned long long left=(unsigned long long)((long long)(int)r11*(int)r2),right=(unsigned long long)((long long)(int)r12*(int)r2);
+    r11=(unsigned)(left>>32)+r5;r12=(unsigned)(right>>32)+r5;t=(int)r11>0;cycles+=10;
+    if(t)cycles+=3;else{cycles+=3;t=(int)r1>=(int)r11;r11=1;}
+    if(t)cycles+=3;else{cycles+=2;r11=r1;}
+    cycles+=3;t=(int)r12>0;
+    if(t)cycles+=3;else{cycles+=3;t=(int)r1>=(int)r12;r12=1;}
+    if(t)cycles+=3;else{cycles+=2;r12=r1;}
+    macl=(unsigned)right;mach=(unsigned)(right>>32);
+    tr8=control_rd32(s,lit8);r9=control_rd32(s,lit9);cycles+=11;
+  }
+#ifdef MIX_SHADOW_PROOF
+  SH2 reference;unsigned short ring_was[2],ring_exp[2],*rs=0;unsigned cb_was[48],cb_exp[48];int proof=mix_proofs<2048;
+  if(proof){
+    unsigned ra=full?r9+(unsigned)(int)(short)RW(s,tr8):0;
+    if(full && (!control_ram(ra)||!control_ram(ra+3)))proof=0;
+    else{
+      if(full){rs=(unsigned short *)((unsigned char *)s->p_sdram+(ra&0x3fffeu));ring_was[0]=rs[0];ring_was[1]=rs[1];}
+      for(unsigned i=0;i<k;i++)cb_was[i]=control_rd32(s,s->r[14]+32*i+24);
+      reference=*s;reference.pc=pc;
+      mix_proof_active=1;chain_proof_active=1;control_proof_active=1;pcm_tail_proof_active=1;
+      sh2_execute_interpreter(&reference,cycles);
+      mix_proof_active=0;chain_proof_active=0;control_proof_active=0;pcm_tail_proof_active=0;
+      reference.icount=s->icount-cycles;
+      if(full){ring_exp[0]=rs[0];ring_exp[1]=rs[1];rs[0]=ring_was[0];rs[1]=ring_was[1];}
+      for(unsigned i=0;i<k;i++){cb_exp[i]=control_rd32(s,s->r[14]+32*i+24);if(cb_exp[i]!=cb_was[i])WL(s,s->r[14]+32*i+24,cb_was[i]);}
+    }
+  }
+#endif
+  a=s->r[14];
+  for(unsigned i=0;i<k;i++)if(retired>>i&1)WL(s,a+32*i+24,cb_retired);
+  s->r[3]=r3;s->r[11]=r11;s->r[12]=r12;s->r[14]=a+32*k;s->r[7]=n-k;s->mach=mach;
+  /* DT set this before any ring access; poll detection may clear it again. */
+  s->no_polling=SH2_NO_POLLING;
+  if(full){
+    unsigned idx=(unsigned)(int)(short)RW(s,tr8);
+    WW(s,r9+idx,r11&0xffffu);idx+=2;WW(s,r9+idx,r12&0xffffu);idx+=2;idx&=0xffu;
+    WW(s,tr8,idx);
+    s->r[0]=idx;s->r[1]=r1;s->r[2]=r2;s->r[5]=r5;s->r[8]=tr8;s->r[9]=r9;s->macl=macl;
+    s->t_flag=t;s->ea=tr8;s->pc=rp+0x3c2;s->ppc=rp+18;
+  }else{
+    s->r[0]=r0;s->r[1]=r1;s->r[2]=r2;s->r[8]=r8;s->macl=macl;s->ppc=pc+0x50;
+    /* all voices done but no budget for the tail: the dt fell to zero, bf/s not taken */
+    if(k==n){s->t_flag=1;s->ea=last_ea;s->pc=tp;}
+    else{s->t_flag=0;s->ea=pc;s->pc=pc;}
+  }
+  s->icount-=cycles;
+#ifdef MIX_SHADOW_PROOF
+  if(proof){
+    unsigned bad=0;
+    if(full && (rs[0]!=ring_exp[0]||rs[1]!=ring_exp[1]))bad|=1;
+    for(unsigned i=0;i<k;i++)if(control_rd32(s,a+32*i+24)!=cb_exp[i])bad|=2;
+    if(memcmp(s,&reference,sizeof *s)||bad){
+      printf("MIX_FAIL pc=%08x cycles=%u n=%u k=%u full=%u bad=%u\n",pc,cycles,n,k,full,bad);
+      const unsigned *x=(const unsigned *)s,*y=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof *s/4;i++)if(x[i]!=y[i])printf("DIFF word=%u native=%08x reference=%08x\n",i,x[i],y[i]);
+      exit(2);
+    }
+    mix_proofs++;
+  }
+#endif
+  mix_calls++;mix_voice_total+=k;if(!full)mix_decl[3]++;return cycles;
+}
+/* Scaled sprite line writer, variant C (byte source -> doubled word into two
+ * framebuffer rows). Folds whole 8-pixel groups, the dt/bf-s loop back, the
+ * per-line tail (next source row, next dest rows) and the head (Duff entry)
+ * in one call, stopping only on interpreter-reconstructible boundaries.
+ * Group budget follows the interpreter rule: a group runs when icount > 0. */
+static unsigned blitc_calls,blitc_groups,blitc_lines,blitc_proofs,blitc_decl[4];
+static int blitc_proof_active;
+#define BLITC_CAP 32
+static unsigned __attribute__((noinline,unused)) blitc_native_impl(SH2 *s,unsigned pc){
+  if(blitc_proof_active || s->delay || s->test_irq || s->icount<=0 || !s->p_sdram || !s->p_dram)return 0;
+  if((pc&0xdf000000u)!=0x06000000u || (pc&0x3ffffu)>0x3fe00u || (pc&0x3ffffu)<0x200u || (pc&1))return 0;
+  const unsigned char *sd=(const unsigned char *)s->p_sdram;
+  /* Find the loop end forward of pc: groups of 8, the last ending in dt r7 / bf/s. */
+  unsigned end=0;
+  for(unsigned g=0;g<8;g++){
+    const unsigned short *q=(const unsigned short *)(sd+((pc+16*g)&0x3ffffu));
+    if(q[0]!=0x612c||q[1]!=0x4218||q[2]!=0x212b||q[3]!=0x2015||q[4]!=0x38de||q[5]!=0x6240||q[6]!=0x34ee)return 0;
+    if(q[7]==0x4710){end=pc+16*g;break;}
+    if(q[7]!=0x2615)return 0;
+  }
+  if(!end)return 0;
+  const unsigned short *le=(const unsigned short *)(sd+((end+16)&0x3ffffu));   /* bf/s, delay */
+  if((le[0]&0xff00)!=0x8f00 || le[1]!=0x2615)return 0;
+  unsigned body=end+16+4+2*(int)(signed char)(le[0]&0xff);
+  if(body>pc || (pc-body)&15 || (pc-body)>=8*16)return 0;
+  for(unsigned a=body;a<pc;a+=16){                        /* groups before pc must be groups too */
+    const unsigned short *q=(const unsigned short *)(sd+(a&0x3ffffu));
+    if(q[0]!=0x612c||q[7]!=0x2615)return 0;
+  }
+  unsigned tail=end+16+4;
+  const unsigned short *tp=(const unsigned short *)(sd+(tail&0x3ffffu));
+  static const unsigned short tailops[]={0x4b10,0x62f2,0x339c,0x960b,0x6039,0x220f,0x68e3,0x52f1,0x356c,0x041a,0x8fa7,0x34cc};
+  if(!hw_eq(tp,tailops,sizeof tailops/2))return 0;
+  unsigned lit6=tail+6+2+2+0x0b*2;                          /* mov.w @(disp,pc) at tail+6 */
+  unsigned head=tail+20+4+2*(int)(signed char)(tp[10]&0xff);
+  const unsigned short *hp=(const unsigned short *)(sd+(head&0x3ffffu));
+  static const unsigned short headops[]={0x9005,0x4818,0x67a3,0x6653,0x305c,0x422b,0x6240};
+  if(!hw_eq(hp,headops,sizeof headops/2))return 0;
+  unsigned lit0=head+2+2+0x05*2;
+  unsigned exitpc=tail+24;
+  unsigned r15=s->r[15];
+  if(!control_memory(s,r15,4)||!control_memory(s,r15+4,4)||!control_memory(s,lit6,2)||!control_memory(s,lit0,2))return 0;
+  unsigned r0=s->r[0],r1=s->r[1],r2=s->r[2],r3=s->r[3],r4=s->r[4],r5=s->r[5],r6=s->r[6],r7=s->r[7],r8=s->r[8],r11=s->r[11];
+  unsigned r9=s->r[9],r12=s->r[12],r13=s->r[13],r14=s->r[14],r10=s->r[10],macl=s->macl,t=s->t_flag,ea=s->ea,ppc=pc-2,cur=pc;
+  unsigned cycles=0,nw=0,ng=0,nl=0,np=0,stop=0,dt=0;int budget=s->icount;
+  unsigned waddr[2*BLITC_CAP],wval[2*BLITC_CAP];
+  while(!stop && ng<BLITC_CAP){
+    if((int)(cycles+(cur==end?11:8))>budget)break;   /* whole group (and its loop back) must fit */
+    unsigned a=r0-2,b=r6-2;
+    if((a&0xdf000000u)!=0x04000000u||(b&0xdf000000u)!=0x04000000u||((a|b)&1)||(r4&0xdf000000u)!=0x06000000u){blitc_decl[0]++;break;}
+    r1=(r2&255)|(r2<<8);waddr[nw]=a;wval[nw++]=r1&65535;
+    unsigned old=r8,tmp=old+r13;r8=tmp+t;t=(old>tmp)||(tmp>r8);
+    unsigned c=r4;r2=(unsigned)(int)(signed char)sd[(c&0x3ffffu)^1];ea=c;
+    old=c;tmp=old+r14;r4=tmp+t;t=(old>tmp)||(tmp>r4);
+    r0=a;ng++;
+    if(cur!=end){waddr[nw]=b;wval[nw++]=r1&65535;r6=b;cycles+=8;cur+=16;ppc=cur-2;continue;}
+    /* last group: dt r7, bf/s body, delay mov.w r1,@-r6 */
+    r7--;t=(r7==0);cycles+=8;dt=1;
+    waddr[nw]=b;wval[nw++]=r1&65535;r6=b;
+    if(r7){cycles+=2+1;cur=body;ea=body;ppc=end+16+2;np=1;continue;}
+    cycles+=1+1;cur=tail;ppc=end+16+2;
+    if((int)(cycles+13)>budget){stop=1;break;}
+    /* tail */
+    r11--;t=(r11==0);cycles+=1;
+    r2=control_rd32(s,r15);ea=r15;r3+=r9;
+    r6=(unsigned)(int)(short)*(const unsigned short *)(sd+(lit6&0x3fffeu));ea=lit6;
+    r0=(r3>>16)|(r3<<16);macl=(unsigned)((int)(short)r0*(short)r2);r8=r14;
+    r2=control_rd32(s,r15+4);ea=r15+4;r5+=r6;r4=macl;cycles+=9;nl++;
+    if(!r11){cycles+=1+1;r4+=r12;cur=exitpc;ppc=tail+22;stop=2;break;}
+    cycles+=2+1;r4+=r12;cur=head;ea=head;ppc=tail+22;
+    if((r4&0xdf000000u)!=0x06000000u||(int)(cycles+8)>budget){stop=1;break;}
+    /* head */
+    r0=(unsigned)(int)(short)*(const unsigned short *)(sd+(lit0&0x3fffeu));ea=lit0;
+    r8<<=8;r7=r10;r6=r5;r0+=r5;
+    unsigned entry=r2;ea=entry;
+    if(entry<body||entry>end||((entry-body)&15)){blitc_decl[1]++;stop=3;break;}
+    c=r4;r2=(unsigned)(int)(signed char)sd[(c&0x3ffffu)^1];ea=c;
+    cycles+=1+1+1+1+1+2+1;cur=entry;ppc=head+12;
+  }
+  if(stop==3){
+    /* head partially applied is not reconstructible: undo by declining the whole call */
+    blitc_decl[2]++;return 0;
+  }
+  if(!ng)return 0;
+  (void)np;
+#ifdef BLITC_SHADOW_PROOF
+  SH2 reference;unsigned short values[2*BLITC_CAP],expected[2*BLITC_CAP];int proof=blitc_proofs<2048;
+  if(proof){
+    for(unsigned i=0;i<nw;i++)values[i]=*((unsigned short *)s->p_dram+((waddr[i]&0x1ffffu)>>1));
+    reference=*s;reference.pc=pc;
+    blitc_proof_active=1;pixel_proof_active=1;
+    sh2_execute_interpreter(&reference,cycles);
+    blitc_proof_active=0;pixel_proof_active=0;
+    reference.icount=s->icount-cycles;
+    for(unsigned i=0;i<nw;i++){unsigned short *pd=(unsigned short *)s->p_dram+((waddr[i]&0x1ffffu)>>1);expected[i]=*pd;}
+    for(unsigned i=nw;i-->0;)*((unsigned short *)s->p_dram+((waddr[i]&0x1ffffu)>>1))=values[i];
+  }
+#endif
+  for(unsigned i=0;i<nw;i++){
+    unsigned a=waddr[i],d=wval[i];
+    unsigned short *pd=(unsigned short *)s->p_dram+((a&0x1ffffu)>>1);
+    if(a&0x20000u){unsigned o=*pd;if(!(d&255))d|=o&255;if(!(d&0xff00))d|=o&0xff00;}
+    *pd=d;
+  }
+  s->r[0]=r0;s->r[1]=r1;s->r[2]=r2;s->r[3]=r3;s->r[4]=r4;s->r[5]=r5;s->r[6]=r6;s->r[7]=r7;s->r[8]=r8;s->r[11]=r11;
+  s->macl=macl;s->t_flag=t;s->ea=ea;s->pc=cur;s->ppc=ppc;if(dt)s->no_polling=SH2_NO_POLLING;s->icount-=cycles;
+#ifdef BLITC_SHADOW_PROOF
+  if(proof){
+    unsigned bad=0;
+    for(unsigned i=0;i<nw;i++)if(*((unsigned short *)s->p_dram+((waddr[i]&0x1ffffu)>>1))!=expected[i])bad=1;
+    if(memcmp(s,&reference,sizeof *s)||bad){
+      printf("BLITC_FAIL pc=%08x cycles=%u groups=%u lines=%u stop=%u bad=%u\n",pc,cycles,ng,nl,stop,bad);
+      const unsigned *x=(const unsigned *)s,*y=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof *s/4;i++)if(x[i]!=y[i])printf("DIFF word=%u native=%08x reference=%08x\n",i,x[i],y[i]);
+      exit(2);
+    }
+    blitc_proofs++;
+  }
+#endif
+  blitc_calls++;blitc_groups+=ng;blitc_lines+=nl;return cycles;
+}
+#ifdef RIG_SH2_COUNT
+void blitc_report(void){printf("BLITC calls=%u groups=%u lines=%u proofs=%u decl_fb=%u decl_entry=%u decl_head=%u\n",blitc_calls,blitc_groups,blitc_lines,blitc_proofs,blitc_decl[0],blitc_decl[1],blitc_decl[2]);}
+#endif
+/* Scaled sprite line writer, variant A (16-bit lookup source -> one
+ * framebuffer row). Entered on the mov.w @(r0,r0),r1 of a group, like
+ * lookup_native; folds groups, the dt/bf-s loop back, the per-line tail and
+ * the head (Duff entry via r4) in one call, stopping only on
+ * interpreter-reconstructible boundaries. Group budget: interpreter rule. */
+static unsigned blita_calls,blita_groups,blita_lines,blita_proofs,blita_decl[4];
+static int blita_proof_active;
+#define BLITA_CAP 32
+static unsigned __attribute__((noinline,unused)) blita_native_impl(SH2 *s,unsigned pc){
+  if(blita_proof_active || s->delay || s->test_irq || s->icount<=0 || !s->p_sdram || !s->p_dram)return 0;
+  if((pc&0xdf000000u)!=0x06000000u || (pc&0x3ffffu)>0x3fe00u || (pc&0x3ffffu)<0x200u || (pc&1))return 0;
+  const unsigned char *sd=(const unsigned char *)s->p_sdram;
+  /* pc points at 010d (second op of a 4-op group). Group base = pc-2. */
+  unsigned gp=pc-2,end=0;
+  for(unsigned g=0;g<8;g++){
+    const unsigned short *q=(const unsigned short *)(sd+((gp+8*g)&0x3ffffu));
+    if(q[0]!=0x38de||q[1]!=0x010d||q[2]!=0x30ee)return 0;
+    if(q[3]==0x4710){end=gp+8*g;break;}
+    if(q[3]!=0x2615)return 0;
+  }
+  if(!end)return 0;
+  const unsigned short *le=(const unsigned short *)(sd+((end+8)&0x3ffffu));   /* bf/s, delay */
+  if((le[0]&0xff00)!=0x8f00 || le[1]!=0x2615)return 0;
+  unsigned body=end+8+4+2*(int)(signed char)(le[0]&0xff);
+  if(body>gp || (gp-body)&7 || (gp-body)>=8*8)return 0;
+  for(unsigned a=body;a<gp;a+=8){
+    const unsigned short *q=(const unsigned short *)(sd+(a&0x3ffffu));
+    if(q[0]!=0x38de||q[3]!=0x2615)return 0;
+  }
+  unsigned tail=end+8+4;
+  const unsigned short *tp=(const unsigned short *)(sd+(tail&0x3ffffu));
+  static const unsigned short tailops[]={0x339c,0x6039,0x220f,0xe602,0x4618,0x001a,0x30cc,0x4001,0x4b10,0x8fca,0x356c};
+  if(!hw_eq(tp,tailops,sizeof tailops/2))return 0;
+  unsigned head=tail+18+4+2*(int)(signed char)(tp[9]&0xff);
+  const unsigned short *hp=(const unsigned short *)(sd+(head&0x3ffffu));
+  static const unsigned short headops[]={0x57f0,0x6653,0x58f1,0x307c,0x442b,0x67a3};
+  if(!hw_eq(hp,headops,sizeof headops/2))return 0;
+  unsigned exitpc=tail+22;
+  unsigned r15=s->r[15];
+  if(!control_memory(s,r15,4)||!control_memory(s,r15+4,4))return 0;
+  unsigned r0=s->r[0],r1=s->r[1],r2=s->r[2],r3=s->r[3],r4=s->r[4],r5=s->r[5],r6=s->r[6],r7=s->r[7],r8=s->r[8],r11=s->r[11];
+  unsigned r9=s->r[9],r12=s->r[12],r13=s->r[13],r14=s->r[14],r10=s->r[10],macl=s->macl,t=s->t_flag,ea=s->ea,ppc=pc-2,cur=gp;
+  unsigned cycles=0,nw=0,ng=0,nl=0,stop=0,first=1,dt=0;int budget=s->icount;
+  unsigned waddr[BLITA_CAP],wval[BLITA_CAP];
+  while(!stop && ng<BLITA_CAP){
+    if((int)(cycles+(first?3:4)+(cur==end?3:0))>budget)break;
+    if(!first){unsigned old=r8,tmp=old+r13;r8=tmp+t;t=(old>tmp)||(tmp>r8);cycles+=1;}
+    unsigned la=r0+r0,b=r6-2;
+    if((la&0xdf000000u)!=0x06000000u||(la&1)||(b&0xdf000000u)!=0x04000000u||(b&1)){blita_decl[0]++;break;}
+    r1=(unsigned)(int)(short)*(const unsigned short *)(sd+(la&0x3fffeu));ea=la;
+    unsigned old=r0,tmp=old+r14;r0=tmp+t;t=(old>tmp)||(tmp>r0);
+    cycles+=2;ng++;first=0;
+    if(cur!=end){waddr[nw]=b;wval[nw++]=r1&65535;r6=b;cycles+=1;cur+=8;ppc=cur-2;continue;}
+    /* last group: dt r7, bf/s body, delay mov.w r1,@-r6 */
+    r7--;t=(r7==0);cycles+=1;dt=1;
+    waddr[nw]=b;wval[nw++]=r1&65535;r6=b;
+    if(r7){cycles+=2+1;cur=body;ea=body;ppc=end+8+2;continue;}
+    cycles+=1+1;cur=tail;ppc=end+8+2;
+    if((int)(cycles+12)>budget){stop=1;break;}
+    /* tail */
+    r3+=r9;r0=(r3>>16)|(r3<<16);macl=(unsigned)((int)(short)r0*(short)r2);
+    r6=2;r6<<=8;r0=macl;r0+=r12;t=r0&1;r0>>=1;
+    r11--;t=(r11==0);cycles+=9;nl++;
+    if(!r11){cycles+=1+1;r5+=r6;cur=exitpc;ppc=tail+20;stop=2;break;}
+    cycles+=2+1;r5+=r6;cur=head;ea=head;ppc=tail+20;
+    if((int)(cycles+7)>budget){stop=1;break;}
+    /* head */
+    r7=control_rd32(s,r15);ea=r15;r6=r5;r8=control_rd32(s,r15+4);ea=r15+4;r0+=r7;
+    unsigned entry=r4;ea=entry;
+    if(entry<body||entry>end||((entry-body)&7)){blita_decl[1]++;stop=3;break;}
+    r7=r10;cycles+=1+1+1+1+2+1;cur=entry;ppc=head+10;
+  }
+  if(stop==3){blita_decl[2]++;return 0;}
+  if(!ng)return 0;
+#ifdef BLITA_SHADOW_PROOF
+  SH2 reference;unsigned short values[BLITA_CAP],expected[BLITA_CAP];int proof=blita_proofs<2048;
+  if(proof){
+    for(unsigned i=0;i<nw;i++)values[i]=*((unsigned short *)s->p_dram+((waddr[i]&0x1ffffu)>>1));
+    reference=*s;reference.pc=pc;
+    blita_proof_active=1;lookup_proof_active=1;
+    sh2_execute_interpreter(&reference,cycles);
+    blita_proof_active=0;lookup_proof_active=0;
+    reference.icount=s->icount-cycles;
+    for(unsigned i=0;i<nw;i++)expected[i]=*((unsigned short *)s->p_dram+((waddr[i]&0x1ffffu)>>1));
+    for(unsigned i=nw;i-->0;)*((unsigned short *)s->p_dram+((waddr[i]&0x1ffffu)>>1))=values[i];
+  }
+#endif
+  for(unsigned i=0;i<nw;i++){
+    unsigned a=waddr[i],d=wval[i];
+    unsigned short *pd=(unsigned short *)s->p_dram+((a&0x1ffffu)>>1);
+    if(a&0x20000u){unsigned o=*pd;if(!(d&255))d|=o&255;if(!(d&0xff00))d|=o&0xff00;}
+    *pd=d;
+  }
+  s->r[0]=r0;s->r[1]=r1;s->r[3]=r3;s->r[5]=r5;s->r[6]=r6;s->r[7]=r7;s->r[8]=r8;s->r[11]=r11;
+  s->macl=macl;s->t_flag=t;s->ea=ea;s->pc=cur;s->ppc=ppc;if(dt)s->no_polling=SH2_NO_POLLING;s->icount-=cycles;
+  (void)r2;(void)r4;
+#ifdef BLITA_SHADOW_PROOF
+  if(proof){
+    unsigned bad=0;
+    for(unsigned i=0;i<nw;i++)if(*((unsigned short *)s->p_dram+((waddr[i]&0x1ffffu)>>1))!=expected[i])bad=1;
+    if(memcmp(s,&reference,sizeof *s)||bad){
+      printf("BLITA_FAIL pc=%08x cycles=%u groups=%u lines=%u stop=%u bad=%u\n",pc,cycles,ng,nl,stop,bad);
+      const unsigned *x=(const unsigned *)s,*y=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof *s/4;i++)if(x[i]!=y[i])printf("DIFF word=%u native=%08x reference=%08x\n",i,x[i],y[i]);
+      exit(2);
+    }
+    blita_proofs++;
+  }
+#endif
+  blita_calls++;blita_groups+=ng;blita_lines+=nl;return cycles;
+}
+#ifdef RIG_SH2_COUNT
+void blita_report(void){printf("BLITA calls=%u groups=%u lines=%u proofs=%u decl_src=%u decl_entry=%u decl_head=%u\n",blita_calls,blita_groups,blita_lines,blita_proofs,blita_decl[0],blita_decl[1],blita_decl[2]);}
+#endif
+/* Scaled sprite line writer, variant B (16-bit lookup, byte-swapped word
+ * into one framebuffer row; software-pipelined body of eight 5-op units in
+ * two alternating orders, Duff entry on a unit). Folds units, the dt/bf-s
+ * loop back, the per-line tail and the head; exact block-fit budget rule. */
+static unsigned blitb_calls,blitb_units,blitb_lines,blitb_proofs,blitb_decl[8];
+static int blitb_proof_active;
+#define BLITB_CAP 40
+static unsigned __attribute__((noinline)) blitb_native_impl(SH2 *s,unsigned pc){
+  if(blitb_proof_active || s->delay || s->test_irq || s->icount<=0 || !s->p_sdram || !s->p_dram)return 0;
+  if((pc&0xdf000000u)!=0x06000000u || (pc&0x3ffffu)>0x3fe00u || (pc&0x3ffffu)<0x200u || (pc&1))return 0;
+  const unsigned char *sd=(const unsigned char *)s->p_sdram;
+  static const unsigned short bodyops[]={
+    0x6418,0x38de,0x010d,0x30ee,0x2645, 0x6418,0x2645,0x38de,0x010d,0x30ee,
+    0x6418,0x38de,0x010d,0x30ee,0x2645, 0x6418,0x2645,0x38de,0x010d,0x30ee,
+    0x6418,0x38de,0x010d,0x30ee,0x2645, 0x6418,0x2645,0x38de,0x010d,0x30ee,
+    0x6418,0x38de,0x010d,0x30ee,0x2645, 0x6418,0x2645,0x38de,0x010d,0x30ee,
+    0x4710,0x8fd5,0x6418};
+  static const unsigned short tailops[]={0x339c,0x9609,0x6039,0x220f,0x4b10,0x64f2,0x356c,0x001a,0x8fc0,0x30cc};
+  static const unsigned short headops[]={0x68e3,0x4818,0x4001,0x010d,0x38de,0x30ee,0x67a3,0x442b,0x6653};
+  const unsigned short *q0=(const unsigned short *)(sd+(pc&0x3ffffu));
+  if(q0[1]!=0x38de && q0[1]!=0x2645)return 0;
+  /* the loop end marker (dt r7; bf/s) is at most eight units ahead */
+  unsigned k=0,body=0;
+  for(;k<8;k++){const unsigned short *q=q0+5*k;if(q[0]==0x4710&&q[1]==0x8fd5){body=pc+10*k-80;break;}}
+  if(!body||!hw_eq(sd+(body&0x3ffffu),bodyops,sizeof bodyops/2)){blitb_decl[4]++;return 0;}
+  unsigned loopend=body+80,tail=body+86,head=tail+16+4+2*(int)(signed char)(tailops[8]&0xff),exitpc=tail+20;
+  if(!hw_eq(sd+(tail&0x3ffffu),tailops,sizeof tailops/2)||!hw_eq(sd+(head&0x3ffffu),headops,sizeof headops/2)){blitb_decl[5]++;return 0;}
+  unsigned lit6=tail+2+4+0x09*2;
+  unsigned r15=s->r[15];
+  if(!control_memory(s,r15,4)||!control_memory(s,lit6,2)){blitb_decl[6]++;return 0;}
+  unsigned r0=s->r[0],r1=s->r[1],r2=s->r[2],r3=s->r[3],r4=s->r[4],r5=s->r[5],r6=s->r[6],r7=s->r[7],r8=s->r[8],r11=s->r[11];
+  unsigned r9=s->r[9],r12=s->r[12],r13=s->r[13],r14=s->r[14],r10=s->r[10],macl=s->macl,t=s->t_flag,ea=s->ea,ppc=pc-2,cur=pc;
+  unsigned cycles=0,nu=0,nl=0,dt=0;int budget=s->icount;
+  unsigned short *fb=(unsigned short *)s->p_dram;
+  unsigned u=k;                        /* the marker is k units ahead: k units left, this one included */
+  if(!u){blitb_decl[4]++;return 0;}
+#ifdef BLITB_SHADOW_PROOF
+  enum{PCAP=4096};static unsigned paddr[PCAP];static unsigned short pval[PCAP];unsigned np=0;
+  int proof=blitb_proofs<2048;
+  SH2 reference; if(proof){reference=*s;reference.pc=pc;}
+#define BLITB_W(a,d) do{ if(proof){ if(np>=PCAP){proof=0;} else {paddr[np]=(a);pval[np]=fb[((a)&0x1ffffu)>>1];np++;} } }while(0)
+#else
+#define BLITB_W(a,d) do{}while(0)
+#endif
+  for(;;){
+    unsigned last=(u==1);
+    if((int)(cycles+(last?9:5))>budget)break;
+    unsigned la=r0+r0,b=r6-2;
+    if((la&0xdf000000u)!=0x06000000u||(b&0xdf000000u)!=0x04000000u||(b&1)){blitb_decl[0]++;break;}
+    r4=(r1&0xffff0000u)|((r1&0xffu)<<8)|((r1>>8)&0xffu);
+    { unsigned d=r4&65535; unsigned short *pd=fb+((b&0x1ffffu)>>1); BLITB_W(b,d);
+      if(b&0x20000u){unsigned o=*pd;if(!(d&255))d|=o&255;if(!(d&0xff00))d|=o&0xff00;} *pd=(unsigned short)d; }
+    r6=b;
+    { unsigned long long x=(unsigned long long)r8+r13+t; r8=(unsigned)x;
+      unsigned long long y=(unsigned long long)r0+r14+(unsigned)(x>>32); r0=(unsigned)y; t=(unsigned)(y>>32); }
+    r1=(unsigned)(int)(short)*(const unsigned short *)(sd+(la&0x3fffeu));ea=la;
+    cycles+=5;nu++;
+    if(!last){cur+=10;ppc=cur-2;u--;continue;}
+    r7--;t=(r7==0);dt=1;cycles+=1;
+    r4=(r1&0xffff0000u)|((r1&0xffu)<<8)|((r1>>8)&0xffu);
+    if(r7){cycles+=2+1;cur=body;ea=body;ppc=loopend+4;u=8;continue;}
+    cycles+=1+1;cur=tail;ppc=loopend+4;
+    if((int)(cycles+11)>budget)break;
+    r3+=r9;
+    r6=(unsigned)(int)(short)*(const unsigned short *)(sd+(lit6&0x3fffeu));ea=lit6;
+    r0=(r3>>16)|(r3<<16);macl=(unsigned)((int)(short)r0*(short)r2);
+    r11--;t=(r11==0);
+    r4=control_rd32(s,r15);ea=r15;r5+=r6;r0=macl;cycles+=8;nl++;
+    if(!r11){cycles+=1+1;r0+=r12;cur=exitpc;ppc=tail+18;break;}
+    cycles+=2+1;r0+=r12;cur=head;ea=head;ppc=tail+18;
+    if((int)(cycles+10)>budget)break;
+    unsigned entry=r4;
+    if(entry<body||entry>=loopend||((entry-body)%10)){blitb_decl[1]++;break;}
+    { unsigned h0=r0>>1,hla=h0+h0; if((hla&0xdf000000u)!=0x06000000u){blitb_decl[2]++;break;} }
+    r8=r14;r8<<=8;t=r0&1;r0>>=1;
+    la=r0+r0;
+    r1=(unsigned)(int)(short)*(const unsigned short *)(sd+(la&0x3fffeu));ea=la;
+    { unsigned long long x=(unsigned long long)r8+r13+t; r8=(unsigned)x;
+      unsigned long long y=(unsigned long long)r0+r14+(unsigned)(x>>32); r0=(unsigned)y; t=(unsigned)(y>>32); }
+    r7=r10;ea=entry;r6=r5;cycles+=10;cur=entry;ppc=head+16;u=8-(entry-body)/10;
+  }
+  if(!nu&&!nl){blitb_decl[7]++;return 0;}
+  s->r[0]=r0;s->r[1]=r1;s->r[3]=r3;s->r[4]=r4;s->r[5]=r5;s->r[6]=r6;s->r[7]=r7;s->r[8]=r8;s->r[11]=r11;
+  s->macl=macl;s->t_flag=t;s->ea=ea;s->pc=cur;s->ppc=ppc;if(dt)s->no_polling=SH2_NO_POLLING;s->icount-=cycles;
+  (void)r2;
+#ifdef BLITB_SHADOW_PROOF
+  if(proof){
+    static unsigned short got[PCAP];
+    for(unsigned i=0;i<np;i++)got[i]=fb[(paddr[i]&0x1ffffu)>>1];
+    for(unsigned i=np;i-->0;)fb[(paddr[i]&0x1ffffu)>>1]=pval[i];
+    blitb_proof_active=1;lookup_proof_active=1;
+    sh2_execute_interpreter(&reference,cycles);
+    blitb_proof_active=0;lookup_proof_active=0;
+    reference.icount=s->icount;
+    unsigned bad=0;
+    for(unsigned i=0;i<np;i++)if(fb[(paddr[i]&0x1ffffu)>>1]!=got[i])bad=1;
+    if(memcmp(s,&reference,sizeof *s)||bad){
+      printf("BLITB_FAIL pc=%08x cycles=%u units=%u lines=%u bad=%u\n",pc,cycles,nu,nl,bad);
+      const unsigned *x=(const unsigned *)s,*y=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof *s/4;i++)if(x[i]!=y[i])printf("DIFF word=%u native=%08x reference=%08x\n",i,x[i],y[i]);
+      exit(2);
+    }
+    blitb_proofs++;
+  }
+#endif
+#undef BLITB_W
+  blitb_calls++;blitb_units+=nu;blitb_lines+=nl;return cycles;
+}
+#ifdef RIG_SH2_COUNT
+void blitb_report(void){printf("BLITB calls=%u units=%u lines=%u proofs=%u decl_src=%u decl_entry=%u decl_head=%u entered=%u nobody=%u tailhead=%u mem=%u nounit=%u\n",blitb_calls,blitb_units,blitb_lines,blitb_proofs,blitb_decl[0],blitb_decl[1],blitb_decl[2],blitb_decl[3],blitb_decl[4],blitb_decl[5],blitb_decl[6],blitb_decl[7]);}
+#endif
+/* Slave main-loop idle pass: ring index compare (on-chip regs, read through
+ * the bus so comm-poll detection and its end-of-run stay exact), command flag
+ * test, loop back. One native pass per 13 interpreted instructions; stops
+ * exactly where poll parking or the budget would stop the interpreter. */
+static unsigned idle_calls,idle_passes,idle_proofs,idle_decl[4];
+static int idle_proof_active;
+static unsigned __attribute__((noinline)) idle_native_impl(SH2 *s,unsigned pc){
+  if(idle_proof_active||s->delay||s->test_irq||s->icount<17||!s->p_sdram||!control_ram(pc)||(pc&1)||(pc&0x3ffffu)>0x3ff00u)return 0;
+  const unsigned char *sd=(const unsigned char *)s->p_sdram;
+  const unsigned short *p=(const unsigned short *)(sd+(pc&0x3ffffu));
+  if(p[1]!=0x6181||p[2]!=0x8581||p[3]!=0x3100||p[4]!=0x8b02||(p[5]&0xf000)!=0xa000||p[6]!=0x0009)return 0;
+  unsigned lit8=((pc+4)&~3u)+(p[0]&0xff)*4;
+  int d12=p[5]&0xfff;if(d12&0x800)d12-=0x1000;
+  unsigned tgt=pc+10+4+2*d12;
+  if(!control_ram(tgt)||(tgt&0x3ffffu)>0x3ff00u)return 0;
+  const unsigned short *q=(const unsigned short *)(sd+(tgt&0x3ffffu));
+  if((q[0]&0xff00)!=0xd800||q[1]!=0x6081||q[2]!=0x2008||(q[3]&0xff00)!=0x8900)return 0;
+  unsigned lit8b=((tgt+4)&~3u)+(q[0]&0xff)*4;
+  unsigned top=tgt+6+4+2*(int)(signed char)(q[3]&0xff);
+  if(!control_ram(top)||(top&0x3ffffu)>0x3ff00u)return 0;
+  const unsigned short *w=(const unsigned short *)(sd+(top&0x3ffffu));
+  int d12b=w[0]&0xfff;if(d12b&0x800)d12b-=0x1000;
+  if((w[0]&0xf000)!=0xa000||w[1]!=0x0009||top+4+2*d12b!=pc)return 0;
+  if(!control_memory(s,lit8,4)||!control_memory(s,lit8b,4))return 0;
+  unsigned a8=control_rd32(s,lit8),f8=control_rd32(s,lit8b);
+  if((a8&0xffffff00u)!=0xffffff00u||(a8&1)||!control_ram(f8)||(f8&1))return 0;
+  /* peek without side effects: mixing pending or a command pending is not idle */
+  const unsigned short *pr=(const unsigned short *)s->peri_regs;
+  if(pr[MEM_BE2((a8&0x1fe)/2)]!=pr[MEM_BE2(((a8+2)&0x1fe)/2)]){idle_decl[0]++;return 0;}
+  if(*(const unsigned short *)(sd+(f8&0x3fffeu))){idle_decl[1]++;return 0;}
+#ifdef IDLE_SHADOW_PROOF
+  SH2 reference;int proof=idle_proofs<2048;int ic0=s->icount;
+  if(proof)reference=*s,reference.pc=pc;
+#endif
+  /* Op by op with the interpreter's own order (execute, then charge) and its
+   * own stop rule (icount <= 0 after an op), so a comm-poll end_run inside a
+   * bus read stops exactly where the interpreter would, delay slot included. */
+  unsigned r8=s->r[8],r1=s->r[1],r0=s->r[0],t=s->t_flag,ea=s->ea,n=0,stop=0;
+#define IDLE_OP(cost,after_pc,after_ppc,delay_at) do{ s->icount-=(cost); if(s->icount<=0){ s->pc=(after_pc); s->ppc=(after_ppc); s->delay=(delay_at); stop=1; } }while(0)
+  while(!stop){
+    r8=a8;ea=lit8;                                   IDLE_OP(1,pc+2,pc,0);            if(stop)break;
+    r1=(unsigned)(int)(short)RW(s,a8);ea=a8;         IDLE_OP(1,pc+4,pc+2,0);          if(stop)break;
+    r0=(unsigned)(int)(short)RW(s,a8+2);ea=a8+2;     IDLE_OP(1,pc+6,pc+4,0);          if(stop)break;
+    t=(r0==r1);                                      IDLE_OP(1,pc+8,pc+6,0);          if(stop)break;
+    if(!t){ea=pc+16;                                 IDLE_OP(3,pc+16,pc+8,0);         if(!stop){s->pc=pc+16;s->ppc=pc+8;s->delay=0;} stop=2;break;}
+                                                     IDLE_OP(1,pc+10,pc+8,0);         if(stop)break;
+    ea=tgt;                                          IDLE_OP(2,tgt,pc+10,pc+12);      if(stop)break;
+                                                     IDLE_OP(1,tgt,pc+12,0);          if(stop)break;
+    r8=f8;ea=lit8b;                                  IDLE_OP(1,tgt+2,tgt,0);          if(stop)break;
+    r0=(unsigned)(int)(short)*(const unsigned short *)(sd+(f8&0x3fffeu));ea=f8; IDLE_OP(1,tgt+4,tgt+2,0); if(stop)break;
+    t=(r0==0);                                       IDLE_OP(1,tgt+6,tgt+4,0);        if(stop)break;
+    if(!t){                                          IDLE_OP(1,tgt+8,tgt+6,0);        if(!stop){s->pc=tgt+8;s->ppc=tgt+6;s->delay=0;} stop=3;break;}
+    ea=top;                                          IDLE_OP(3,top,tgt+6,0);          if(stop)break;
+    ea=pc;                                           IDLE_OP(2,pc,top,top+2);         if(stop)break;
+                                                     IDLE_OP(1,pc,top+2,0);           n++; if(stop)break;
+  }
+#undef IDLE_OP
+  if(!stop){s->pc=pc;s->ppc=top+2;s->delay=0;}
+  s->r[8]=r8;s->r[1]=r1;s->r[0]=r0;s->t_flag=t;s->ea=ea;
+#ifdef IDLE_SHADOW_PROOF
+  if(proof){
+    idle_proof_active=1;sh2_execute_interpreter(&reference,ic0);idle_proof_active=0;
+    if(memcmp(s,&reference,sizeof *s)){
+      printf("IDLE_FAIL pc=%08x ic0=%d passes=%u stop=%u\n",pc,ic0,n,stop);
+      const unsigned *x=(const unsigned *)s,*y=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof *s/4;i++)if(x[i]!=y[i])printf("DIFF word=%u native=%08x reference=%08x\n",i,x[i],y[i]);
+      exit(2);
+    }
+    idle_proofs++;
+  }
+#endif
+  idle_calls++;idle_passes+=n;return 1;
+}
+#ifdef RIG_SH2_COUNT
+void idle_report(void){printf("IDLE calls=%u passes=%u proofs=%u decl_mix=%u decl_cmd=%u\n",idle_calls,idle_passes,idle_proofs,idle_decl[0],idle_decl[1]);}
+#endif
+/* Unrolled column fill: per element load the next row pointer, clip-test the
+ * current one, store one byte at (row + x), x++. Roles r3/r6 alternate.
+ * Both paths cost 6; folded element by element with the block-fit rule,
+ * stores go through the bus so overwrite-image semantics stay exact. */
+static unsigned fill_calls,fill_elems,fill_proofs,fill_decl[4];
+static int fill_proof_active;
+#define FILL_CAP 64
+static unsigned __attribute__((noinline)) fill_native_impl(SH2 *s,unsigned pc){
+  if(fill_proof_active||s->delay||s->test_irq||s->icount<6||!s->p_sdram||!s->p_dram||!control_ram(pc)||(pc&1)||(pc&0x3ffffu)>0x3f000u)return 0;
+  const unsigned char *sd=(const unsigned char *)s->p_sdram;
+  unsigned r0=s->r[0],r1=s->r[1],r2=s->r[2],r3=s->r[3],r4=s->r[4],r5=s->r[5],r6=s->r[6],t=s->t_flag,ea=s->ea;
+  unsigned cur=pc,cycles=0,n=0,nw=0;int budget=s->icount;
+  unsigned waddr[FILL_CAP];unsigned char wval[FILL_CAP];
+  while(n<FILL_CAP && (int)(cycles+6)<=budget){
+    const unsigned short *q=(const unsigned short *)(sd+(cur&0x3ffffu));
+    unsigned A,B;
+    if(q[0]==0x6316){A=3;B=6;}else if(q[0]==0x6616){A=6;B=3;}else break;
+    if(q[1]!=(0x3042|(B<<8))||q[2]!=0x8d01||q[3]!=(0x302c|(A<<8))||q[4]!=(0x0054|(B<<8))||q[5]!=0x7001)break;
+    if(!control_memory(s,r1,4)){fill_decl[0]++;break;}
+    unsigned rB=(B==3)?r3:r6,rA;
+    unsigned st=rB+r0;
+    if((st&0xdf000000u)!=0x04000000u){fill_decl[1]++;break;}
+    rA=control_rd32(s,r1);ea=r1;r1+=4;
+    t=(rB>=r4);
+    if(t){ea=cur+4+4+2;rA+=r2;}
+    else{rA+=r2;waddr[nw]=st;wval[nw++]=(unsigned char)r5;ea=st;}
+    r0+=1;
+    if(A==3)r3=rA;else r6=rA;
+    cycles+=6;n++;cur+=12;
+  }
+  if(!n)return 0;
+#ifdef FILL_SHADOW_PROOF
+  SH2 reference;unsigned char values[FILL_CAP],expected[FILL_CAP];int proof=fill_proofs<2048;
+  if(proof){
+    for(unsigned i=0;i<nw;i++)values[i]=((unsigned char *)s->p_dram)[(waddr[i]&0x1ffffu)^1];
+    reference=*s;reference.pc=pc;
+    fill_proof_active=1;sh2_execute_interpreter(&reference,cycles);fill_proof_active=0;
+    reference.icount=s->icount-cycles;
+    for(unsigned i=0;i<nw;i++)expected[i]=((unsigned char *)s->p_dram)[(waddr[i]&0x1ffffu)^1];
+    for(unsigned i=nw;i-->0;)((unsigned char *)s->p_dram)[(waddr[i]&0x1ffffu)^1]=values[i];
+  }
+#endif
+  for(unsigned i=0;i<nw;i++)WB(s,waddr[i],wval[i]);
+  s->r[0]=r0;s->r[1]=r1;s->r[3]=r3;s->r[6]=r6;s->t_flag=t;s->ea=ea;s->pc=cur;s->ppc=cur-2;s->icount-=cycles;
+#ifdef FILL_SHADOW_PROOF
+  if(proof){
+    unsigned bad=0;
+    for(unsigned i=0;i<nw;i++)if(((unsigned char *)s->p_dram)[(waddr[i]&0x1ffffu)^1]!=expected[i])bad=1;
+    if(memcmp(s,&reference,sizeof *s)||bad){
+      printf("FILL_FAIL pc=%08x cycles=%u elems=%u bad=%u\n",pc,cycles,n,bad);
+      const unsigned *x=(const unsigned *)s,*y=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof *s/4;i++)if(x[i]!=y[i])printf("DIFF word=%u native=%08x reference=%08x\n",i,x[i],y[i]);
+      exit(2);
+    }
+    fill_proofs++;
+  }
+#endif
+  fill_calls++;fill_elems+=n;return cycles;
+}
+#ifdef RIG_SH2_COUNT
+void fill_report(void){printf("FILL calls=%u elems=%u proofs=%u decl_tab=%u decl_dst=%u\n",fill_calls,fill_elems,fill_proofs,fill_decl[0],fill_decl[1]);}
+#endif
+#ifdef RIG_SH2_COUNT
+void mix_report(void){printf("MIX calls=%u proofs=%u voices=%u decl_n=%u decl_budget=%u decl_cb=%u partial=%u\n",mix_calls,mix_proofs,mix_voice_total,mix_decl[0],mix_decl[1],mix_decl[2],mix_decl[3]);
+  printf("MIX budget at entry: <45=%llu <100=%llu <200=%llu <400=%llu <700=%llu >=700=%llu (r7==16 entries=%llu)\n",mix_budget_hist[0],mix_budget_hist[1],mix_budget_hist[2],mix_budget_hist[3],mix_budget_hist[4],mix_budget_hist[5],mix_budget_hist[6]);
+  printf("MIX master insns: blitA=%llu blitB=%llu blitC=%llu blitD=%llu 6b00_c000=%llu lo2000=%llu 2000_67c0=%llu hi=%llu\n",mix_master_bucket[0],mix_master_bucket[1],mix_master_bucket[2],mix_master_bucket[3],mix_master_bucket[4],mix_master_bucket[5],mix_master_bucket[6],mix_master_bucket[7]);
+  for(int c=0;c<2;c++){unsigned long long tot=0;for(int i=0;i<2048;i++)tot+=mix_pcbin[c][i];printf("MIX pcbin core%d total=%llu top16:",c,tot);for(int k=0;k<16;k++){int b=-1;for(int i=0;i<2048;i++)if(mix_pcbin[c][i]&&(b<0||mix_pcbin[c][i]>mix_pcbin[c][b]))b=i;if(b<0)break;printf(" %05x=%llu",b<<7,mix_pcbin[c][b]);mix_pcbin[c][b]=0;}printf("\n");}
+  printf("MIX slave insns: irq390=%llu mixer=%llu main7f4=%llu sub=%llu other=%llu\n",mix_slave_bucket[0],mix_slave_bucket[1],mix_slave_bucket[2],mix_slave_bucket[3],mix_slave_bucket[4]);}
+#endif
+
+#ifdef RIG_NATIVE_COST
+extern unsigned long long rig_slices[2],rig_slice_cycles[2];
+void native_cost_report(void){ {extern unsigned long long rig_runsh2[2],rig_runsh2_ticks[2]; printf("RUNSH2 master=%llu ticks=%llu slave=%llu ticks=%llu\n",rig_runsh2[0],rig_runsh2_ticks[0],rig_runsh2[1],rig_runsh2_ticks[1]);}printf("SLICES master=%llu slave=%llu cyc_master=%llu cyc_slave=%llu\n",rig_slices[0],rig_slices[1],rig_slice_cycles[0],rig_slice_cycles[1]);static const char *nm[]={"mix_native","blitb_native","blitc_native","blita_native","idle_native","fill_native","chain_native","pixel_native","lookup_native","pcm_tail_native"};for(int i=0;i<10;i++)printf("NCOST %s ticks=%llu calls=%llu\n",nm[i],native_cost[i],native_ncall[i]);}
+#endif
+#ifdef RIG_NATIVE_COST
+unsigned long long rig_slices[2],rig_slice_ticks[2],rig_slice_cycles[2];
+#endif
 int sh2_execute_interpreter(SH2 *sh2, int cycles)
 {
 	UINT32 opcode;
@@ -1608,6 +2773,11 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 	do
 	{
 		RIG_OPCOST_T0(sh2);
+#ifdef RIG_MIX_DIAG
+		{ extern unsigned long long mix_pcbin[2][2048]; mix_pcbin[sh2->is_slave&1][(sh2->pc&0x3ffff)>>7]++; }
+		if (sh2->is_slave) { extern unsigned long long mix_slave_bucket[8],mix_budget_hist[8],mix_master_bucket[8],mix_pcbin[2][2048]; unsigned q=sh2->pc&0x3ffff; mix_slave_bucket[q<0x3c0&&q>=0x380?0:q<0x480&&q>=0x3c0?1:q>=0x7f4&&q<0x860?2:q<0x2000?3:4]++; }
+		else { extern unsigned long long mix_master_bucket[8]; unsigned q=sh2->pc&0x3ffff; mix_master_bucket[q>=0x67c0&&q<0x6868?0:q>=0x6868&&q<0x6960?1:q>=0x6960&&q<0x6a4c?2:q>=0x6a4c&&q<0x6b00?3:q>=0x6b00&&q<0xc000?4:q<0x2000?5:q<0x67c0?6:7]++; }
+#endif
 		if (sh2->delay)
 		{
 			sh2->ppc = sh2->delay;
@@ -1749,13 +2919,23 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 #else
 		switch ((opcode >> 12) & 0xf)
 		{
-		case 0x0: op0000(sh2, opcode); break;
+#ifdef GNW_BLIT_AC
+		case 0x0: if(gnw_direct && opcode==0x010d && (blita_native(sh2,sh2->ppc) || lookup_native(sh2,sh2->ppc))) { RIG_OPCOST_T1(sh2,opcode);continue; } op0000(sh2,opcode);break;
+#else
+		case 0x0: if(gnw_direct && opcode==0x010d && lookup_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0000(sh2,opcode);break;
+#endif
 		case 0x1: op0001(sh2, opcode); break;
-		case 0x2: op0010(sh2, opcode); break;
-		case 0x3: op0011(sh2, opcode); break;
+		case 0x2: if(gnw_direct && opcode==0x201f && control_native(sh2,sh2->ppc,0)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0010(sh2,opcode);break;
+		case 0x3: if(gnw_direct && opcode==0x3d88 && control_native(sh2,sh2->ppc,1)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0011(sh2,opcode);break;
 		case 0x4: op0100(sh2, opcode); break;
-		case 0x5: op0101(sh2, opcode); break;
-		case 0x6: op0110(sh2, opcode); break;
+		case 0x5: if(gnw_direct && opcode==0x52e1 && control_native(sh2,sh2->ppc,2)) { RIG_OPCOST_T1(sh2,opcode);continue; } if(gnw_direct && opcode==0x50e6 && chain_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0101(sh2,opcode);break;
+#ifdef GNW_BLIT_AC
+		case 0x6: if(gnw_direct && opcode==0x612c && (blitc_native(sh2,sh2->ppc) || pixel_native(sh2,sh2->ppc))) { RIG_OPCOST_T1(sh2,opcode);continue; }
+#else
+		case 0x6: if(gnw_direct && opcode==0x612c && pixel_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; }
+#endif
+		          if(gnw_direct && opcode==0x6418 && blitb_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; }
+		          if(gnw_direct && (opcode==0x6316||opcode==0x6616) && fill_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0110(sh2,opcode);break;
 		case 0x7: op0111(sh2, opcode); break;
 		case 0x8: GNW_FASTLOOP_GATE_8(sh2, opcode, gnw_direct);
 		          op1000(sh2, opcode); break;
@@ -1769,7 +2949,8 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 				rig_gbr_hist[(sh2)->is_slave & 1][((sh2)->gbr >> 24) & 0xff]++;
 #endif
 			op1100(sh2, opcode); break;
-		case 0xD: op1101(sh2, opcode); break;
+		case 0xD: if(gnw_direct && opcode==0xd21c && pcm_tail_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; }
+		          if(gnw_direct && opcode==0xd834 && idle_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; } op1101(sh2,opcode);break;
 		case 0xE: op1110(sh2, opcode); break;
 		case 0xF: op1111(sh2, opcode); break;
 		}
@@ -1816,6 +2997,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 			}
 			sh2->test_irq = 0;
 		}
+		if(gnw_direct && opcode==0x8bfa && sh2->pc+8==sh2->ppc)countdown_fold(sh2);
 		RIG_OPCOST_T1(sh2, opcode);
 	}
 	while (sh2->icount > 0 || sh2->delay);	/* can't interrupt before delay */

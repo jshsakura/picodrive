@@ -906,7 +906,11 @@ void PicoVideoSync(int skip)
   if (!(PicoIn.opt & POPT_ALT_RENDERER) && !PicoIn.skipFrame) {
     if (last >= lines)
       last = lines-1;
-    else // in active display, need to sync next frame as well
+    else if (skip >= 0) // in active display, need to sync next frame as well
+      // GNW: frame-end flush arrives with skip == -1; everything was already
+      // synced above, so SYNC_NEXT would just dirty the NEXT frame for no
+      // reason (GNW_32X_PERF_FINDINGS §8 fix 3). Mid-frame syncs (skip >= 0)
+      // keep the original behavior.
       Pico.est.rendstatus |= PDRAW_SYNC_NEXT;
 
     //elprintf(EL_ANOMALY, "sync");
@@ -949,8 +953,15 @@ PICO_INTERNAL_ASM void PicoVideoWrite(u32 a,unsigned short d)
 
     // try avoiding the sync if the data doesn't change.
     // Writes to the SAT in VRAM are special since they update the SAT cache.
+    // GNW: extend the same-value skip to SAT writes by comparing against the
+    // SAT cache (same index math as UpdateSAT). The VRAM store itself always
+    // happens; only the render sync is skipped. Doom 32X rewrites the SAT
+    // with identical values every frame (GNW_32X_PERF_FINDINGS §8 fix 1).
     if ((pvid->reg[1]&0x40) &&
-        !(pvid->type == 1 && !(pvid->addr&1) && ((pvid->addr^SATaddr)&SATmask) && PicoMem.vram[pvid->addr>>1] == d) &&
+        !(pvid->type == 1 && !(pvid->addr&1) &&
+          ((((pvid->addr^SATaddr)&SATmask)
+            ? PicoMem.vram[pvid->addr>>1] == d
+            : ((u16 *)&VdpSATCache[2*((pvid->addr^SATaddr) >> 3)])[(pvid->addr&7) >> 1] == d))) &&
         !(pvid->type == 3 && PicoMem.cram[(pvid->addr>>1) & 0x3f] == (d & 0xeee)) &&
         !(pvid->type == 5 && PicoMem.vsram[(pvid->addr>>1) & 0x3f] == (d & 0x7ff)))
       // the vertical scroll value for this line must be read from VSRAM early,
