@@ -705,7 +705,7 @@ NOINLINE void io_ports_write(u32 a, u32 d)
   PicoMem.ioports[a] = d;
 }
 
-int io_ports_pack(void *buf, size_t size)
+GNW_XIP_COLD int io_ports_pack(void *buf, size_t size)
 {
   size_t b, i;
   memcpy(buf, PicoMem.ioports, (b = sizeof(PicoMem.ioports)));
@@ -725,7 +725,7 @@ int io_ports_pack(void *buf, size_t size)
   return b;
 }
 
-void io_ports_unpack(const void *buf, size_t size)
+GNW_XIP_COLD void io_ports_unpack(const void *buf, size_t size)
 {
   size_t b, i;
   memcpy(PicoMem.ioports, buf, (b = sizeof(PicoMem.ioports)));
@@ -1175,7 +1175,7 @@ static void PicoWrite16_vdp(u32 a, u32 d)
 static void m68k_mem_setup(void);
 #endif
 
-PICO_INTERNAL void PicoMemSetup(void)
+GNW_XIP_COLD PICO_INTERNAL void PicoMemSetup(void)
 {
   int mask, rs, sstart, a;
 
@@ -1542,7 +1542,7 @@ void ym2612_pack_state_old(void)
     YM2612PicoStateSave2(tat, tbt, busy);
 }
 
-int ym2612_pack_timers(void *buf, size_t size)
+GNW_XIP_COLD int ym2612_pack_timers(void *buf, size_t size)
 {
   // timers are saved as tick counts, in 16.16 int format
   int tac, tat = 0, tbc, tbt = 0, busy = 0;
@@ -1569,7 +1569,7 @@ int ym2612_pack_timers(void *buf, size_t size)
 }
 
 // legacy code, only used for GP2X
-void ym2612_unpack_state_old(void)
+GNW_XIP_COLD void ym2612_unpack_state_old(void)
 {
   int i, ret, tat, tbt, busy = 0;
   YM2612PicoStateLoad();
@@ -1619,7 +1619,7 @@ void ym2612_unpack_state_old(void)
   }
 }
 
-void ym2612_unpack_timers(const void *buf, size_t size)
+GNW_XIP_COLD void ym2612_unpack_timers(const void *buf, size_t size)
 {
   int tac, tat, tbc, tbt, busy;
   size_t b = 0;

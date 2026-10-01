@@ -2753,7 +2753,7 @@ static void bank_switch_rom_sh2(void)
   }
 }
 
-void PicoMemSetup32x(void)
+GNW_XIP_COLD void PicoMemSetup32x(void)
 {
   unsigned int rs;
   int i;
@@ -2946,7 +2946,7 @@ void p32x_update_banks(void)
     sh2_drc_flush_all();
 }
 
-void Pico32xMemStateLoaded(void)
+GNW_XIP_COLD void Pico32xMemStateLoaded(void)
 {
   bank_switch_rom_68k(Pico32x.regs[4 / 2]);
   Pico32xSwapDRAM((Pico32x.vdp_regs[0x0a / 2] & P32XV_FS) ^ P32XV_FS);

@@ -9,6 +9,18 @@
 
 #ifndef PICO_INTERNAL_INCLUDED
 #define PICO_INTERNAL_INCLUDED
+
+/* GNW: code that never runs inside a frame (memory-map setup, savestate
+ * pack/unpack) goes to the 32X XIP blob instead of RAM_EMU, so the RAM it
+ * gave back can hold code that runs every instruction. The name must not
+ * start with ".text": the RAM_EMU overlay's `(.text .text*)` lines are matched
+ * first and would swallow it. STM32H7B0VBTx_SDCARD.ld (.xip_md32x) and the
+ * rig's mps2_an500_32x.ld must both claim `.gnw_xip_cold`. */
+#ifdef GNW_32X_CORE
+#define GNW_XIP_COLD __attribute__((section(".gnw_xip_cold")))
+#else
+#define GNW_XIP_COLD
+#endif
 #include <stdio.h>
 #include <string.h>
 #include "pico_types.h"
