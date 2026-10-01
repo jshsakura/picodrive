@@ -1958,6 +1958,7 @@ static unsigned chain_native_impl(SH2 *s,unsigned pc);
 static unsigned pixel_native_impl(SH2 *s,unsigned pc);
 static unsigned lookup_native_impl(SH2 *s,unsigned pc);
 static unsigned pcm_tail_native_impl(SH2 *s,unsigned pc);
+static unsigned irq_native_impl(SH2 *s,unsigned pc);
 
 #ifdef RIG_NATIVE_COST
 #include <stdint.h>
@@ -1977,6 +1978,7 @@ NC_WRAP(6,chain_native)
 NC_WRAP(7,pixel_native)
 NC_WRAP(8,lookup_native)
 NC_WRAP(9,pcm_tail_native)
+NC_WRAP(10,irq_native)
 static unsigned chain_native_impl(SH2 *s,unsigned pc){
   if(chain_proof_active)return 0;
   { unsigned m=mix_native(s,pc); if(m)return m; }
@@ -2670,6 +2672,115 @@ static unsigned __attribute__((noinline)) idle_native_impl(SH2 *s,unsigned pc){
 #endif
   idle_calls++;idle_passes+=n;return 1;
 }
+/* Slave PWM interrupt: the generic IRQ entry (save r0/r1, vector from SR's
+ * level through a table, jmp, save r8 in the slot) and the handler it lands
+ * in (next long from a 256-byte ring to the PWM pair at GBR+0x34, ring index
+ * += 4, lower the mask, toggle a flag byte, clear the PWM interrupt at
+ * GBR+0x1C and read it back, restore, rte). ~1,000 times a frame in After
+ * Burner, ~14% of all guest SH-2 instructions. Recognised by its code, never
+ * by its address; every load and store goes through the bus macros the
+ * interpreter uses, in its order, with ppc/pc/ea/icount kept as it keeps
+ * them, and after every instruction the loop's own tail is applied: an IRQ
+ * that would be taken (LDC SR and RTE set test_irq) or an exhausted slice
+ * stops here and the interpreter's tail does the rest, exactly as it would
+ * have. Declines before touching anything unless both blocks match. */
+static unsigned irq_calls,irq_full,irq_proofs,irq_decl[2];
+static int irq_proof_active;
+static const unsigned short irq_entry_code[9]={0x2f06,0x0002,0x2f16,0x4009,0xd100,0xc93c,0x001e,0x402b,0x2f86};
+static const unsigned short irq_body_code[22]={0xd100,0xd800,0x6011,0x088e,0x7004,0x600c,0x2101,0x6083,0xc20d,0x9000,
+  0x400e,0xd100,0x8417,0xca02,0x8017,0xc10e,0xc50e,0x0009,0x68f6,0x61f6,0x60f6,0x002b};
+static int irq_match(const unsigned short *p,const unsigned short *want,unsigned n,unsigned immmask){
+  for(unsigned i=0;i<n;i++){unsigned m=(immmask>>i)&1?0xff00u:0xffffu;if((p[i]&m)!=want[i])return 0;}
+  return 1;
+}
+static unsigned __attribute__((noinline)) irq_native_impl(SH2 *s,unsigned pc){
+  if(irq_proof_active||s->delay||s->test_irq||s->icount<2||!s->p_sdram||!control_ram(pc)||(pc&3)||(pc&0x3ffffu)>0x3ff00u)return 0;
+  const unsigned char *sd=(const unsigned char *)s->p_sdram;
+  const unsigned short *e=(const unsigned short *)(sd+(pc&0x3ffffu));
+  if(!irq_match(e,irq_entry_code,9,1u<<4)){irq_decl[0]++;return 0;}
+  /* the vector the entry will pick, read without side effects */
+  unsigned lit=((pc+8+4)&~3u)+(e[4]&0xff)*4;
+  if(!control_ram(lit))return 0;
+  unsigned tab=*(const unsigned *)(sd+(lit&0x3fffcu));tab=(tab>>16)|(tab<<16);
+  unsigned sr=(s->sr&~T)|s->t_flag,slot=((sr>>2)&0x3cu)+tab;
+  if(!control_ram(slot)||(slot&3))return 0;
+  unsigned h=*(const unsigned *)(sd+(slot&0x3fffcu));h=(h>>16)|(h<<16);
+  if(!control_ram(h)||(h&3)||(h&0x3ffffu)>0x3ff00u)return 0;
+  const unsigned short *b=(const unsigned short *)(sd+(h&0x3ffffu));
+  if(!irq_match(b,irq_body_code,22,(1u<<0)|(1u<<1)|(1u<<9)|(1u<<11))){irq_decl[1]++;return 0;}
+  if(b[22]!=0x0009)return 0;
+#ifdef IRQ_SHADOW_PROOF
+  SH2 reference;int proof=irq_proofs<2048;int ic0=s->icount;
+  if(proof)reference=*s;
+#endif
+  unsigned a;
+  /* one instruction at address a: what the fetch does, then the op, then
+   * the loop tail. TAIL returns to the interpreter's own tail. */
+#define AT(addr) do{ a=(addr); s->ppc=a; s->pc=a+2; }while(0)
+#define SLOT() do{ s->ppc=s->delay; s->delay=0; }while(0)
+#define TAIL() do{ s->icount--; if(!s->delay){ if(s->test_irq){ if(s->pending_level>(int)((s->sr>>4)&15))goto out; s->test_irq=0; } if(s->icount<=0)goto out; } }while(0)
+  AT(pc);      s->r[15]-=4; WL(s,s->r[15],s->r[0]);                                   TAIL();
+  AT(pc+2);    s->r[0]=(s->sr&~T)|s->t_flag;                                          TAIL();
+  AT(pc+4);    s->r[15]-=4; WL(s,s->r[15],s->r[1]);                                   TAIL();
+  AT(pc+6);    s->r[0]>>=2;                                                           TAIL();
+  AT(pc+8);    s->ea=((s->pc+2)&~3u)+(e[4]&0xff)*4; s->r[1]=RL(s,s->ea);              TAIL();
+  AT(pc+10);   s->r[0]&=0x3c;                                                         TAIL();
+  AT(pc+12);   s->ea=s->r[1]+s->r[0]; s->r[0]=RL(s,s->ea);                            TAIL();
+  AT(pc+14);   s->delay=s->pc; s->pc=s->ea=s->r[0]; s->icount--;                      TAIL();
+  if(s->pc!=h)goto out;   /* the bus gave another vector than the peek: let the interpreter go on */
+  SLOT();      s->r[15]-=4; WL(s,s->r[15],s->r[8]);                                   TAIL();
+  AT(h);       s->ea=((s->pc+2)&~3u)+(b[0]&0xff)*4; s->r[1]=RL(s,s->ea);              TAIL();
+  AT(h+2);     s->ea=((s->pc+2)&~3u)+(b[1]&0xff)*4; s->r[8]=RL(s,s->ea);              TAIL();
+  AT(h+4);     s->ea=s->r[1]; s->r[0]=(UINT32)(INT32)(INT16)RW(s,s->ea);              TAIL();
+  AT(h+6);     s->ea=s->r[8]+s->r[0]; s->r[8]=RL(s,s->ea);                            TAIL();
+  AT(h+8);     s->r[0]+=4;                                                            TAIL();
+  AT(h+10);    s->r[0]&=0xff;                                                         TAIL();
+  AT(h+12);    s->ea=s->r[1]; WW(s,s->ea,s->r[0]&0xffff);                             TAIL();
+  AT(h+14);    s->r[0]=s->r[8];                                                       TAIL();
+  AT(h+16);    s->ea=s->gbr+13*4; WL(s,s->ea,s->r[0]);                                TAIL();
+  AT(h+18);    s->ea=s->pc+(b[9]&0xff)*2+2; s->r[0]=(UINT32)(INT32)(INT16)RW(s,s->ea); TAIL();
+  AT(h+20);    s->sr=s->r[0]&FLAGS; s->t_flag=s->sr&T; s->test_irq=1;                 TAIL();
+  AT(h+22);    s->ea=((s->pc+2)&~3u)+(b[11]&0xff)*4; s->r[1]=RL(s,s->ea);             TAIL();
+  AT(h+24);    s->ea=s->r[1]+7; s->r[0]=(UINT32)(INT32)(INT16)(INT8)RB(s,s->ea);       TAIL();
+  AT(h+26);    s->r[0]^=2;                                                            TAIL();
+  AT(h+28);    s->ea=s->r[1]+7; WB(s,s->ea,s->r[0]&0xff);                             TAIL();
+  AT(h+30);    s->ea=s->gbr+14*2; WW(s,s->ea,s->r[0]&0xffff);                         TAIL();
+  AT(h+32);    s->ea=s->gbr+14*2; s->r[0]=(INT32)(INT16)RW(s,s->ea);                  TAIL();
+  AT(h+34);                                                                           TAIL();
+  AT(h+36);    s->r[8]=RL(s,s->r[15]); s->r[15]+=4;                                   TAIL();
+  AT(h+38);    s->r[1]=RL(s,s->r[15]); s->r[15]+=4;                                   TAIL();
+  AT(h+40);    s->r[0]=RL(s,s->r[15]); s->r[15]+=4;                                   TAIL();
+  AT(h+42);    s->ea=s->r[15]; s->delay=s->pc; s->pc=RL(s,s->ea); s->r[15]+=4;
+               s->ea=s->r[15]; s->sr=RL(s,s->ea)&FLAGS; s->t_flag=s->sr&T; s->r[15]+=4;
+               s->icount-=3; s->test_irq=1;                                           TAIL();
+  SLOT();                                                                             TAIL();
+  irq_full++;
+out:
+#undef AT
+#undef SLOT
+#undef TAIL
+#ifdef IRQ_SHADOW_PROOF
+  /* The reference is the interpreter over the same cycles. Where the native
+   * stopped with an interrupt about to be taken, the interpreter's tail would
+   * take it inside that same call: those samples are not compared. */
+  if(proof&&!(s->test_irq&&!s->delay&&s->pending_level>(int)((s->sr>>4)&15))){
+    int used=ic0-s->icount;
+    irq_proof_active=1;sh2_execute_interpreter(&reference,used);irq_proof_active=0;
+    reference.icount=ic0-(used-reference.icount);
+    if(memcmp(s,&reference,sizeof *s)){
+      printf("IRQ_FAIL pc=%08x ic0=%d used=%d\n",pc,ic0,used);
+      const unsigned *x=(const unsigned *)s,*y=(const unsigned *)&reference;
+      for(unsigned i=0;i<sizeof *s/4;i++)if(x[i]!=y[i])printf("DIFF word=%u native=%08x reference=%08x\n",i,x[i],y[i]);
+      exit(2);
+    }
+    irq_proofs++;
+  }
+#endif
+  irq_calls++;return 1;
+}
+#ifdef RIG_SH2_COUNT
+void irq_report(void){printf("IRQN calls=%u full=%u proofs=%u decl_entry=%u decl_body=%u\n",irq_calls,irq_full,irq_proofs,irq_decl[0],irq_decl[1]);}
+#endif
 #ifdef RIG_SH2_COUNT
 void idle_report(void){printf("IDLE calls=%u passes=%u proofs=%u decl_mix=%u decl_cmd=%u\n",idle_calls,idle_passes,idle_proofs,idle_decl[0],idle_decl[1]);}
 #endif
@@ -2925,7 +3036,11 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		case 0x0: if(gnw_direct && opcode==0x010d && lookup_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0000(sh2,opcode);break;
 #endif
 		case 0x1: op0001(sh2, opcode); break;
-		case 0x2: if(gnw_direct && opcode==0x201f && control_native(sh2,sh2->ppc,0)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0010(sh2,opcode);break;
+		case 0x2: if(gnw_direct && opcode==0x201f && control_native(sh2,sh2->ppc,0)) { RIG_OPCOST_T1(sh2,opcode);continue; }
+		          /* the native applies the loop tail itself after every instruction
+		           * but the last; that one is this tail, so it must not be skipped */
+		          if(gnw_direct && opcode==0x2f06 && irq_native(sh2,sh2->ppc)) goto gnw_irq_tail;
+		          op0010(sh2,opcode);break;
 		case 0x3: if(gnw_direct && opcode==0x3d88 && control_native(sh2,sh2->ppc,1)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0011(sh2,opcode);break;
 		case 0x4: op0100(sh2, opcode); break;
 		case 0x5: if(gnw_direct && opcode==0x52e1 && control_native(sh2,sh2->ppc,2)) { RIG_OPCOST_T1(sh2,opcode);continue; } if(gnw_direct && opcode==0x50e6 && chain_native(sh2,sh2->ppc)) { RIG_OPCOST_T1(sh2,opcode);continue; } op0101(sh2,opcode);break;
@@ -2958,6 +3073,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 
 		sh2->icount--;
 
+gnw_irq_tail:
 		/* The !delay guard is dead on every workload we can measure: an IRQ
 		 * taken with a delay slot outstanding never happens in 900 attract
 		 * frames (fb checksums byte-identical with the guard dropped, rig
