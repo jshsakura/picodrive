@@ -660,7 +660,11 @@ static void rig_pchist_tick(SH2 *sh2, int is_delay, unsigned short opcode)
 {
 	unsigned core = sh2->is_slave & 1;
 	unsigned int pc = sh2->ppc;
-	unsigned start = (pc >> 1) & (RIG_PC_HIST_SLOTS - 1);
+	/* Multiplicative hash, not the PC's own low bits: code is contiguous, so an
+	 * identity hash packs it into runs longer than the probe window and every
+	 * later PC that shares low bits (ROM 0x02xxxxxx behind SDRAM 0x06xxxxxx)
+	 * is dropped. Kolibri lost 45% of its instructions that way (2026-10-04). */
+	unsigned start = (((pc >> 1) * 2654435761u) >> 12) & (RIG_PC_HIST_SLOTS - 1);
 	unsigned limit = RIG_PC_HIST_MAXPROBE < RIG_PC_HIST_SLOTS
 	               ? RIG_PC_HIST_MAXPROBE : RIG_PC_HIST_SLOTS;
 	for (unsigned i = 0; i < limit; i++) {
@@ -960,7 +964,8 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 		{
 			unsigned int target = sh2->ppc + disp8 * 2 + 4;
 			if (target + 4 == sh2->ppc
-			    && (target & 0xc6000000) == 0x06000000)	/* body 2 insns, in SDRAM (RW() on a sysreg/comm target would fire poll_detect and corrupt the guest's poll state) */
+			    && ((target & 0xc6000000) == 0x06000000
+			        || (target & 0xc6000000) == 0x02000000))	/* body 2 insns, in SDRAM or cart ROM. RW() on a sysreg/comm target would fire poll_detect and corrupt the guest's poll state; ROM is a plain table read (sh2_read16_rom), so it is as safe as SDRAM. Kolibri's slave spins at 0x0207416a, in ROM: 38.8% of all guest SH-2 instructions that the SDRAM-only guard let through. The POLLED address must still be SDRAM (checked below). */
 			{
 				UINT32 bop1 = (UINT32)(UINT16)RW(sh2, target);
 				UINT32 bop2 = (UINT32)(UINT16)RW(sh2, target + 2);
