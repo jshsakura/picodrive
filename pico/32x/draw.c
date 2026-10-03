@@ -298,9 +298,14 @@ static void gnw_line_pp(unsigned short *pd, unsigned char *p32x,
        * removing the solid-run detector a 0.48% gain and the device
        * charged 2.95%). So the octa path is deliberately built for the
        * device to judge, not the rig. -DGNW_PP_NO_OCTA prices it. */
+      /* p32x must be word aligned here, not just even. The two adjacent
+       * u32 loads below are fused into ONE LDRD, which Cortex-M7 traps unless
+       * 4-byte aligned. A p32x that is 2 mod 4 took this path and faulted
+       * (Kolibri, UsageFault UFSR.UNALIGNED at gnw_line_pp, 2026-10-03). It
+       * falls through to the quad path, whose single LDR is legal unaligned. */
       if (GNW_PP_OCTA && i >= 8
           && !(((uintptr_t)pmd | (uintptr_t)pd) & 3)
-          && !((uintptr_t)(p32x) & 1)
+          && !((uintptr_t)(p32x) & 3)
           && (((u32 *)pmd)[0] & 0x3f3f3f3fu) == mdbg4
           && (((u32 *)pmd)[1] & 0x3f3f3f3fu) == mdbg4) {
         u32 q0 = ((u32 *)(p32x))[0], q1 = ((u32 *)(p32x))[1];
