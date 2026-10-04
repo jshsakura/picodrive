@@ -982,6 +982,65 @@ static int __attribute__((noinline)) gnw_cmd_idle_fold(SH2 *sh2)
 	return 1;
 }
 
+/* Word copy loop (Knuckles' Chaotix master, 8.25% of all guest SH-2
+ * instructions in the attract demo, 2026-10-04):
+ *
+ *   loop: MOV.W @R4+,R2; DT R1; MOV.W R2,@(R0,R8); BF/S loop; ADD #2,R0
+ *
+ * Real work, not a wait: the fold does every load and store, in order, and
+ * only skips the interpreter's dispatch. Entered at the BF/S. One round from
+ * there is ADD, load, DT, store, BF/S = 6 cycles, and the bus handlers read
+ * icount (poll wake, sync), so icount is set to what the interpreter would
+ * show at each access: it subtracts AFTER executing. The source must be cart
+ * ROM or SDRAM; the store goes through the normal write handler, and if that
+ * handler ends the slice the fold stops with its count. */
+#ifdef RIG_SH2_COUNT
+unsigned int gnw_copyw_stat[2];	/* folds, words copied */
+#endif
+static int __attribute__((noinline)) gnw_copyw_fold(SH2 *sh2)
+{
+	unsigned int target = sh2->ppc - 6;
+	const UINT16 *code;
+	int c, n;
+
+	if ((target & 0xdf000001) != 0x06000000) return 0;
+	code = (const UINT16 *)((const UINT8 *)sh2->p_sdram + (target & 0x3fffe));
+	if (code[0] != 0x6245 || code[1] != 0x4110 || code[2] != 0x0825 || code[4] != 0x7002)
+		return 0;
+	if (sh2->t_flag || (sh2->r[4] & 1)
+	    || ((sh2->r[4] & 0xc6000000) != 0x06000000 && (sh2->r[4] & 0xc6000000) != 0x02000000))
+		return 1;
+	c = sh2->icount;
+	n = (c - 1) / 6;
+	if ((unsigned int)n > sh2->r[1]) n = (int)sh2->r[1];
+	if (n <= 0) return 1;
+#ifdef RIG_SH2_COUNT
+	gnw_copyw_stat[0]++;
+#endif
+	while (n-- > 0)
+	{
+		sh2->r[0] += 2;
+		sh2->r[2] = (UINT32)(INT32)(INT16)RW(sh2, sh2->r[4]);
+		sh2->r[4] += 2;
+		sh2->r[1]--;
+		sh2->icount = c - 5;
+		WW(sh2, sh2->r[0] + sh2->r[8], sh2->r[2] & 0xffff);
+#ifdef RIG_SH2_COUNT
+		gnw_copyw_stat[1]++;
+#endif
+		if (sh2->icount != c - 5 || sh2->test_irq)
+		{
+			c = sh2->icount + 5;	/* the handler moved the slice end */
+			c -= 6;
+			break;
+		}
+		c -= 6;
+	}
+	sh2->icount = c;
+	sh2->t_flag = sh2->r[1] == 0 ? T : 0;
+	return 1;
+}
+
 /* Fast-forward hook, entered only for a directly-fetched (non-delay-slot)
  * BF with negative displacement or BRA-to-self, with no irq test pending.
  * At entry: ppc = insn address, pc = ppc + 2, delay = 0, icount >= 1. */
@@ -1031,6 +1090,8 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 	 * read.  If the slice ends still looping, T is left at the loop
 	 * value so the real BT/BF branches back and the scheduler runs the
 	 * producer on the next slice.  No RPOLL/SLEEP state — deadlock-free. */
+	if (opcode == 0x8ffb && gnw_copyw_fold(sh2))	/* word copy loop */
+		return;
 	/* command-dispatcher idle loop: see gnw_cmd_idle_fold() */
 	if (opcode == 0x89e6 && gnw_cmd_idle_fold(sh2))
 		return;
