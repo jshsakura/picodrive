@@ -904,6 +904,75 @@ static unsigned int gnw_dl_reject[2][GNW_DL_REJ_SLOTS];
 #define GNW_DL_REJ_SLOT(sh2) \
 	(&gnw_dl_reject[(sh2)->is_slave & 1][((sh2)->ppc >> 1) & (GNW_DL_REJ_SLOTS - 1)])
 
+/* Command-dispatcher idle loop (Virtua Fighter 32X master, 26% of all
+ * guest SH-2 instructions in the attract demo, 2026-10-04):
+ *
+ *   loop: R0 = (u16)*cmd; push R0; (*counter)++; if (R0 > 0x80) leave;
+ *         *sp_save = SP; JSR table[R0]; if (SP != *sp_save) leave;
+ *         pop R0; if (R0 == 0) goto loop        <- BT, opcode 0x89e6
+ *
+ * With cmd == 0 the handler is table[0] = `RTS; NOP`, so an iteration
+ * changes exactly one thing: the counter. Everything it touches (cmd,
+ * counter, sp_save, table, handler) is SDRAM, so no read has a side
+ * effect and nothing in the slice can change cmd. It is a wait loop too
+ * long (27 insns, a call inside) for the bus-read poll detector.
+ *
+ * Recognised by its 25 opcode words, never by PC, name or ROM hash.
+ * Entered at the BT with T==1, i.e. the previous iteration was idle, so
+ * the registers and the stack slot already hold the values every further
+ * idle iteration would write: the fold only has to add n to the counter
+ * and charge n * 31 cycles (27 insns + BT taken 2 + JSR 1 + RTS 1). The
+ * last iteration is left to the interpreter, like every case here.
+ * A structural match always returns, so the countdown cases below never
+ * put this PC in the reject cache. */
+#ifdef RIG_SH2_COUNT
+unsigned int gnw_cmdidle_stat[3];	/* structural matches, folds, iterations folded */
+#endif
+/* noinline: a body this size inlined into the interpreter loop costs the whole
+ * core its register allocation (rig: +14% host instructions, slave +20%). */
+static int __attribute__((noinline)) gnw_cmd_idle_fold(SH2 *sh2)
+{
+	static const UINT16 body[24] = {
+		0xd80d, 0x6081, 0x600d, 0x2f06, 0xd20c, 0x6122, 0x7101, 0x2212,
+		0xe180, 0x611c, 0x3017, 0x8917, 0xd209, 0x22f2, 0xd109, 0x001e,
+		0x400b, 0x0009, 0xd206, 0x6222, 0x3f20, 0x8b0f, 0x60f6, 0x8800 };
+	unsigned int target = sh2->ppc - 0x30;
+	unsigned int cmd, cnt, sps, tbl, h;
+	int k, n;
+
+	if ((target & 0xdf000003) != 0x06000000) return 0;
+	for (k = 0; k < 24; k++)
+		if ((UINT16)RW(sh2, target + k * 2) != body[k]) return 0;
+	cmd = RL(sh2, target + 0x38); cnt = RL(sh2, target + 0x3c);
+	sps = RL(sh2, target + 0x40); tbl = RL(sh2, target + 0x44);
+	if ((cmd & 0xdf000001) != 0x06000000 || (cnt & 0xdf000003) != 0x06000000
+	    || (sps & 0xdf000003) != 0x06000000 || (tbl & 0xdf000003) != 0x06000000)
+		return 0;
+	h = RL(sh2, tbl);
+	if ((h & 0xdf000001) != 0x06000000
+	    || (UINT16)RW(sh2, h) != 0x000b || (UINT16)RW(sh2, h + 2) != 0x0009)
+		return 0;
+#ifdef RIG_SH2_COUNT
+	gnw_cmdidle_stat[0]++;
+#endif
+	/* At the BT the pop has already run, so SP is back up and R2 (reloaded
+	 * from *sp_save) is one slot below it. */
+	if (sh2->t_flag && sh2->icount > 31
+	    && (UINT16)RW(sh2, cmd) == 0
+	    && sh2->r[0] == 0 && sh2->r[1] == tbl && sh2->r[8] == cmd
+	    && sh2->r[2] == sh2->r[15] - 4 && RL(sh2, sps) == sh2->r[15] - 4
+	    && sh2->pr == target + 0x24)
+	{
+		n = (sh2->icount - 1) / 31;
+		WL(sh2, cnt, RL(sh2, cnt) + (unsigned int)n);
+		sh2->icount -= n * 31;
+#ifdef RIG_SH2_COUNT
+		gnw_cmdidle_stat[1]++; gnw_cmdidle_stat[2] += n;
+#endif
+	}
+	return 1;
+}
+
 /* Fast-forward hook, entered only for a directly-fetched (non-delay-slot)
  * BF with negative displacement or BRA-to-self, with no irq test pending.
  * At entry: ppc = insn address, pc = ppc + 2, delay = 0, icount >= 1. */
@@ -953,6 +1022,10 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 	 * read.  If the slice ends still looping, T is left at the loop
 	 * value so the real BT/BF branches back and the scheduler runs the
 	 * producer on the next slice.  No RPOLL/SLEEP state — deadlock-free. */
+	/* command-dispatcher idle loop: see gnw_cmd_idle_fold() */
+	if (opcode == 0x89e6 && gnw_cmd_idle_fold(sh2))
+		return;
+
 	if ((opcode & 0xff00) == 0x8900 || (opcode & 0xff00) == 0x8b00)	/* BT / BF */
 	{
 		int disp8 = (int)(signed char)(opcode & 0xff);
