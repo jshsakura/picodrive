@@ -336,6 +336,11 @@ static unsigned int op_refs[0x10000];
 # define rlog2(...)
 #endif
 
+#if defined(GNW_32X_CORE) && !defined(DRC_SH2) && !defined(DRC_CMP) && \
+    !defined(GNW_SH2_NO_FASTLOOPS) && !defined(GNW_NO_PCM_SPAN)
+#define GNW_PCM_SPAN_HANDLER 1
+static unsigned __attribute__((noinline,section(".gnw_xip_cold"))) pcm_span_native(SH2 *,unsigned);
+#endif
 #include "sh2.c"
 
 /* RIG_SH2_COUNT: executed-instruction counter for the QEMU M7 feasibility rig
@@ -2361,6 +2366,10 @@ void pcm_tail_synthetic_proof(SH2 *base){
  * Everything is computed into locals first; any guard failure declines with
  * the guest state untouched. Cycle charges mirror the interpreter's per-op
  * costs (1/op, +1 BRA/BFS-taken/DMULS/MULS, +2 BT/BF-taken, JMP 2). */
+#ifdef GNW_PCM_SPAN_HANDLER
+#include "pcm_span.h"
+#include "pcm_synthetic.h"
+#endif
 static unsigned mix_calls,mix_proofs,mix_voice_total,mix_decl[8];
 #ifdef RIG_SH2_COUNT
 unsigned long long mix_slave_bucket[8],mix_budget_hist[8],mix_master_bucket[8],mix_pcbin[2][2048];

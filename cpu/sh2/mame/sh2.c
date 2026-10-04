@@ -2057,7 +2057,14 @@ INLINE void op0010(sh2_state *sh2, UINT16 opcode)
 	case 12: CMPSTR(sh2, Rm, Rn);	rlog(LRNM);			break;
 	case 13: XTRCT(sh2, Rm, Rn); 	rlog(LRNM);			break;
 	case 14: MULU(sh2, Rm, Rn);	rlog(LRNM); rlog1(SHR_MACL);	break;
-	case 15: MULS(sh2, Rm, Rn);	rlog(LRNM); rlog1(SHR_MACL);	break;
+	case 15:
+#ifdef GNW_PCM_SPAN_HANDLER
+        if (opcode==0x230f && sh2->pc==sh2->ppc+2 && pcm_span_native(sh2,sh2->ppc)) {
+            sh2->icount++;
+            break;
+        }
+#endif
+        MULS(sh2, Rm, Rn);	rlog(LRNM); rlog1(SHR_MACL);	break;
 	}
 }
 
