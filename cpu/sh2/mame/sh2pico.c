@@ -938,38 +938,47 @@ static int __attribute__((noinline)) gnw_cmd_idle_fold(SH2 *sh2)
 		0x400b, 0x0009, 0xd206, 0x6222, 0x3f20, 0x8b0f, 0x60f6, 0x8800 };
 	unsigned int target = sh2->ppc - 0x30;
 	unsigned int cmd, cnt, sps, tbl, h;
+	const UINT8 *ram = (const UINT8 *)sh2->p_sdram;
+	const UINT16 *code;
 	int k, n;
+/* Every address is checked to be SDRAM before it is read, so read SDRAM
+ * directly: 24 expansions of RW() made this function 900 bytes, and neither
+ * ITCM nor RAM_EMU has 900 bytes. */
+#define CI_W(a) (*(const UINT16 *)(ram + ((a) & 0x3fffe)))
+#define CI_L(a) CPU_BE2(*(const UINT32 *)(ram + ((a) & 0x3fffc)))
+#define CI_RAM(a, low) (((a) & (0xdf000000 | (low))) == 0x06000000)
 
-	if ((target & 0xdf000003) != 0x06000000) return 0;
+	if (!CI_RAM(target, 3)) return 0;
+	code = &CI_W(target);
 	for (k = 0; k < 24; k++)
-		if ((UINT16)RW(sh2, target + k * 2) != body[k]) return 0;
-	cmd = RL(sh2, target + 0x38); cnt = RL(sh2, target + 0x3c);
-	sps = RL(sh2, target + 0x40); tbl = RL(sh2, target + 0x44);
-	if ((cmd & 0xdf000001) != 0x06000000 || (cnt & 0xdf000003) != 0x06000000
-	    || (sps & 0xdf000003) != 0x06000000 || (tbl & 0xdf000003) != 0x06000000)
+		if (code[k] != body[k]) return 0;
+	cmd = CI_L(target + 0x38); cnt = CI_L(target + 0x3c);
+	sps = CI_L(target + 0x40); tbl = CI_L(target + 0x44);
+	if (!CI_RAM(cmd, 1) || !CI_RAM(cnt, 3) || !CI_RAM(sps, 3) || !CI_RAM(tbl, 3))
 		return 0;
-	h = RL(sh2, tbl);
-	if ((h & 0xdf000001) != 0x06000000
-	    || (UINT16)RW(sh2, h) != 0x000b || (UINT16)RW(sh2, h + 2) != 0x0009)
+	h = CI_L(tbl);
+	if (!CI_RAM(h, 1) || CI_W(h) != 0x000b || CI_W(h + 2) != 0x0009)	/* RTS; NOP */
 		return 0;
 #ifdef RIG_SH2_COUNT
 	gnw_cmdidle_stat[0]++;
 #endif
 	/* At the BT the pop has already run, so SP is back up and R2 (reloaded
 	 * from *sp_save) is one slot below it. */
-	if (sh2->t_flag && sh2->icount > 31
-	    && (UINT16)RW(sh2, cmd) == 0
+	if (sh2->t_flag && sh2->icount > 31 && CI_W(cmd) == 0
 	    && sh2->r[0] == 0 && sh2->r[1] == tbl && sh2->r[8] == cmd
-	    && sh2->r[2] == sh2->r[15] - 4 && RL(sh2, sps) == sh2->r[15] - 4
+	    && sh2->r[2] == sh2->r[15] - 4 && CI_L(sps) == sh2->r[2]
 	    && sh2->pr == target + 0x24)
 	{
 		n = (sh2->icount - 1) / 31;
-		WL(sh2, cnt, RL(sh2, cnt) + (unsigned int)n);
+		WL(sh2, cnt, CI_L(cnt) + (unsigned int)n);
 		sh2->icount -= n * 31;
 #ifdef RIG_SH2_COUNT
 		gnw_cmdidle_stat[1]++; gnw_cmdidle_stat[2] += n;
 #endif
 	}
+#undef CI_W
+#undef CI_L
+#undef CI_RAM
 	return 1;
 }
 
