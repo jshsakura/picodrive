@@ -1041,6 +1041,95 @@ static int __attribute__((noinline)) gnw_copyw_fold(SH2 *sh2)
 	return 1;
 }
 
+/* Two more Chaotix master loops, same treatment as gnw_copyw_fold: every
+ * load and store is done, in order, with icount set to the interpreter's
+ * value at each store. They live in XIP flash (ITCM has 224 bytes left,
+ * RAM_EMU 528): the loops are tiny and stay in the I-cache.
+ *
+ *   fill:  MOV.W R3,@R7; DT R5; BF/S fill; ADD R9,R7              (5 cycles)
+ *   bcopy: MOV.B @R4+,R2; TST R2,R2; BT/S skip; DT R1;
+ *          ADD #$80,R2; MOV.B R2,@(R0,R8); skip: BF/S bcopy; ADD #1,R0
+ *          (8 cycles for a transparent byte, 9 for a stored one)        */
+static int __attribute__((noinline, section(".gnw_xip_cold"))) gnw_fillw_fold(SH2 *sh2)
+{
+	unsigned int target = sh2->ppc - 4;
+	const UINT16 *code;
+	int c, n;
+
+	if ((target & 0xdf000001) != 0x06000000) return 0;
+	code = (const UINT16 *)((const UINT8 *)sh2->p_sdram + (target & 0x3fffe));
+	if (code[0] != 0x2731 || code[1] != 0x4510 || code[3] != 0x379c) return 0;
+	if (sh2->t_flag) return 1;
+	c = sh2->icount;
+	n = (c - 1) / 5;
+	if ((unsigned int)n > sh2->r[5]) n = (int)sh2->r[5];
+	if (n <= 0) return 1;
+#ifdef RIG_SH2_COUNT
+	gnw_copyw_stat[0]++;
+#endif
+	while (n-- > 0)
+	{
+		sh2->r[7] += sh2->r[9];
+		sh2->r[5]--;
+		sh2->icount = c - 3;
+		WW(sh2, sh2->r[7], sh2->r[3] & 0xffff);
+#ifdef RIG_SH2_COUNT
+		gnw_copyw_stat[1]++;
+#endif
+		if (sh2->icount != c - 3 || sh2->test_irq) { c = sh2->icount + 3 - 5; goto out; }
+		c -= 5;
+	}
+out:
+	sh2->icount = c;
+	sh2->t_flag = sh2->r[5] == 0 ? T : 0;
+	return 1;
+}
+
+static int __attribute__((noinline, section(".gnw_xip_cold"))) gnw_bcopy_fold(SH2 *sh2)
+{
+	unsigned int target = sh2->ppc - 12;
+	const UINT16 *code;
+	int c;
+
+	if ((target & 0xdf000001) != 0x06000000) return 0;
+	code = (const UINT16 *)((const UINT8 *)sh2->p_sdram + (target & 0x3fffe));
+	if (code[0] != 0x6244 || code[1] != 0x2228 || code[2] != 0x8d02 || code[3] != 0x4110
+	    || code[4] != 0x7280 || code[5] != 0x0824 || code[7] != 0x7001)
+		return 0;
+	if (sh2->t_flag
+	    || ((sh2->r[4] & 0xc6000000) != 0x06000000 && (sh2->r[4] & 0xc6000000) != 0x02000000))
+		return 1;
+	c = sh2->icount;
+	if (c <= 9) return 1;
+#ifdef RIG_SH2_COUNT
+	gnw_copyw_stat[0]++;
+#endif
+	while (c > 9)
+	{
+		sh2->r[0] += 1;
+		sh2->r[2] = (UINT32)(INT32)(INT8)RB(sh2, sh2->r[4]);
+		sh2->r[4] += 1;
+		sh2->r[1]--;
+		if (sh2->r[2] == 0)
+			c -= 8;
+		else
+		{
+			sh2->r[2] += 0xffffff80;
+			sh2->icount = c - 8;
+			WB(sh2, sh2->r[0] + sh2->r[8], sh2->r[2] & 0xff);
+			if (sh2->icount != c - 8 || sh2->test_irq) { c = sh2->icount + 8 - 9; break; }
+			c -= 9;
+		}
+#ifdef RIG_SH2_COUNT
+		gnw_copyw_stat[1]++;
+#endif
+		if (sh2->r[1] == 0) break;
+	}
+	sh2->icount = c;
+	sh2->t_flag = sh2->r[1] == 0 ? T : 0;
+	return 1;
+}
+
 /* Fast-forward hook, entered only for a directly-fetched (non-delay-slot)
  * BF with negative displacement or BRA-to-self, with no irq test pending.
  * At entry: ppc = insn address, pc = ppc + 2, delay = 0, icount >= 1. */
@@ -1091,6 +1180,10 @@ static void gnw_sh2_fastloop(SH2 *sh2, UINT32 opcode)
 	 * value so the real BT/BF branches back and the scheduler runs the
 	 * producer on the next slice.  No RPOLL/SLEEP state — deadlock-free. */
 	if (opcode == 0x8ffb && gnw_copyw_fold(sh2))	/* word copy loop */
+		return;
+	if (opcode == 0x8ffc && gnw_fillw_fold(sh2))	/* word fill loop */
+		return;
+	if (opcode == 0x8ff8 && gnw_bcopy_fold(sh2))	/* transparent byte copy loop */
 		return;
 	/* command-dispatcher idle loop: see gnw_cmd_idle_fold() */
 	if (opcode == 0x89e6 && gnw_cmd_idle_fold(sh2))
